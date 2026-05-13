@@ -184,10 +184,15 @@ fn get_font<'a>(state: &'a mut State, kind: FontKind, text: &str) -> &'a Font {
     // should be used instead.
     for c in text.chars() {
         let c = c as u32;
-        if (0x3000..=0x30FF).contains(&c) || // JA punctuation, kana
-           (0xFF00..=0xFFEF).contains(&c) || // full-width/half-width chars
-           (0x4e00..=0x9FA0).contains(&c) || // various kanji
-           (0x3400..=0x4DBF).contains(&c) { // more kanji
+        if (0x2E80..=0x2FFF).contains(&c) || // CJK radicals, punctuation
+           (0x3000..=0x30FF).contains(&c) || // JA punctuation, kana
+           (0x3100..=0x31EF).contains(&c) || // Bopomofo, CJK strokes
+           (0x3300..=0x33FF).contains(&c) || // CJK compatibility
+           (0x3400..=0x4DBF).contains(&c) || // CJK Ext A
+           (0x4E00..=0x9FFF).contains(&c) || // CJK unified ideographs
+           (0xF900..=0xFAFF).contains(&c) || // compatibility ideographs
+           (0xFE30..=0xFE4F).contains(&c) || // compatibility forms
+           (0xFF00..=0xFFEF).contains(&c) { // full-width/half-width chars
             match kind {
                 // CJK has no italic equivalent
                 FontKind::MonoRegular | FontKind::MonoItalic | FontKind::SansRegular | FontKind::SansItalic | FontKind::SerifRegular | FontKind::SerifItalic => {

@@ -53,6 +53,7 @@ pub mod ns_property_list_serialization;
 pub mod ns_run_loop;
 pub mod ns_scanner;
 pub mod ns_set;
+pub mod ns_sort_descriptor;
 pub mod ns_string;
 pub mod ns_thread;
 pub mod ns_time_zone;
@@ -103,6 +104,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ns_run_loop::CLASSES,
         ns_scanner::CLASSES,
         ns_set::CLASSES,
+        ns_sort_descriptor::CLASSES,
         ns_string::CLASSES,
         ns_thread::CLASSES,
         ns_timer::CLASSES,

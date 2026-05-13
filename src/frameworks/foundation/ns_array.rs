@@ -10,8 +10,8 @@ use super::ns_property_list_serialization::{
     deserialize_plist_from_file, NSPropertyListBinaryFormat_v1_0,
 };
 use super::{
-    _nib_archive_decoder, ns_keyed_unarchiver, ns_string, ns_url, NSComparisonResult, NSNotFound,
-    NSRange, NSUInteger,
+    _nib_archive_decoder, ns_keyed_unarchiver, ns_sort_descriptor, ns_string, ns_url,
+    NSComparisonResult, NSNotFound, NSOrderedAscending, NSOrderedDescending, NSRange, NSUInteger,
 };
 use crate::abi::{CallFromHost, GuestFunction};
 use crate::frameworks::foundation::ns_keyed_archiver::{
@@ -487,6 +487,12 @@ pub const CLASSES: ClassExports = objc_classes! {
     autorelease(env, new)
 }
 
+- (id)sortedArrayUsingDescriptors:(id)descriptors { // NSArray*
+    let new = msg![env; this mutableCopy];
+    () = msg![env; new sortUsingDescriptors:descriptors];
+    autorelease(env, new)
+}
+
 @end
 
 // Special variant for use by CFArray with NULL callbacks: objects aren't
@@ -635,6 +641,20 @@ pub const CLASSES: ClassExports = objc_classes! {
     );
 
     let (env, _) = user_data;
+    env.objc.borrow_mut::<ArrayHostObject>(this).array = array;
+}
+
+- (())sortUsingDescriptors:(id)descriptors { // NSArray*
+    let host_object: &mut ArrayHostObject = env.objc.borrow_mut(this);
+    let mut array = std::mem::take(&mut host_object.array);
+    array.sort_by(|&lhs, &rhs| {
+        let res = ns_sort_descriptor::compare_objects_using_descriptors(env, lhs, rhs, descriptors);
+        match res {
+            NSOrderedAscending => std::cmp::Ordering::Less,
+            NSOrderedDescending => std::cmp::Ordering::Greater,
+            _ => std::cmp::Ordering::Equal,
+        }
+    });
     env.objc.borrow_mut::<ArrayHostObject>(this).array = array;
 }
 

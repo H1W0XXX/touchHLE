@@ -215,6 +215,85 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // NSKeyValueCoding
 // https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/KeyValueCoding/SearchImplementation.html
+- (id)valueForKey:(id)key { // NSString*
+    let key_string = to_rust_string(env, key);
+    if key_string.is_empty() {
+        let sel = env.objc.lookup_selector("valueForUndefinedKey:").unwrap();
+        return msg_send(env, (this, sel, key));
+    }
+    assert!(key_string.is_ascii()); // TODO: do we have to handle non-ASCII keys?
+    let key_string_owned = key_string.to_string();
+    let camel_case_key_string = format!(
+        "{}{}",
+        key_string.as_bytes()[0].to_ascii_uppercase() as char,
+        &key_string[1..]
+    );
+
+    let class = msg![env; this class];
+
+    for selector_name in [
+        format!("get{camel_case_key_string}"),
+        key_string.to_string(),
+        format!("is{camel_case_key_string}"),
+        format!("_{key_string}"),
+    ] {
+        if let Some(sel) = env.objc.lookup_selector(&selector_name) {
+            if env.objc.class_has_method(class, sel) {
+                let value: id = msg_send_no_type_checking(env, (this, sel));
+                return value;
+            }
+        }
+    }
+
+    let sel = env.objc.lookup_selector("accessInstanceVariablesDirectly").unwrap();
+    let access_instance_variables_directly = msg_send(env, (class, sel));
+    if access_instance_variables_directly {
+        if let Some(ivar_ptr) = env
+            .objc
+            .object_lookup_ivar(&env.mem, this, &format!("_{key_string}"))
+            .or_else(|| {
+                env.objc.object_lookup_ivar(
+                    &env.mem,
+                    this,
+                    &format!("_is{camel_case_key_string}"),
+                )
+            })
+            .or_else(|| env.objc.object_lookup_ivar(&env.mem, this, &key_string_owned))
+            .or_else(|| {
+                env.objc.object_lookup_ivar(
+                    &env.mem,
+                    this,
+                    &format!("is{camel_case_key_string}"),
+                )
+            })
+        {
+            return env.mem.read(ivar_ptr.cast());
+        }
+    }
+
+    let sel = env.objc.lookup_selector("valueForUndefinedKey:").unwrap();
+    msg_send(env, (this, sel, key))
+}
+
+- (id)valueForUndefinedKey:(id)key { // NSString*
+    let class: Class = ObjC::read_isa(this, &env.mem);
+    let class_name_string = env.objc.get_class_name(class).to_owned();
+    let key_string = to_rust_string(env, key);
+    panic!(
+        "Object {:?} of class {:?} ({:?}) does not have a getter for {} ({:?})\
+        \nAvailable selectors: {}\nAvailable ivars: {}",
+        this,
+        class_name_string,
+        class,
+        key_string,
+        key,
+        env.objc
+            .debug_all_class_selectors_as_strings(&env.mem, class)
+            .join(", "),
+        env.objc.debug_all_class_ivars_as_strings(class).join(", ")
+    );
+}
+
 - (())setValue:(id)value
        forKey:(id)key { // NSString*
     let key_string = to_rust_string(env, key); // TODO: avoid copy?
