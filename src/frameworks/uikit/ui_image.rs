@@ -5,7 +5,10 @@
  */
 //! `UIImage`.
 
-use crate::frameworks::core_graphics::cg_context::CGContextDrawImage;
+use crate::frameworks::core_graphics::cg_context::{
+    CGContextDrawImage, CGContextRestoreGState, CGContextSaveGState, CGContextScaleCTM,
+    CGContextTranslateCTM,
+};
 use crate::frameworks::core_graphics::cg_image::{
     self, CGImageCreateWithImageInRect, CGImageGetHeight, CGImageGetWidth, CGImageRef,
     CGImageRelease, CGImageRetain,
@@ -250,6 +253,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     draw_image_in_rect(env, this, rect, context);
 }
 
+- (bool)_touchHLEIsStretchable {
+    env.objc.borrow::<UIImageHostObject>(this).stretch_caps.is_some()
+}
+
 @end
 
 // Undocumented class used in NIBs
@@ -299,8 +306,13 @@ fn draw_image_in_rect(env: &mut Environment, image_obj: id, rect: CGRect, contex
     let host = env.objc.borrow::<UIImageHostObject>(image_obj);
     let image = host.cg_image;
     let stretch_caps = host.stretch_caps;
+    CGContextSaveGState(env, context);
+    CGContextTranslateCTM(env, context, 0.0, rect.origin.y * 2.0 + rect.size.height);
+    CGContextScaleCTM(env, context, 1.0, -1.0);
+
     if stretch_caps.is_none() {
         CGContextDrawImage(env, context, rect, image);
+        CGContextRestoreGState(env, context);
         return;
     }
 
@@ -362,4 +374,5 @@ fn draw_image_in_rect(env: &mut Environment, image_obj: id, rect: CGRect, contex
             );
         }
     }
+    CGContextRestoreGState(env, context);
 }

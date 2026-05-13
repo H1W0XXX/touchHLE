@@ -5,6 +5,7 @@
  */
 //! `UIImageView`.
 
+use crate::frameworks::core_graphics::cg_image::CGImageRef;
 use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::frameworks::foundation::NSTimeInterval;
@@ -99,7 +100,17 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, old_image);
 
     let layer: id = msg![env; this layer];
-    () = msg![env; layer setContents:nil];
+    let stretchable = if new_image == nil {
+        false
+    } else {
+        msg![env; new_image _touchHLEIsStretchable]
+    };
+    if stretchable {
+        () = msg![env; layer setContents:nil];
+    } else {
+        let cg_image: CGImageRef = msg![env; new_image CGImage];
+        () = msg![env; layer setContents:cg_image];
+    }
     () = msg![env; this setNeedsDisplay];
 }
 
@@ -124,7 +135,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())drawRect:(CGRect)rect {
     let image = env.objc.borrow::<UIImageViewHostObject>(this).image;
-    if image != nil {
+    if image != nil && msg![env; image _touchHLEIsStretchable] {
         () = msg![env; image drawInRect:rect];
     }
 }
