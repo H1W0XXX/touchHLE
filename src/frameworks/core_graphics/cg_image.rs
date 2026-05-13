@@ -112,7 +112,7 @@ fn CGImageCreateCopyWithColorSpace(
     from_image(env, new_image)
 }
 
-fn CGImageCreateWithImageInRect(
+pub fn CGImageCreateWithImageInRect(
     env: &mut Environment,
     image: CGImageRef,
     rect: CGRect,

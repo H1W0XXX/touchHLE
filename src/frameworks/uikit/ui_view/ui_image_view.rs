@@ -5,12 +5,11 @@
  */
 //! `UIImageView`.
 
-use crate::frameworks::core_graphics::cg_image::CGImageRef;
 use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::frameworks::foundation::NSTimeInterval;
 use crate::objc::{
-    id, impl_HostObject_with_superclass, msg, msg_super, objc_classes, release, retain,
+    id, impl_HostObject_with_superclass, msg, msg_super, nil, objc_classes, release, retain,
     todo_objc_setter, ClassExports, NSZonePtr,
 };
 
@@ -100,8 +99,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, old_image);
 
     let layer: id = msg![env; this layer];
-    let cg_image: CGImageRef = msg![env; new_image CGImage];
-    () = msg![env; layer setContents:cg_image];
+    () = msg![env; layer setContents:nil];
+    () = msg![env; this setNeedsDisplay];
 }
 
 - (())setAnimationImages:(id)images { // NSArray<UIImage *>*
@@ -121,6 +120,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())stopAnimating {
     log!("TODO: [(UIImageView*) {:?} stopAnimating]", this);
+}
+
+- (())drawRect:(CGRect)rect {
+    let image = env.objc.borrow::<UIImageViewHostObject>(this).image;
+    if image != nil {
+        () = msg![env; image drawInRect:rect];
+    }
 }
 
 @end

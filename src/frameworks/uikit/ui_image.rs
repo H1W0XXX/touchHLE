@@ -7,7 +7,8 @@
 
 use crate::frameworks::core_graphics::cg_context::CGContextDrawImage;
 use crate::frameworks::core_graphics::cg_image::{
-    self, CGImageGetHeight, CGImageGetWidth, CGImageRef, CGImageRelease, CGImageRetain,
+    self, CGImageCreateWithImageInRect, CGImageGetHeight, CGImageGetWidth, CGImageRef,
+    CGImageRelease, CGImageRetain,
 };
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::get_static_str;
@@ -41,6 +42,7 @@ impl State {
 
 struct UIImageHostObject {
     cg_image: CGImageRef,
+    stretch_caps: Option<(NSInteger, NSInteger)>,
 }
 impl HostObject for UIImageHostObject {}
 
@@ -61,7 +63,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 @implementation UIImage: NSObject
 
 + (id)allocWithZone:(NSZonePtr)_zone {
-    let host_object = Box::new(UIImageHostObject { cg_image: nil });
+    let host_object = Box::new(UIImageHostObject {
+        cg_image: nil,
+        stretch_caps: None,
+    });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
 
@@ -146,7 +151,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())dealloc {
-    let &UIImageHostObject { cg_image } = env.objc.borrow(this);
+    let &UIImageHostObject { cg_image, .. } = env.objc.borrow(this);
     CGImageRelease(env, cg_image);
 
     env.objc.dealloc_object(this, &mut env.mem)
@@ -188,8 +193,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)stretchableImageWithLeftCapWidth:(NSInteger)_leftCapWidth
                           topCapHeight:(NSInteger)_topCapHeight {
-    log!("TODO: properly support stretchableImageWithLeftCapWidth:topCapHeight:");
-    retain(env, this)
+    let new: id = msg_class![env; UIImage alloc];
+    let cg_image = env.objc.borrow::<UIImageHostObject>(this).cg_image;
+    let new: id = msg![env; new initWithCGImage:cg_image];
+    env.objc.borrow_mut::<UIImageHostObject>(new).stretch_caps =
+        Some((_leftCapWidth.max(0), _topCapHeight.max(0)));
+    autorelease(env, new)
 }
 
 // TODO: more init methods
@@ -221,8 +230,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())drawInRect:(CGRect)rect {
     let context = UIGraphicsGetCurrentContext(env);
-    let image = env.objc.borrow::<UIImageHostObject>(this).cg_image;
-    CGContextDrawImage(env, context, rect, image);
+    draw_image_in_rect(env, this, rect, context);
 }
 
 - (())drawAtPoint:(CGPoint)point {
@@ -239,7 +247,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             height: CGImageGetHeight(env, image) as CGFloat,
         }
     };
-    CGContextDrawImage(env, context, rect, image);
+    draw_image_in_rect(env, this, rect, context);
 }
 
 @end
@@ -264,3 +272,94 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
+
+fn draw_image_slice(
+    env: &mut Environment,
+    context: id,
+    image: CGImageRef,
+    src: CGRect,
+    dst: CGRect,
+) {
+    if src.size.width <= 0.0
+        || src.size.height <= 0.0
+        || dst.size.width <= 0.0
+        || dst.size.height <= 0.0
+    {
+        return;
+    }
+    let slice = CGImageCreateWithImageInRect(env, image, src);
+    if slice == nil {
+        return;
+    }
+    CGContextDrawImage(env, context, dst, slice);
+    CGImageRelease(env, slice);
+}
+
+fn draw_image_in_rect(env: &mut Environment, image_obj: id, rect: CGRect, context: id) {
+    let host = env.objc.borrow::<UIImageHostObject>(image_obj);
+    let image = host.cg_image;
+    let stretch_caps = host.stretch_caps;
+    if stretch_caps.is_none() {
+        CGContextDrawImage(env, context, rect, image);
+        return;
+    }
+
+    let (image_width, image_height) = cg_image::borrow_image(&env.objc, image).dimensions();
+    let image_width = image_width as CGFloat;
+    let image_height = image_height as CGFloat;
+    let (left_cap_width, top_cap_height) = stretch_caps.unwrap();
+
+    let left_src = (left_cap_width as CGFloat).clamp(0.0, image_width);
+    let top_src = (top_cap_height as CGFloat).clamp(0.0, image_height);
+    let center_src_w = if left_src < image_width { 1.0 } else { 0.0 };
+    let center_src_h = if top_src < image_height { 1.0 } else { 0.0 };
+    let right_src = (image_width - left_src - center_src_w).max(0.0);
+    let bottom_src = (image_height - top_src - center_src_h).max(0.0);
+
+    let left_dst = left_src.min(rect.size.width);
+    let top_dst = top_src.min(rect.size.height);
+    let right_dst = right_src.min((rect.size.width - left_dst).max(0.0));
+    let bottom_dst = bottom_src.min((rect.size.height - top_dst).max(0.0));
+    let center_dst_w = (rect.size.width - left_dst - right_dst).max(0.0);
+    let center_dst_h = (rect.size.height - top_dst - bottom_dst).max(0.0);
+
+    let src_x = [0.0, left_src, left_src + center_src_w];
+    let src_y = [0.0, top_src, top_src + center_src_h];
+    let src_w = [left_src, center_src_w, right_src];
+    let src_h = [top_src, center_src_h, bottom_src];
+
+    let dst_x = [rect.origin.x, rect.origin.x + left_dst, rect.origin.x + left_dst + center_dst_w];
+    let dst_y = [rect.origin.y, rect.origin.y + top_dst, rect.origin.y + top_dst + center_dst_h];
+    let dst_w = [left_dst, center_dst_w, right_dst];
+    let dst_h = [top_dst, center_dst_h, bottom_dst];
+
+    for row in 0..3 {
+        for col in 0..3 {
+            draw_image_slice(
+                env,
+                context,
+                image,
+                CGRect {
+                    origin: CGPoint {
+                        x: src_x[col],
+                        y: src_y[row],
+                    },
+                    size: CGSize {
+                        width: src_w[col],
+                        height: src_h[row],
+                    },
+                },
+                CGRect {
+                    origin: CGPoint {
+                        x: dst_x[col],
+                        y: dst_y[row],
+                    },
+                    size: CGSize {
+                        width: dst_w[col],
+                        height: dst_h[row],
+                    },
+                },
+            );
+        }
+    }
+}
