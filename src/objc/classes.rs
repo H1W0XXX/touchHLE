@@ -469,7 +469,9 @@ fn substitute_classes(
             | "ApWebRetryThread"
     );
 
-    if !(name.starts_with("AdMob")
+    if !(name == "InterstitialNoticeView"
+        || name.starts_with("InterstitialNotice")
+        || name.starts_with("AdMob")
         || name.starts_with("AdColony")
         || name.starts_with("ADC")
         || name.starts_with("AltAds")
