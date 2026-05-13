@@ -16,7 +16,7 @@
 //! - The GCC documentation's [Fast Enumeration Protocol section](https://gcc.gnu.org/onlinedocs/gcc/Fast-enumeration-protocol.html)
 
 use crate::mem::{MutPtr, MutVoidPtr, SafeRead};
-use crate::objc::{id, msg, nil, objc_classes, ClassExports};
+use crate::objc::{autorelease, id, msg, msg_class, nil, objc_classes, ClassExports};
 use crate::Environment;
 
 use super::NSUInteger;
@@ -37,6 +37,19 @@ pub const CLASSES: ClassExports = objc_classes! {
 // Abstract class. Subclass must implement:
 // - (id)nextObject;
 @implementation NSEnumerator: NSObject
+
+// Convenience implementation built on top of nextObject.
+- (id)allObjects {
+    let objects: id = msg_class![env; NSMutableArray new];
+    loop {
+        let object: id = msg![env; this nextObject];
+        if object == nil {
+            break;
+        }
+        () = msg![env; objects addObject:object];
+    }
+    autorelease(env, objects)
+}
 
 // NSFastEnumeration (convenience) implementation
 - (NSUInteger)countByEnumeratingWithState:(MutPtr<NSFastEnumerationState>)state
