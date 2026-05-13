@@ -19,4 +19,25 @@ fn if_nameindex(_env: &mut Environment) -> ConstPtr<if_nameindex> {
     Ptr::null()
 }
 
-pub const FUNCTIONS: FunctionExports = &[export_c_func!(if_nameindex())];
+fn if_nametoindex(env: &mut Environment, ifname: ConstPtr<u8>) -> u32 {
+    if ifname.is_null() {
+        return 0;
+    }
+
+    let name = env.mem.cstr_at_utf8(ifname);
+    match name {
+        // Common iPhone OS names. The exact index is not important for apps
+        // that only use this as a network-reachability probe.
+        Ok("lo0") => 1,
+        Ok("en0") | Ok("pdp_ip0") => 2,
+        _ => {
+            log!("TODO: if_nametoindex({name:?})");
+            0
+        }
+    }
+}
+
+pub const FUNCTIONS: FunctionExports = &[
+    export_c_func!(if_nameindex()),
+    export_c_func!(if_nametoindex(_)),
+];

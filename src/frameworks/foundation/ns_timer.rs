@@ -47,6 +47,14 @@ pub const CLASSES: ClassExports = objc_classes! {
                    selector:(SEL)selector
                    userInfo:(id)user_info
                     repeats:(bool)repeats {
+    if target == nil {
+        log_dbg!(
+            "Ignoring NSTimer scheduled with nil target for selector {:?}",
+            selector.as_str(&env.mem),
+        );
+        return nil;
+    }
+
     let ns_interval = ns_interval.max(0.0001);
     let rust_interval = Duration::from_secs_f64(ns_interval);
 
@@ -89,6 +97,9 @@ pub const CLASSES: ClassExports = objc_classes! {
                                             selector:selector
                                             userInfo:user_info
                                              repeats:repeats];
+    if timer == nil {
+        return nil;
+    }
 
     let run_loop: id = msg_class![env; NSRunLoop currentRunLoop];
     let mode: id = ns_string::get_static_str(env, NSDefaultRunLoopMode);
@@ -139,6 +150,11 @@ pub const CLASSES: ClassExports = objc_classes! {
         repeats,
         ..
     } = env.objc.borrow(this);
+
+    if target == nil {
+        () = msg![env; this invalidate];
+        return;
+    }
 
     let pool: id = msg_class![env; NSAutoreleasePool new];
 
@@ -200,6 +216,12 @@ pub(super) fn handle_timer(env: &mut Environment, timer: id) -> Option<Instant> 
     // is invalidated from another timer earlier in the current tick of the
     // run loop it might still be run.
     let due_by = due_by?;
+
+    if target == nil {
+        ns_run_loop::remove_timer(env, run_loop, timer);
+        env.objc.borrow_mut::<NSTimerHostObject>(timer).due_by = None;
+        return None;
+    }
 
     let now = Instant::now();
 

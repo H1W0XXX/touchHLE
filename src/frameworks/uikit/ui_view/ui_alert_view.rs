@@ -21,8 +21,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             cancelButtonTitle:(id)cancelButtonTitle
             otherButtonTitles:(id)otherButtonTitles {
 
-    log!("TODO: [(UIAlertView*){:?} initWithTitle:{:?} message:{:?} delegate:{:?} cancelButtonTitle:{:?} otherButtonTitles:{:?}]", this, title, message, delegate, cancelButtonTitle, otherButtonTitles);
-
+    let _ = (delegate, cancelButtonTitle, otherButtonTitles);
     let msg = if message == nil { Cow::from("(nil)") } else { ns_string::to_rust_string(env, message) };
     let title = if title == nil { Cow::from("(nil)") } else { ns_string::to_rust_string(env, title) };
     log!("UIAlertView: title: {:?}, message: {:?}", title, msg);
@@ -31,11 +30,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())addButtonWithTitle:(id)title {
-    log!("TODO: [(UIAlertView *){:?} addButtonWithTitle:{}]", this, ns_string::to_rust_string(env, title));
+    log_dbg!("[(UIAlertView *){:?} addButtonWithTitle:{}]", this, ns_string::to_rust_string(env, title));
 }
 
 - (())show {
-    log!("TODO: [(UIAlertView*){:?} show]", this);
+    log_dbg!("[(UIAlertView*){:?} show]", this);
 }
 
 @end

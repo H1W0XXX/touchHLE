@@ -12,12 +12,25 @@ use crate::objc::{
     id, msg, msg_class, msg_send, nil, objc_classes, release, retain, ClassExports, HostObject,
     NSZonePtr, SEL,
 };
+use crate::Environment;
 use std::borrow::Cow;
 use std::collections::HashMap;
 
 #[derive(Default)]
 pub struct State {
     default_center: Option<id>,
+    pub zombie_farm_startup_player_determined: bool,
+}
+
+pub fn zombie_farm_startup_player_determined(env: &Environment) -> bool {
+    env.framework_state
+        .foundation
+        .ns_notification_center
+        .zombie_farm_startup_player_determined
+}
+
+fn is_zombie_farm_bundle(bundle_id: &str) -> bool {
+    bundle_id.starts_with("com.playforge.ZombieFarm") || bundle_id.starts_with("com.playforge.ZFR")
 }
 
 #[derive(Clone)]
@@ -28,7 +41,7 @@ struct Observer {
 }
 
 struct NSNotificationCenterHostObject {
-    observers: HashMap<Cow<'static, str>, Vec<Observer>>,
+    observers: HashMap<Option<Cow<'static, str>>, Vec<Observer>>,
 }
 impl HostObject for NSNotificationCenterHostObject {}
 
@@ -68,6 +81,14 @@ pub const CLASSES: ClassExports = objc_classes! {
          selector:(SEL)selector
              name:(NSNotificationName)name
            object:(id)object {
+    if observer == nil {
+        log_dbg!(
+            "Ignoring addObserver:selector:name:object: with nil observer for {:?}",
+            selector.as_str(&env.mem),
+        );
+        return;
+    }
+
     if name == nil &&
         env.bundle.bundle_identifier().starts_with("com.chillingo.cuttherope") &&
         selector == env.objc.lookup_selector("fetchUpdateNotification:").unwrap() {
@@ -76,9 +97,13 @@ pub const CLASSES: ClassExports = objc_classes! {
         log!("Applying game-specific hack for Cut the Rope: ignoring addObserver:selector:name:object: for fetchUpdateNotification:");
         return;
     }
-    // TODO: handle case where name is nil
-    // Usually a static string, so no real copy will happen
-    let name = ns_string::to_rust_string(env, name);
+    // nil means the observer wants notifications with any name.
+    // Usually a static string, so no real copy will happen.
+    let name = if name == nil {
+        None
+    } else {
+        Some(ns_string::to_rust_string(env, name))
+    };
 
     log_dbg!(
         "[(NSNotificationCenter*){:?} addObserver:{:?} selector:{:?} name:{:?} object:{:?}",
@@ -145,8 +170,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     let mut removed_observers = Vec::new();
 
     let host_obj = env.objc.borrow_mut::<NSNotificationCenterHostObject>(this);
-    if let Some(ref name) = name {
-        let Some(observers) = host_obj.observers.get_mut(name) else {
+    if let Some(name) = name {
+        let Some(observers) = host_obj.observers.get_mut(&Some(name)) else {
             return;
         };
         remove_observers_internal(observers, &mut removed_observers, observer, object);
@@ -174,13 +199,55 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     let notification_poster: id = msg![env; notification object];
 
-    log_dbg!("Notification is a {:?} posted by {:?}", name, notification_poster);
+    if name == "kStartupPlayerDeterminedNotification"
+        && is_zombie_farm_bundle(env.bundle.bundle_identifier())
+    {
+        env.framework_state
+            .foundation
+            .ns_notification_center
+            .zombie_farm_startup_player_determined = true;
+    }
+
+    log!(
+        "ZombieFarm trace: notification {:?} posted by {:?}",
+        name,
+        notification_poster
+    );
 
     let host_obj = env.objc.borrow_mut::<NSNotificationCenterHostObject>(this);
-    let Some(observers) = host_obj.observers.get(&name).cloned() else {
+    let mut observers = Vec::new();
+    if let Some(named_observers) = host_obj.observers.get(&Some(name.clone())) {
+        observers.extend(named_observers.iter().cloned());
+    }
+    if let Some(any_name_observers) = host_obj.observers.get(&None) {
+        observers.extend(any_name_observers.iter().cloned());
+    }
+    let bundle_id = env.bundle.bundle_identifier();
+    if observers.is_empty()
+        && name == "kStatusBarCanceledNotification"
+        && is_zombie_farm_bundle(bundle_id)
+    {
+        let status_bar_class = env.objc.get_known_class("StatusBar", &mut env.mem);
+        let hide_sel = env.objc.lookup_selector("hide").unwrap();
+        log!("ZombieFarm trace: no observer for cancel notification; hiding StatusBar");
+        let _: () = msg_send(env, (status_bar_class, hide_sel));
+        let status_bar_sel = env.objc.lookup_selector("statusBar").unwrap();
+        let status_bar: id = msg_send(env, (status_bar_class, status_bar_sel));
+        if status_bar != nil {
+            let view: id = msg![env; status_bar view];
+            if view != nil {
+                () = msg![env; view setHidden:true];
+                () = msg![env; view setUserInteractionEnabled:false];
+                () = msg![env; view removeFromSuperview];
+            }
+        }
         return;
-    };
+    }
     for Observer { observer, selector, object } in observers {
+        if observer == nil {
+            continue;
+        }
+
         // The object argument is a filter for which notification sources the
         // observer is interested in.
         if object != nil && notification_poster != object {
@@ -190,6 +257,12 @@ pub const CLASSES: ClassExports = objc_classes! {
         log_dbg!(
             "Notification {:?} observed, sending {:?} message to {:?}",
             notification,
+            selector.as_str(&env.mem),
+            observer
+        );
+        log!(
+            "ZombieFarm trace: notification {:?} observed, sending {:?} to {:?}",
+            name,
             selector.as_str(&env.mem),
             observer
         );

@@ -447,13 +447,46 @@ fn substitute_classes(
     // Naturally it makes a lot of use of UIKit and networking in ways we
     // don't support yet. This isn't "ad blocking" because ads no longer work
     // on real devices anyway :)
+    let is_apsalar = matches!(
+        name,
+        "Apsalar"
+            | "ApAbstractEvent"
+            | "ApButton"
+            | "ApContentDisplay"
+            | "ApCrypto"
+            | "ApDeviceKey"
+            | "ApError"
+            | "ApEvent"
+            | "ApFeedbackButton"
+            | "ApID"
+            | "ApItem"
+            | "ApItems"
+            | "ApLoader"
+            | "ApRegisterEvent"
+            | "ApSessionEvent"
+            | "ApThread"
+            | "ApUtils"
+            | "ApWebRetryThread"
+    );
+
     if !(name.starts_with("AdMob")
+        || name.starts_with("AdColony")
+        || name.starts_with("ADC")
         || name.starts_with("AltAds")
+        || name.starts_with("ASI")
+        || is_apsalar
+        || name.starts_with("ChartBoost")
         || name.starts_with("Mobclix")
         || name.starts_with("FB") // Facebook
         || name.starts_with("Flurry")
+        || name.starts_with("Greystripe")
+        || name.starts_with("Lmmob")
+        || name.starts_with("Millennial")
+        || name.starts_with("MM")
         || name.starts_with("OpenFeint")
-        || name.starts_with("Tapjoy"))
+        || name.starts_with("Tapjoy")
+        || name.starts_with("UA")
+        || name.starts_with("UAirship"))
     {
         return None;
     }
@@ -468,7 +501,7 @@ fn substitute_classes(
         assert!(name == metaclass_name);
     }
 
-    log!(
+    log_dbg!(
         "Note: substituting fake class for {} to improve compatibility",
         name
     );
@@ -979,7 +1012,13 @@ pub(super) fn class_getSuperclass(env: &mut Environment, cls: Class) -> Class {
     if cls == nil {
         nil
     } else {
-        env.objc.borrow::<ClassHostObject>(cls).superclass
+        let host_object = env.objc.get_host_object(cls).unwrap();
+        if host_object.as_any().is::<FakeClass>() || host_object.as_any().is::<UnimplementedClass>()
+        {
+            nil
+        } else {
+            env.objc.borrow::<ClassHostObject>(cls).superclass
+        }
     }
 }
 
@@ -987,6 +1026,12 @@ pub(super) fn class_getInstanceSize(env: &mut Environment, cls: Class) -> GuestU
     if cls == nil {
         0
     } else {
-        env.objc.borrow::<ClassHostObject>(cls).instance_size
+        let host_object = env.objc.get_host_object(cls).unwrap();
+        if host_object.as_any().is::<FakeClass>() || host_object.as_any().is::<UnimplementedClass>()
+        {
+            0
+        } else {
+            env.objc.borrow::<ClassHostObject>(cls).instance_size
+        }
     }
 }

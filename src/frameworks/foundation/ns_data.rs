@@ -5,7 +5,7 @@
  */
 //! `NSData` and `NSMutableData`.
 
-use super::ns_string::to_rust_string;
+use super::ns_string::{from_rust_string, to_rust_string};
 use super::{NSRange, NSUInteger};
 use crate::frameworks::foundation::ns_keyed_unarchiver::decode_current_data;
 use crate::fs::GuestPath;
@@ -14,6 +14,12 @@ use crate::objc::{
     autorelease, id, msg, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
 };
 use crate::{msg_class, Environment};
+
+fn is_zombie_farm_save_path(path: &str) -> bool {
+    path.ends_with("/Documents/saveGame.bin2")
+        || path.ends_with("/Documents/saveGame.preview")
+        || path.ends_with("/Documents/playerProfileManager.txt")
+}
 
 pub(super) struct NSDataHostObject {
     pub(super) bytes: MutVoidPtr,
@@ -121,12 +127,32 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)initWithContentsOfURL:(id)url { // NSURL *
+    if url == nil {
+        release(env, this);
+        return nil;
+    }
+
+    let is_file_url: bool = msg![env; url isFileURL];
+    if is_file_url {
+        let path: id = msg![env; url path];
+        return msg![env; this initWithContentsOfFile:path];
+    }
+
     let path: id = msg![env; url absoluteString];
     let path = to_rust_string(env, path);
-    // TODO: file URL case
-    assert!(path.starts_with("http"));
+    if !path.starts_with("http") {
+        log!(
+            "Warning: [(NSData*){:?} initWithContentsOfURL:{:?}] unsupported non-http URL",
+            this,
+            path,
+        );
+        release(env, this);
+        return nil;
+    }
+
     log!("TODO: ignoring [(NSData*){:?} initWithContentsOfURL:{:?}]", this, path);
     // TODO: actually load data once we have proper network support
+    release(env, this);
     nil
 }
 
@@ -135,8 +161,14 @@ pub const CLASSES: ClassExports = objc_classes! {
         return nil;
     }
     let path = to_rust_string(env, path);
+    if is_zombie_farm_save_path(&path) {
+        log!("ZombieFarm save: NSData read '{}'", path);
+    }
     log_dbg!("[(NSData*){:?} initWithContentsOfFile:{:?}]", this, path);
     let Ok(bytes) = env.fs.read(GuestPath::new(&path)) else {
+        if is_zombie_farm_save_path(&path) {
+            log!("ZombieFarm save: NSData read missing '{}'", path);
+        }
         release(env, this);
         return nil;
     };
@@ -160,6 +192,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (bool)writeToFile:(id)path // NSString*
          atomically:(bool)_use_aux_file {
     let file = to_rust_string(env, path);
+    let length = env.objc.borrow::<NSDataHostObject>(this).length;
+    if is_zombie_farm_save_path(&file) {
+        log!("ZombieFarm save: NSData write '{}' ({} bytes)", file, length);
+    }
     log_dbg!("[(NSData*){:?} writeToFile:{:?} atomically:_]", this, file);
     let host_object = env.objc.borrow::<NSDataHostObject>(this);
     // Mem::bytes_at() panics when the pointer is NULL, but NSData's pointer can
@@ -211,6 +247,35 @@ pub const CLASSES: ClassExports = objc_classes! {
     let a = to_rust_slice(env, this).to_owned();
     let b = to_rust_slice(env, other);
     a == b
+}
+
+- (id)subdataWithRange:(NSRange)range {
+    let &NSDataHostObject { bytes, length, .. } = env.objc.borrow(this);
+    assert!(range.location <= length && range.location + range.length <= length);
+    let sub_bytes = (bytes.cast_const() + range.location).cast_void();
+    let sub_length = range.length;
+    let data: id = msg_class![env; NSData dataWithBytes:sub_bytes length:sub_length];
+    data
+}
+
+- (id)description {
+    let &NSDataHostObject { bytes, length, .. } = env.objc.borrow(this);
+    if length == 0 || bytes.is_null() {
+        return from_rust_string(env, "<>".to_string());
+    }
+
+    let slice = env.mem.bytes_at(bytes.cast(), length);
+    let mut description = String::with_capacity((length as usize * 2) + (length as usize / 4) + 2);
+    description.push('<');
+    for (i, byte) in slice.iter().enumerate() {
+        if i != 0 && i % 4 == 0 {
+            description.push(' ');
+        }
+        use std::fmt::Write as _;
+        write!(&mut description, "{byte:02x}").unwrap();
+    }
+    description.push('>');
+    from_rust_string(env, description)
 }
 
 - (())getBytes:(MutPtr<u8>)buffer length:(NSUInteger)length {
@@ -298,6 +363,19 @@ pub const CLASSES: ClassExports = objc_classes! {
     let other_length: NSUInteger = msg![env; other_data length];
     log_dbg!("appendData other_data {:?}, other_bytes {:?}, other_length {}", other_data, other_bytes, other_length);
     msg![env; this appendBytes:other_bytes length:other_length]
+}
+
+- (())setData:(id)data { // NSData *
+    if data == this {
+        return;
+    }
+    let bytes: ConstVoidPtr = msg![env; data bytes];
+    let length: NSUInteger = msg![env; data length];
+    () = msg![env; this setLength:length];
+    if length != 0 {
+        let dest = env.objc.borrow::<NSDataHostObject>(this).bytes;
+        env.mem.memmove(dest, bytes, length);
+    }
 }
 
 - (())appendBytes:(ConstPtr<u8>)append_bytes length:(NSUInteger)append_length {

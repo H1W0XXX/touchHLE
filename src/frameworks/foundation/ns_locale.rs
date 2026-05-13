@@ -45,17 +45,17 @@ impl State {
 fn get_preferred_languages(env: &mut Environment) -> Vec<String> {
     let options = env.options.as_ref();
     if let Some(ref preferred_languages) = options.preferred_languages {
-        log!("The app requested your preferred languages. {:?} will reported based on your --preferred-languages= option.", preferred_languages);
+        log_dbg!("The app requested your preferred languages. {:?} will reported based on your --preferred-languages= option.", preferred_languages);
         return preferred_languages.clone();
     }
 
     let languages = get_preferred_language_codes(env);
     if languages.is_empty() {
         let lang = "en".to_string();
-        log!("The app requested your preferred languages. No information could be retrieved, so {:?} (English) will be reported.", lang);
+        log_dbg!("The app requested your preferred languages. No information could be retrieved, so {:?} (English) will be reported.", lang);
         vec![lang]
     } else {
-        log!("The app requested your preferred languages. {:?} will be reported based on your system language preferences.", languages);
+        log_dbg!("The app requested your preferred languages. {:?} will be reported based on your system language preferences.", languages);
         languages
     }
 }
@@ -64,10 +64,10 @@ fn get_preferred_countries(env: &mut Environment) -> Vec<String> {
     let countries = get_preferred_country_codes(env);
     if countries.is_empty() {
         let country = "US".to_string();
-        log!("The app requested your current locale. No country information could be retrieved, so {:?} will be reported.", country);
+        log_dbg!("The app requested your current locale. No country information could be retrieved, so {:?} will be reported.", country);
         vec![country]
     } else {
-        log!("The app requested your current locale. {:?} will be reported based on your system region settings.", countries);
+        log_dbg!("The app requested your current locale. {:?} will be reported based on your system region settings.", countries);
         countries
     }
 }

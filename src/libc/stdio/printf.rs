@@ -351,29 +351,21 @@ pub fn printf_inner<const NS_LOG: bool, F: Fn(&Mem, GuestUSize) -> u8>(
                     uint
                 };
                 if pad_width > 0 {
-                    assert!(precision.is_none()); // TODO
                     let pad_width = pad_width as usize;
+                    let formatted = format_unsigned_hex(uint, precision, false);
                     if pad_char == '0' && precision.is_none() {
                         write!(&mut res, "{uint:0>pad_width$x}").unwrap();
                     } else {
-                        write!(&mut res, "{uint:>pad_width$x}").unwrap();
+                        write!(&mut res, "{formatted:>pad_width$}").unwrap();
                     }
                 } else {
-                    let tmp = if precision.is_some_and(|value| value > 0) {
-                        format!("{:01$x}", uint, precision.unwrap())
-                    } else {
-                        if let Some(precision) = precision {
-                            assert!(precision == 0 && uint != 0); // TODO
-                        }
-                        format!("{uint:x}")
-                    };
+                    let tmp = format_unsigned_hex(uint, precision, false);
                     res.extend_from_slice(tmp.as_bytes());
                 }
             }
             b'X' => {
                 assert!(!prepend_sign);
                 assert!(!left_justified);
-                assert!(precision.is_none());
                 // Note: on 32-bit system unsigned int and unsigned long
                 // are u32, so length_modifier is ignored
                 let uint: u32 = if length_modifier == Some("ll") {
@@ -392,14 +384,16 @@ pub fn printf_inner<const NS_LOG: bool, F: Fn(&Mem, GuestUSize) -> u8>(
                 };
                 if pad_width > 0 {
                     let pad_width = pad_width as usize;
+                    let formatted = format_unsigned_hex(uint, precision, true);
                     if pad_char == '0' && precision.is_none() {
                         write!(&mut res, "{uint:0>pad_width$X}").unwrap();
                     } else {
                         assert!(pad_char == ' '); // TODO
-                        write!(&mut res, "{uint:>pad_width$X}").unwrap();
+                        write!(&mut res, "{formatted:>pad_width$}").unwrap();
                     }
                 } else {
-                    res.extend_from_slice(format!("{uint:X}").as_bytes());
+                    let tmp = format_unsigned_hex(uint, precision, true);
+                    res.extend_from_slice(tmp.as_bytes());
                 }
             }
             b'p' => {
@@ -541,6 +535,16 @@ fn e_format(float: f64, pad_width: usize, pad_char: char, precision: usize) -> S
         assert!(pad_char == ' '); // TODO
         let float_exp_notation = format!("{sign}{mantissa:.precision$}e{exponent:+03}");
         format!("{float_exp_notation:>pad_width$}")
+    }
+}
+
+fn format_unsigned_hex(uint: u32, precision: Option<usize>, uppercase: bool) -> String {
+    match precision {
+        Some(0) if uint == 0 => String::new(),
+        Some(precision) if uppercase => format!("{uint:0>precision$X}"),
+        Some(precision) => format!("{uint:0>precision$x}"),
+        None if uppercase => format!("{uint:X}"),
+        None => format!("{uint:x}"),
     }
 }
 

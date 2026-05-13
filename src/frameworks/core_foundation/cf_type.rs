@@ -6,7 +6,7 @@
 //! `CFType` (type-generic functions etc).
 
 use super::{CFHashCode, CFIndex};
-use crate::dyld::{export_c_func, FunctionExports};
+use crate::dyld::{export_c_func, export_c_func_aliased, FunctionExports};
 use crate::frameworks::foundation::NSUInteger;
 use crate::objc::Class;
 use crate::{msg, objc};
@@ -20,6 +20,13 @@ pub fn CFRetain(env: &mut Environment, object: CFTypeRef) -> CFTypeRef {
 }
 pub fn CFRelease(env: &mut Environment, object: CFTypeRef) {
     objc::release(env, object);
+}
+
+pub fn _CFMakeCollectable(_env: &mut Environment, object: CFTypeRef) -> CFTypeRef {
+    // iPhone OS never had Objective-C garbage collection. Some older shared
+    // code still links this symbol, but in a non-GC runtime it is just an
+    // ownership annotation and must not change the object.
+    object
 }
 
 pub fn CFGetRetainCount(env: &mut Environment, object: CFTypeRef) -> CFIndex {
@@ -48,6 +55,7 @@ pub fn CFHash(env: &mut Environment, object: CFTypeRef) -> CFHashCode {
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CFRetain(_)),
     export_c_func!(CFRelease(_)),
+    export_c_func_aliased!("CFMakeCollectable", _CFMakeCollectable(_)),
     export_c_func!(CFGetRetainCount(_)),
     export_c_func!(CFEqual(_, _)),
     export_c_func!(CFHash(_)),

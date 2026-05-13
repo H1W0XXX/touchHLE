@@ -7,6 +7,7 @@
 
 use super::ui_device::*;
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
+use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::{from_rust_string, get_static_str};
 use crate::frameworks::foundation::{ns_array, ns_string, NSInteger, NSUInteger};
 use crate::mem::MutPtr;
@@ -29,6 +30,19 @@ struct UIApplicationHostObject {
     delegate_is_retained: bool,
 }
 impl HostObject for UIApplicationHostObject {}
+
+#[derive(Default)]
+struct UILocalNotificationHostObject {
+    fire_date: id,
+    time_zone: id,
+    alert_body: id,
+    alert_action: id,
+    sound_name: id,
+    user_info: id,
+    repeat_interval: NSUInteger,
+    application_icon_badge_number: NSInteger,
+}
+impl HostObject for UILocalNotificationHostObject {}
 
 pub type UIInterfaceOrientation = UIDeviceOrientation;
 #[allow(unused)]
@@ -135,6 +149,26 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; this setStatusBarOrientation:orientation]
 }
 
+- (CGRect)statusBarFrame {
+    if env.framework_state.uikit.ui_application.status_bar_hidden {
+        return CGRect::default();
+    }
+
+    const STATUS_BAR_HEIGHT: f32 = 20.0;
+    let (portrait_width, portrait_height) = env.window().device_family().portrait_size();
+    let (width, height) = match msg![env; this statusBarOrientation] {
+        UIDeviceOrientationLandscapeLeft | UIDeviceOrientationLandscapeRight => {
+            (portrait_height as f32, STATUS_BAR_HEIGHT)
+        }
+        _ => (portrait_width as f32, STATUS_BAR_HEIGHT),
+    };
+
+    CGRect {
+        origin: CGPoint { x: 0.0, y: 0.0 },
+        size: CGSize { width, height },
+    }
+}
+
 - (bool)isIdleTimerDisabled {
     !env.window().is_screen_saver_enabled()
 }
@@ -207,18 +241,38 @@ pub const CLASSES: ClassExports = objc_classes! {
     log!("TODO: ignoring registerForRemoteNotificationTypes:{}", types);
 }
 
+- (id)scheduledLocalNotifications {
+    let notifications = ns_array::from_vec(env, vec![]);
+    autorelease(env, notifications)
+}
+- (())setScheduledLocalNotifications:(id)notifications {
+    log_dbg!("Ignoring setScheduledLocalNotifications:{:?}", notifications);
+}
+- (())scheduleLocalNotification:(id)notification {
+    log_dbg!("Ignoring scheduleLocalNotification:{:?}", notification);
+}
+- (())presentLocalNotificationNow:(id)notification {
+    log_dbg!("Ignoring presentLocalNotificationNow:{:?}", notification);
+}
+- (())cancelLocalNotification:(id)notification {
+    log_dbg!("Ignoring cancelLocalNotification:{:?}", notification);
+}
+- (())cancelAllLocalNotifications {
+    log_dbg!("Ignoring cancelAllLocalNotifications");
+}
+
 - (NSInteger)applicationIconBadgeNumber {
     0 // default value
 }
 - (())setApplicationIconBadgeNumber:(NSInteger)bn {
-    log!("TODO: ignoring setApplicationIconBadgeNumber:{}", bn);
+    log_dbg!("Ignoring setApplicationIconBadgeNumber:{}", bn);
 }
 
 - (bool)applicationSupportsShakeToEdit {
     true // default value
 }
 - (())setApplicationSupportsShakeToEdit:(bool)enable {
-    log!("TODO: ignoring setApplicationSupportsShakeToEdit:{}", enable);
+    log_dbg!("Ignoring setApplicationSupportsShakeToEdit:{}", enable);
 }
 
 // UIResponder implementation
@@ -236,6 +290,107 @@ pub const CLASSES: ClassExports = objc_classes! {
     } else {
         nil
     }
+}
+
+@end
+
+@implementation UILocalNotification: NSObject
+
++ (id)allocWithZone:(NSZonePtr)_zone {
+    env.objc.alloc_object(this, Box::<UILocalNotificationHostObject>::default(), &mut env.mem)
+}
+
+- (())dealloc {
+    let UILocalNotificationHostObject {
+        fire_date,
+        time_zone,
+        alert_body,
+        alert_action,
+        sound_name,
+        user_info,
+        ..
+    } = std::mem::take(env.objc.borrow_mut(this));
+    release(env, fire_date);
+    release(env, time_zone);
+    release(env, alert_body);
+    release(env, alert_action);
+    release(env, sound_name);
+    release(env, user_info);
+    env.objc.dealloc_object(this, &mut env.mem)
+}
+
+- (id)fireDate {
+    env.objc.borrow::<UILocalNotificationHostObject>(this).fire_date
+}
+- (())setFireDate:(id)value {
+    let value = retain(env, value);
+    let host = env.objc.borrow_mut::<UILocalNotificationHostObject>(this);
+    let old = std::mem::replace(&mut host.fire_date, value);
+    release(env, old);
+}
+
+- (id)timeZone {
+    env.objc.borrow::<UILocalNotificationHostObject>(this).time_zone
+}
+- (())setTimeZone:(id)value {
+    let value = retain(env, value);
+    let host = env.objc.borrow_mut::<UILocalNotificationHostObject>(this);
+    let old = std::mem::replace(&mut host.time_zone, value);
+    release(env, old);
+}
+
+- (id)alertBody {
+    env.objc.borrow::<UILocalNotificationHostObject>(this).alert_body
+}
+- (())setAlertBody:(id)value {
+    let value = retain(env, value);
+    let host = env.objc.borrow_mut::<UILocalNotificationHostObject>(this);
+    let old = std::mem::replace(&mut host.alert_body, value);
+    release(env, old);
+}
+
+- (id)alertAction {
+    env.objc.borrow::<UILocalNotificationHostObject>(this).alert_action
+}
+- (())setAlertAction:(id)value {
+    let value = retain(env, value);
+    let host = env.objc.borrow_mut::<UILocalNotificationHostObject>(this);
+    let old = std::mem::replace(&mut host.alert_action, value);
+    release(env, old);
+}
+
+- (id)soundName {
+    env.objc.borrow::<UILocalNotificationHostObject>(this).sound_name
+}
+- (())setSoundName:(id)value {
+    let value = retain(env, value);
+    let host = env.objc.borrow_mut::<UILocalNotificationHostObject>(this);
+    let old = std::mem::replace(&mut host.sound_name, value);
+    release(env, old);
+}
+
+- (id)userInfo {
+    env.objc.borrow::<UILocalNotificationHostObject>(this).user_info
+}
+- (())setUserInfo:(id)value {
+    let value = retain(env, value);
+    let host = env.objc.borrow_mut::<UILocalNotificationHostObject>(this);
+    let old = std::mem::replace(&mut host.user_info, value);
+    release(env, old);
+}
+
+- (NSUInteger)repeatInterval {
+    env.objc.borrow::<UILocalNotificationHostObject>(this).repeat_interval
+}
+- (())setRepeatInterval:(NSUInteger)value {
+    env.objc.borrow_mut::<UILocalNotificationHostObject>(this).repeat_interval = value;
+}
+
+- (NSInteger)applicationIconBadgeNumber {
+    env.objc.borrow::<UILocalNotificationHostObject>(this).application_icon_badge_number
+}
+- (())setApplicationIconBadgeNumber:(NSInteger)value {
+    env.objc.borrow_mut::<UILocalNotificationHostObject>(this).application_icon_badge_number = value;
 }
 
 @end
@@ -336,13 +491,26 @@ pub(super) fn UIApplicationMain(
             "application:didFinishLaunchingWithOptions:",
         ) {
             let empty_dict: id = msg_class![env; NSDictionary dictionary];
+            log_dbg!(
+                "Calling application:didFinishLaunchingWithOptions: on {:?}",
+                delegate
+            );
             () = msg![env; delegate application:ui_application didFinishLaunchingWithOptions:empty_dict];
+            log_dbg!(
+                "Returned from application:didFinishLaunchingWithOptions: on {:?}",
+                delegate
+            );
         } else if env.objc.object_has_method_named(
             &env.mem,
             delegate,
             "applicationDidFinishLaunching:",
         ) {
+            log_dbg!("Calling applicationDidFinishLaunching: on {:?}", delegate);
             () = msg![env; delegate applicationDidFinishLaunching:ui_application];
+            log_dbg!(
+                "Returned from applicationDidFinishLaunching: on {:?}",
+                delegate
+            );
         }
 
         let center: id = msg_class![env; NSNotificationCenter defaultCenter];
@@ -369,7 +537,12 @@ pub(super) fn UIApplicationMain(
             .objc
             .object_has_method_named(&env.mem, delegate, "applicationDidBecomeActive:")
         {
+            log_dbg!("Calling applicationDidBecomeActive: on {:?}", delegate);
             () = msg![env; delegate applicationDidBecomeActive:ui_application];
+            log_dbg!(
+                "Returned from applicationDidBecomeActive: on {:?}",
+                delegate
+            );
         }
 
         let center: id = msg_class![env; NSNotificationCenter defaultCenter];
@@ -454,10 +627,15 @@ const UIApplicationWillEnterForegroundNotification: &str =
 const UIApplicationWillResignActiveNotification: &str = "UIApplicationWillResignActiveNotification";
 const UIApplicationWillTerminateNotification: &str = "UIApplicationWillTerminateNotification";
 /// Other app notifications
+const UIApplicationDidChangeStatusBarFrameNotification: &str =
+    "UIApplicationDidChangeStatusBarFrameNotification";
 const UIApplicationLaunchOptionsRemoteNotificationKey: &str =
     "UIApplicationLaunchOptionsRemoteNotificationKey";
+const UIApplicationLaunchOptionsLocalNotificationKey: &str =
+    "UIApplicationLaunchOptionsLocalNotificationKey";
 const UIApplicationDidReceiveMemoryWarningNotification: &str =
     "UIApplicationDidReceiveMemoryWarningNotification";
+const UILocalNotificationDefaultSoundName: &str = "UILocalNotificationDefaultSoundName";
 
 /// `UIApplicationLaunchOptionsKey` and `NSNotificationName` values.
 /// (Both types are strings)
@@ -491,8 +669,24 @@ pub const CONSTANTS: ConstantExports = &[
         HostConstant::NSString(UIApplicationDidReceiveMemoryWarningNotification),
     ),
     (
+        "_UIApplicationDidChangeStatusBarFrameNotification",
+        HostConstant::NSString(UIApplicationDidChangeStatusBarFrameNotification),
+    ),
+    (
         "_UIApplicationLaunchOptionsRemoteNotificationKey",
         HostConstant::NSString(UIApplicationLaunchOptionsRemoteNotificationKey),
+    ),
+    (
+        "_UIApplicationLaunchOptionsLocalNotificationKey",
+        HostConstant::NSString(UIApplicationLaunchOptionsLocalNotificationKey),
+    ),
+    (
+        "_UILocalNotificationDefaultSoundName",
+        HostConstant::NSString(UILocalNotificationDefaultSoundName),
+    ),
+    (
+        "_UIBackgroundTaskInvalid",
+        HostConstant::Custom(|env| env.mem.alloc_and_write(NSUInteger::MAX).cast().cast_const()),
     ),
 ];
 

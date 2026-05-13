@@ -19,11 +19,23 @@ use super::{NSTimeInterval, NSUInteger};
 use crate::frameworks::foundation::ns_run_loop::{add_perform_request, cancel_perform_requests};
 use crate::frameworks::foundation::ns_thread::detach_new_thread_inner;
 use crate::libc::semaphore::{host_destroy_semaphore, sem_wait};
-use crate::mem::MutVoidPtr;
+use crate::mem::{ConstVoidPtr, MutVoidPtr};
 use crate::objc::{
     autorelease, id, msg, msg_class, msg_send, msg_send_no_type_checking, nil, objc_classes,
-    retain, Class, ClassExports, NSZonePtr, ObjC, TrivialHostObject, SEL,
+    retain, Class, ClassExports, NSZonePtr, ObjC, TrivialHostObject, IMP, SEL,
 };
+
+fn method_imp_for_class(env: &mut crate::Environment, class: Class, selector: SEL) -> ConstVoidPtr {
+    match env.objc.class_get_method_imp(class, selector) {
+        Some(IMP::Guest(guest_imp)) => guest_imp.to_ptr(),
+        Some(IMP::Host(_)) => env
+            .dyld
+            .create_proc_address(&mut env.mem, &mut env.cpu, "_objc_msgSend")
+            .unwrap()
+            .to_ptr(),
+        None => ConstVoidPtr::null(),
+    }
+}
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -66,12 +78,25 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.class_has_method(this, selector)
 }
 
++ (ConstVoidPtr)instanceMethodForSelector:(SEL)selector {
+    method_imp_for_class(env, this, selector)
+}
+
++ (ConstVoidPtr)methodForSelector:(SEL)selector {
+    let class = ObjC::read_isa(this, &env.mem);
+    method_imp_for_class(env, class, selector)
+}
+
 + (())cancelPreviousPerformRequestsWithTarget:(id)target selector:(SEL)selector object:(id)arg {
     let run_loop: id = msg_class![env; NSRunLoop currentRunLoop];
     cancel_perform_requests(env, run_loop, target, selector, arg);
 }
 
 + (bool)accessInstanceVariablesDirectly {
+    true
+}
+
++ (bool)automaticallyNotifiesObserversForKey:(id)_key {
     true
 }
 
@@ -98,6 +123,30 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)init {
     this
+}
+
+- (())willChangeValueForKey:(id)_key {
+}
+
+- (())didChangeValueForKey:(id)_key {
+}
+
+- (())addObserver:(id)_observer
+       forKeyPath:(id)_key_path
+          options:(NSUInteger)_options
+          context:(MutVoidPtr)_context {
+}
+
+- (())removeObserver:(id)_observer forKeyPath:(id)_key_path {
+}
+
+- (())removeObserver:(id)_observer forKeyPath:(id)_key_path context:(MutVoidPtr)_context {
+}
+
+- (())observeValueForKeyPath:(id)_key_path
+                    ofObject:(id)_object
+                      change:(id)_change
+                     context:(MutVoidPtr)_context {
 }
 
 - (NSUInteger)retainCount {
@@ -245,6 +294,11 @@ forUndefinedKey:(id)key { // NSString*
     env.objc.object_has_method(&env.mem, this, selector)
 }
 
+- (ConstVoidPtr)methodForSelector:(SEL)selector {
+    let class = ObjC::read_isa(this, &env.mem);
+    method_imp_for_class(env, class, selector)
+}
+
 - (id)performSelector:(SEL)sel {
     assert!(!sel.is_null());
     msg_send_no_type_checking(env, (this, sel))
@@ -333,6 +387,25 @@ forUndefinedKey:(id)key { // NSString*
     if wait {
         sem_wait(env, sem);
         host_destroy_semaphore(env, sem);
+    }
+}
+
+- (())performSelector:(SEL)sel
+             onThread:(id)thread
+           withObject:(id)arg
+        waitUntilDone:(bool)wait {
+    log_dbg!(
+        "performSelector:{} onThread:{:?} withObject:{:?} waitUntilDone:{}",
+        sel.as_str(&env.mem),
+        thread,
+        arg,
+        wait
+    );
+    if sel.as_str(&env.mem).ends_with(':') {
+        () = msg_send_no_type_checking(env, (this, sel, arg));
+    } else {
+        assert!(arg.is_null());
+        () = msg_send_no_type_checking(env, (this, sel));
     }
 }
 

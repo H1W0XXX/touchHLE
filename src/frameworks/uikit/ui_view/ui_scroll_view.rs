@@ -5,12 +5,12 @@
  */
 //! `UIScrollView`.
 
+pub mod ui_table_view;
 pub mod ui_text_view;
 use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::NSInteger;
 use crate::objc::{
-    id, impl_HostObject_with_superclass, msg, nil, objc_classes, todo_objc_setter, ClassExports,
-    NSZonePtr, SEL,
+    id, impl_HostObject_with_superclass, msg, nil, objc_classes, ClassExports, NSZonePtr, SEL,
 };
 
 type UIScrollViewIndicatorStyle = NSInteger;
@@ -91,7 +91,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setIndicatorStyle:(UIScrollViewIndicatorStyle)style {
-    todo_objc_setter!(this, style);
+    let _ = style;
 }
 
 - (())touchesMoved:(id)touches // NSSet* of UITouch*

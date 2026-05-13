@@ -82,18 +82,26 @@ impl AudioFile {
         // which is appropriate for the file. This is worked around here by
         // using temporary readers for checking if the file is the supported
         // format, then recreating the reader if that works.
-        if hound::WavReader::new(Cursor::new(&bytes)).is_ok() {
-            let reader = hound::WavReader::new(Cursor::new(bytes)).unwrap();
-            Ok(AudioFile(AudioFileInner::Wave(reader)))
-        // TODO: Real MP3/MP4/Non-linear PCM container handling. Currently we
-        // are immediately decoding the entire file to PCM and acting as if
-        // it's a PCM file, simply because because this is easier. Full MP3
-        // support would require a lot of changes in Audio Toolbox.
-        } else if let Ok(pcm) = symphonia_formats::decode_symphonia_to_pcm(Cursor::new(bytes)) {
-            Ok(AudioFile(AudioFileInner::Symphonia(pcm)))
-        } else {
-            Err(AudioFileOpenError::FileDecodeError)
+        if let Ok(reader) = hound::WavReader::new(Cursor::new(&bytes)) {
+            let hound::WavSpec {
+                bits_per_sample,
+                sample_format,
+                ..
+            } = reader.spec();
+            if matches!(bits_per_sample, 8 | 16) && sample_format == hound::SampleFormat::Int {
+                let reader = hound::WavReader::new(Cursor::new(bytes)).unwrap();
+                return Ok(AudioFile(AudioFileInner::Wave(reader)));
+            }
+            drop(reader);
+            // TODO: Real MP3/MP4/Non-linear PCM container handling. Currently we
+            // are immediately decoding the entire file to PCM and acting as if
+            // it's a PCM file, simply because because this is easier. Full MP3
+            // support would require a lot of changes in Audio Toolbox.
         }
+        if let Ok(pcm) = symphonia_formats::decode_symphonia_to_pcm(Cursor::new(bytes)) {
+            return Ok(AudioFile(AudioFileInner::Symphonia(pcm)));
+        }
+        Err(AudioFileOpenError::FileDecodeError)
     }
 
     pub fn audio_description(&self) -> AudioDescription {

@@ -110,6 +110,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)HTTPBody {
     env.objc.borrow::<NSURLRequestHostObject>(this).http_body
 }
+- (NSTimeInterval)timeoutInterval {
+    env.objc.borrow::<NSURLRequestHostObject>(this).timeout_interval
+}
 
 - (())dealloc {
     log_dbg!("[(NSURLRequest*){:?} dealloc]", this);
@@ -130,6 +133,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 @implementation NSMutableURLRequest: NSURLRequest
+
+- (())setTimeoutInterval:(NSTimeInterval)timeout_interval {
+    env.objc.borrow_mut::<NSURLRequestHostObject>(this).timeout_interval = timeout_interval;
+}
 
 - (())setHTTPMethod:(id)http_method { // NSString *
     let http_method_copy = msg![env; http_method copy];

@@ -17,7 +17,7 @@ use crate::frameworks::uikit::ui_font::{
 use crate::frameworks::uikit::ui_graphics::UIGraphicsGetCurrentContext;
 use crate::objc::{
     id, impl_HostObject_with_superclass, msg, msg_class, msg_super, nil, objc_classes, release,
-    retain, todo_objc_setter, ClassExports, NSZonePtr,
+    retain, ClassExports, NSZonePtr,
 };
 
 pub struct UILabelHostObject {
@@ -58,6 +58,18 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
 
+- (id)init {
+    let this: id = msg_super![env; this init];
+    // These aren't redundant, the setters fetch the real defaults.
+    () = msg![env; this setFont:nil];
+    () = msg![env; this setTextColor:nil];
+    () = msg![env; this setBackgroundColor:nil];
+    // Built-in views don't have user-controlled opaqueness.
+    () = msg_super![env; this setOpaque:false];
+    () = msg![env; this setUserInteractionEnabled:false];
+    this
+}
+
 - (id)initWithCoder:(id)coder {
     let this: id = msg_super![env; this initWithCoder:coder];
 
@@ -86,6 +98,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     // Built-in views don't have user-controlled opaqueness.
     () = msg_super![env; this setOpaque:false];
+    () = msg![env; this setUserInteractionEnabled:false];
     this
 }
 
@@ -97,6 +110,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     () = msg![env; this setBackgroundColor:nil];
     // Built-in views don't have user-controlled opaqueness.
     () = msg_super![env; this setOpaque:false];
+    () = msg![env; this setUserInteractionEnabled:false];
     this
 }
 
@@ -182,13 +196,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setBackgroundColor:(id)color { // UIColor*
-    // This overrides the standard setBackgroundColor: accessor on UIView.
-    // UILabel seems to default to white, and setting the background color to
-    // nil also just gives white, rather than the normal transparency. I don't
-    // know how or why it does that, but overriding this setter seems like a
-    // reasonable way to match that behavior.
+    // Zombie Farm and other older UIKit apps rely on labels defaulting to a
+    // transparent background unless an explicit background color is provided.
     let color: id = if color == nil {
-        msg_class![env; UIColor whiteColor]
+        msg_class![env; UIColor clearColor]
     } else {
         color
     };
@@ -196,10 +207,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setShadowColor:(id)color { // UIColor*
-    todo_objc_setter!(this, color);
+    log_dbg!("Ignoring setShadowColor:{:?} for label {:?}", color, this);
 }
 - (())setShadowOffset:(CGSize)value {
-    todo_objc_setter!(this, value);
+    log_dbg!("Ignoring setShadowOffset:{:?} for label {:?}", value, this);
 }
 
 - (())setOpaque:(bool)_opaque {

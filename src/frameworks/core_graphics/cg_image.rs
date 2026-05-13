@@ -9,7 +9,7 @@ use super::cg_color_space::{
     kCGColorSpaceGenericRGB, CGColorSpaceCreateWithName, CGColorSpaceGetModel, CGColorSpaceRef,
 };
 use super::cg_data_provider::{self, CGDataProviderRef};
-use super::CGFloat;
+use super::{CGFloat, CGRect};
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::frameworks::core_foundation::{CFRelease, CFRetain, CFTypeRef};
 use crate::frameworks::foundation::ns_string;
@@ -112,6 +112,53 @@ fn CGImageCreateCopyWithColorSpace(
     from_image(env, new_image)
 }
 
+fn CGImageCreateWithImageInRect(
+    env: &mut Environment,
+    image: CGImageRef,
+    rect: CGRect,
+) -> CGImageRef {
+    let CGRect { origin, size } = rect;
+    if image == nil || size.width <= 0.0 || size.height <= 0.0 {
+        return nil;
+    }
+
+    let (pixels, dimensions) = {
+        let image = env.objc.borrow::<CGImageHostObject>(image);
+        let (source_width, source_height) = image.image.dimensions();
+
+        let x0 = origin.x.floor().max(0.0).min(source_width as f32) as u32;
+        let y0 = origin.y.floor().max(0.0).min(source_height as f32) as u32;
+        let x1 = (origin.x + size.width)
+            .ceil()
+            .max(0.0)
+            .min(source_width as f32) as u32;
+        let y1 = (origin.y + size.height)
+            .ceil()
+            .max(0.0)
+            .min(source_height as f32) as u32;
+
+        if x1 <= x0 || y1 <= y0 {
+            return nil;
+        }
+
+        let crop_width = x1 - x0;
+        let crop_height = y1 - y0;
+        let mut pixels = Vec::with_capacity(crop_width as usize * crop_height as usize * 4);
+        let source_pixels = image.image.pixels();
+        let source_stride = source_width as usize * 4;
+        let row_len = crop_width as usize * 4;
+
+        for y in y0..y1 {
+            let start = y as usize * source_stride + x0 as usize * 4;
+            pixels.extend_from_slice(&source_pixels[start..start + row_len]);
+        }
+
+        (pixels, (crop_width, crop_height))
+    };
+
+    from_image(env, Image::from_pixel_vec(pixels, dimensions))
+}
+
 fn CGImageCreateWithPNGDataProvider(
     env: &mut Environment,
     source: CGDataProviderRef,
@@ -211,6 +258,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGImageRelease(_)),
     export_c_func!(CGImageRetain(_)),
     export_c_func!(CGImageCreateCopyWithColorSpace(_, _)),
+    export_c_func!(CGImageCreateWithImageInRect(_, _)),
     export_c_func!(CGImageCreateWithPNGDataProvider(_, _, _, _)),
     export_c_func!(CGImageCreateWithJPEGDataProvider(_, _, _, _)),
     export_c_func!(CGImageGetAlphaInfo(_)),

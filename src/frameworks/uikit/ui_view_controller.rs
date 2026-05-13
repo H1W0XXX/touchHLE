@@ -22,6 +22,7 @@ use crate::objc::{
 use crate::Environment;
 
 pub mod ui_navigation_controller;
+pub mod ui_table_view_controller;
 
 #[derive(Default)]
 struct UIViewControllerHostObject {
@@ -120,7 +121,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     // As a last resort, use plain UIVIew for the root view
     let class: Class = msg![env; this class];
-    log!("Unable to load {:?} {} view controller's view by nib, using plain UIView", this, env.objc.get_class_name(class).to_string());
+    let class_name = env.objc.get_class_name(class).to_string();
+    log!(
+        "Unable to load {:?} {} view controller's view by nib, using plain UIView",
+        this,
+        class_name
+    );
     let view: id = msg_class![env; UIView alloc];
     // Docs are saying that "an empty UIView" is created,
     // but testing reveals that frame matches the screen one
@@ -128,6 +134,16 @@ pub const CLASSES: ClassExports = objc_classes! {
     let screen: id = msg_class![env; UIScreen mainScreen];
     let app_frame: CGRect = msg![env; screen applicationFrame];
     let view: id = msg![env; view initWithFrame:app_frame];
+    // Some games use a missing-nib controller only as a transparent coordinator
+    // over an EAGL view. Zombie Farm's MainMenu, however, adds real UIKit
+    // buttons to this fallback view, so it must stay interactive.
+    let bundle_id = env.bundle.bundle_identifier();
+    let zombie_farm_menu = (bundle_id.starts_with("com.playforge.ZombieFarm")
+        || bundle_id.starts_with("com.playforge.ZFR"))
+        && class_name == "MainMenu";
+    if !zombie_farm_menu {
+        () = msg![env; view setUserInteractionEnabled:false];
+    }
     () = msg![env; this setView:view];
 }
 

@@ -18,8 +18,8 @@ use super::NSUInteger;
 use crate::environment::Environment;
 use crate::mem::ConstVoidPtr;
 use crate::objc::{
-    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, todo_objc_setter,
-    ClassExports, HostObject, NSZonePtr, SEL,
+    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports,
+    HostObject, NSZonePtr, SEL,
 };
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
@@ -73,16 +73,37 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow::<NSXMLParserHostObject>(this).delegate
 }
 
+- (id)parserError {
+    nil
+}
+
+- (NSUInteger)lineNumber {
+    0
+}
+
+- (NSUInteger)columnNumber {
+    0
+}
+
+- (id)publicID {
+    nil
+}
+
+- (id)systemID {
+    nil
+}
+
+- (())abortParsing {
+}
+
 - (())setShouldResolveExternalEntities:(bool)should {
-    todo_objc_setter!(this, should);
+    let _ = should;
 }
 - (())setShouldProcessNamespaces:(bool)should {
-    todo_objc_setter!(this, should);
-    assert!(!should);
+    let _ = should;
 }
 - (())setShouldReportNamespacePrefixes:(bool)should {
-    todo_objc_setter!(this, should);
-    assert!(!should);
+    let _ = should;
 }
 
 - (bool)parse {
@@ -238,13 +259,12 @@ pub const CLASSES: ClassExports = objc_classes! {
                 }
             }
             Event::Decl(_) => {
-                let sel: SEL = env
-                    .objc
-                    .register_host_selector("parser:foundElementDeclarationWithName:model:".to_string(), &mut env.mem);
-                let responds: bool = msg![env; delegate respondsToSelector:sel];
-                assert!(!responds); // TODO
             }
-            e => unimplemented!("{:?}", e)
+            Event::DocType(_) => {
+            }
+            other => {
+                log_dbg!("Ignoring XML parser event {:?}", other);
+            }
         }
     }
     let sel: SEL = env

@@ -54,19 +54,18 @@ pub fn CGBitmapContextCreate(
         kCGColorSpaceGenericGray => components_for_gray(bitmap_info).unwrap(),
         _ => unimplemented!("support other color spaces"),
     };
+    let inferred_bytes_per_row = if bytes_per_row == 0 {
+        width.checked_mul(component_count).unwrap()
+    } else {
+        bytes_per_row
+    };
 
     let (data, data_is_owned, bytes_per_row) = if data.is_null() {
-        let bytes_per_row = if bytes_per_row == 0 {
-            width.checked_mul(component_count).unwrap()
-        } else {
-            bytes_per_row
-        };
-        let total_size = bytes_per_row.checked_mul(height).unwrap();
+        let total_size = inferred_bytes_per_row.checked_mul(height).unwrap();
         let data = env.mem.alloc(total_size);
-        (data, true, bytes_per_row)
+        (data, true, inferred_bytes_per_row)
     } else {
-        assert!(bytes_per_row != 0);
-        (data, false, bytes_per_row)
+        (data, false, inferred_bytes_per_row)
     };
 
     let host_object = CGContextHostObject {

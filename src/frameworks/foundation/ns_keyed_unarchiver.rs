@@ -81,6 +81,19 @@ pub const CLASSES: ClassExports = objc_classes! {
     autorelease(env, result)
 }
 
++ (())setClass:(id)_class forClassName:(id)class_name {
+    let class_name = if class_name == nil {
+        "<nil>".to_string()
+    } else {
+        to_rust_string(env, class_name).to_string()
+    };
+    log_dbg!("TODO: ignoring [NSKeyedUnarchiver setClass:forClassName:{:?}]", class_name);
+}
+
++ (id)classForClassName:(id)_class_name {
+    nil
+}
+
 // TODO: other init methods.
 
 - (id)initForReadingWithData:(id)data { // NSData *
@@ -134,6 +147,19 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (id)delegate {
     env.objc.borrow::<NSKeyedUnarchiverHostObject>(this).delegate
+}
+
+- (())setClass:(id)_class forClassName:(id)class_name {
+    let class_name = if class_name == nil {
+        "<nil>".to_string()
+    } else {
+        to_rust_string(env, class_name).to_string()
+    };
+    log_dbg!("TODO: ignoring [(NSKeyedUnarchiver*){:?} setClass:forClassName:{:?}]", this, class_name);
+}
+
+- (id)classForClassName:(id)_class_name {
+    nil
 }
 
 // These methods drive most of the decoding. They get called in two cases:

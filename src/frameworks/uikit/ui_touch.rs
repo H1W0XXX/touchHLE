@@ -10,8 +10,8 @@ use crate::frameworks::core_graphics::{CGPoint, CGRect};
 use crate::frameworks::foundation::{NSInteger, NSTimeInterval, NSUInteger};
 use crate::mem::MutVoidPtr;
 use crate::objc::{
-    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
-    NSZonePtr,
+    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, Class, ClassExports,
+    HostObject, NSZonePtr,
 };
 use crate::window::{Coords, Event, FingerId};
 use crate::Environment;
@@ -219,16 +219,33 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
 
         // Assumes the windows in the list are ordered back-to-front.
         // TODO: this may not be correct once we support windowLevel.
+        //
+        // If a higher window only contributes a transparent/non-interactive
+        // placeholder view, its UIView hit-test result is the window itself.
+        // Keep looking through lower windows so EAGL-backed games can still
+        // receive touches.
         let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
-        let Some((window, location_in_window)) = windows.into_iter().rev().find_map(|window| {
+        let mut fallback_window_hit = None;
+        let mut selected_window_hit = None;
+        for window in windows.into_iter().rev() {
             let location_in_window: CGPoint =
                 msg![env; window convertPoint:location fromWindow:nil];
-            if msg![env; window pointInside:location_in_window withEvent:event] {
-                Some((window, location_in_window))
-            } else {
-                None
+            if !msg![env; window pointInside:location_in_window withEvent:event] {
+                continue;
             }
-        }) else {
+            let view: id = msg![env; window hitTest:location_in_window withEvent:event];
+            if view == nil {
+                continue;
+            }
+            if view == window {
+                fallback_window_hit.get_or_insert((window, location_in_window, view));
+                continue;
+            }
+            selected_window_hit = Some((window, location_in_window, view));
+            break;
+        }
+        let Some((window, location_in_window, view)) = selected_window_hit.or(fallback_window_hit)
+        else {
             log!(
                 "Couldn't find a window for touch at {:?}, discarding",
                 location,
@@ -236,26 +253,17 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             continue;
         };
 
-        let view: id = msg![env; window hitTest:location_in_window withEvent:event];
-        if view == nil {
-            log!(
-                "Couldn't find a view for touch at {:?} in window {:?}, discarding",
-                location_in_window,
-                window,
-            );
-            continue;
-        } else {
-            log_dbg!(
-                "Found view {:?} with frame {:?} for touch at {:?} in window {:?}",
-                view,
-                {
-                    let f: CGRect = msg![env; view frame];
-                    f
-                },
-                location_in_window,
-                window,
-            );
-        }
+        let view_class: Class = msg![env; view class];
+        let view_class_name = env.objc.get_class_name(view_class).to_string();
+        let view_frame: CGRect = msg![env; view frame];
+        log_dbg!(
+            "Found view {:?} ({}) with frame {:?} for touch at {:?} in window {:?}",
+            view,
+            view_class_name,
+            view_frame,
+            location_in_window,
+            window,
+        );
 
         let is_multi_touch_enabled: bool = msg![env; view isMultipleTouchEnabled];
         if !is_multi_touch_enabled {
@@ -355,8 +363,6 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             continue;
         }
 
-        log_dbg!("Finger {:?} touch move: {:?}", finger_id, coords);
-
         host_object.previous_location = host_object.location;
         host_object.location = location;
         host_object.timestamp = timestamp;
@@ -389,12 +395,6 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
     autorelease(env, event);
 
     for (view, touches) in view_touches {
-        log_dbg!(
-            "Sending [{:?} touchesMoved:{:?} withEvent:{:?}]",
-            view,
-            touches,
-            event
-        );
         let _: () = msg![env; view touchesMoved:touches withEvent:event];
     }
 

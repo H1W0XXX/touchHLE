@@ -23,18 +23,39 @@ use crate::frameworks::core_graphics::cg_color::CGColorRef;
 use crate::frameworks::core_graphics::cg_context::{CGContextClearRect, CGContextRef};
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::get_static_str;
-use crate::frameworks::foundation::{ns_array, NSInteger, NSUInteger};
+use crate::frameworks::foundation::{ns_array, NSInteger, NSTimeInterval, NSUInteger};
+use crate::mem::MutVoidPtr;
 use crate::objc::{
-    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, todo_objc_setter, Class,
-    ClassExports, HostObject, NSZonePtr, ObjC,
+    autorelease, id, msg, msg_class, msg_send, nil, objc_classes, release, retain,
+    todo_objc_setter, Class, ClassExports, HostObject, NSZonePtr, ObjC, SEL,
 };
 use crate::Environment;
 
-#[derive(Default)]
 pub struct State {
     /// List of views for internal purposes. Non-retaining!
     pub(super) views: Vec<id>,
     pub ui_window: ui_window::State,
+    pub animations_enabled: bool,
+    animation: Option<UIViewAnimationState>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            views: Vec::new(),
+            ui_window: ui_window::State::default(),
+            animations_enabled: true,
+            animation: None,
+        }
+    }
+}
+
+struct UIViewAnimationState {
+    animation_id: id,
+    context: MutVoidPtr,
+    delegate: id,
+    will_start_selector: Option<SEL>,
+    did_stop_selector: Option<SEL>,
 }
 
 pub(super) struct UIViewHostObject {
@@ -65,6 +86,44 @@ impl Default for UIViewHostObject {
             clears_context_before_drawing: true,
             user_interaction_enabled: true,
             multiple_touch_enabled: false,
+        }
+    }
+}
+
+fn call_animation_selector(
+    env: &mut Environment,
+    delegate: id,
+    selector: Option<SEL>,
+    animation_id: id,
+    finished: bool,
+    context: MutVoidPtr,
+) {
+    let Some(selector) = selector else {
+        return;
+    };
+    if selector.is_null() {
+        return;
+    }
+
+    let selector_name = selector.as_str(&env.mem);
+    match selector_name.bytes().filter(|&b| b == b':').count() {
+        0 => {
+            let _: () = msg_send(env, (delegate, selector));
+        }
+        1 => {
+            let _: () = msg_send(env, (delegate, selector, animation_id));
+        }
+        2 => {
+            let _: () = msg_send(env, (delegate, selector, animation_id, finished));
+        }
+        3 => {
+            let _: () = msg_send(env, (delegate, selector, animation_id, finished, context));
+        }
+        _ => {
+            log!(
+                "Warning: UIView animation selector {:?} has too many arguments",
+                selector_name
+            );
         }
     }
 }
@@ -108,6 +167,89 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 + (Class)layerClass {
     env.objc.get_known_class("CALayer", &mut env.mem)
+}
+
++ (())beginAnimations:(id)animation_id context:(MutVoidPtr)context {
+    env.framework_state.uikit.ui_view.animation = Some(UIViewAnimationState {
+        animation_id,
+        context,
+        delegate: nil,
+        will_start_selector: None,
+        did_stop_selector: None,
+    });
+}
+
++ (())commitAnimations {
+    let Some(animation) = env.framework_state.uikit.ui_view.animation.take() else {
+        return;
+    };
+    if animation.delegate == nil {
+        return;
+    }
+
+    call_animation_selector(
+        env,
+        animation.delegate,
+        animation.will_start_selector,
+        animation.animation_id,
+        true,
+        animation.context,
+    );
+    call_animation_selector(
+        env,
+        animation.delegate,
+        animation.did_stop_selector,
+        animation.animation_id,
+        true,
+        animation.context,
+    );
+}
+
++ (())setAnimationDuration:(NSTimeInterval)_duration {
+}
+
++ (())setAnimationDelay:(NSTimeInterval)_delay {
+}
+
++ (())setAnimationCurve:(NSInteger)_curve {
+}
+
++ (())setAnimationDelegate:(id)delegate {
+    if let Some(animation) = &mut env.framework_state.uikit.ui_view.animation {
+        animation.delegate = delegate;
+    }
+}
+
++ (())setAnimationWillStartSelector:(SEL)selector {
+    if let Some(animation) = &mut env.framework_state.uikit.ui_view.animation {
+        animation.will_start_selector = Some(selector);
+    }
+}
+
++ (())setAnimationDidStopSelector:(SEL)selector {
+    if let Some(animation) = &mut env.framework_state.uikit.ui_view.animation {
+        animation.did_stop_selector = Some(selector);
+    }
+}
+
++ (())setAnimationBeginsFromCurrentState:(bool)_from_current_state {
+}
+
++ (())setAnimationRepeatCount:(CGFloat)_repeat_count {
+}
+
++ (())setAnimationRepeatAutoreverses:(bool)_repeat_autoreverses {
+}
+
++ (())setAnimationTransition:(NSInteger)_transition forView:(id)_view cache:(bool)_cache {
+}
+
++ (())setAnimationsEnabled:(bool)enabled {
+    env.framework_state.uikit.ui_view.animations_enabled = enabled;
+}
+
++ (bool)areAnimationsEnabled {
+    env.framework_state.uikit.ui_view.animations_enabled
 }
 
 // TODO: accessors etc
@@ -236,12 +378,19 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setExclusiveTouch:(bool)exclusive {
-    log!("TODO: ignoring setExclusiveTouch:{} for view {:?}", exclusive, this);
+    log_dbg!("Ignoring setExclusiveTouch:{} for view {:?}", exclusive, this);
 }
 
 - (())layoutSubviews {
     // On iOS 5.1 and earlier, the default implementation of this method does
     // nothing.
+}
+- (())setNeedsLayout {
+    // TODO: defer this until the next layout pass.
+    () = msg![env; this layoutSubviews];
+}
+- (())layoutIfNeeded {
+    () = msg![env; this layoutSubviews];
 }
 
 - (id)superview {
@@ -340,6 +489,26 @@ pub const CLASSES: ClassExports = objc_classes! {
     () = msg![env; this_layer insertSublayer:subview_layer below:sibling_layer];
 }
 
+- (())insertSubview:(id)view aboveSubview:(id)sibling {
+    retain(env, view);
+    () = msg![env; view removeFromSuperview];
+
+    let subview_obj = env.objc.borrow_mut::<UIViewHostObject>(view);
+    subview_obj.superview = this;
+    let subview_layer = subview_obj.layer;
+
+    let &mut UIViewHostObject {
+        ref mut subviews,
+        layer: this_layer,
+        ..
+    } = env.objc.borrow_mut(this);
+
+    let idx = subviews.iter().position(|&subview2| subview2 == sibling).unwrap();
+    subviews.insert(idx + 1, view);
+
+    () = msg![env; this_layer insertSublayer:subview_layer atIndex:((idx + 1) as u32)];
+}
+
 - (())bringSubviewToFront:(id)subview {
     if subview == nil {
         // This happens in Touch & Go LITE. It's probably due to the ad classes
@@ -393,6 +562,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())removeFromSuperview {
+    log!(
+        "ZombieFarm trace: UIView {:?} removeFromSuperview",
+        this,
+    );
     let &mut UIViewHostObject {
         ref mut superview,
         layer: this_layer,
@@ -448,6 +621,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; layer isHidden]
 }
 - (())setHidden:(bool)hidden {
+    log!(
+        "ZombieFarm trace: UIView {:?} setHidden:{}",
+        this,
+        hidden,
+    );
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
     msg![env; layer setHidden:hidden]
 }
@@ -470,6 +648,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; layer opacity]
 }
 - (())setAlpha:(CGFloat)alpha {
+    log!(
+        "ZombieFarm trace: UIView {:?} setAlpha:{}",
+        this,
+        alpha,
+    );
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
     msg![env; layer setOpacity:alpha]
 }
@@ -519,8 +702,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; layer bounds]
 }
 - (())setBounds:(CGRect)bounds {
+    log!(
+        "ZombieFarm trace: UIView {:?} setBounds:{:?}",
+        this,
+        bounds,
+    );
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
-    msg![env; layer setBounds:bounds]
+    () = msg![env; layer setBounds:bounds];
+    () = msg![env; this layoutSubviews];
 }
 - (CGPoint)center {
     // FIXME: what happens if [layer anchorPoint] isn't (0.5, 0.5)?
@@ -528,6 +717,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; layer position]
 }
 - (())setCenter:(CGPoint)center {
+    log!(
+        "ZombieFarm trace: UIView {:?} setCenter:{:?}",
+        this,
+        center,
+    );
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
     msg![env; layer setPosition:center]
 }
@@ -536,14 +730,25 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; layer frame]
 }
 - (())setFrame:(CGRect)frame {
+    log!(
+        "ZombieFarm trace: UIView {:?} setFrame:{:?}",
+        this,
+        frame,
+    );
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
-    msg![env; layer setFrame:frame]
+    () = msg![env; layer setFrame:frame];
+    () = msg![env; this layoutSubviews];
 }
 - (CGAffineTransform)transform {
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
     msg![env; layer affineTransform]
 }
 - (())setTransform:(CGAffineTransform)transform {
+    log!(
+        "ZombieFarm trace: UIView {:?} setTransform:{:?}",
+        this,
+        transform,
+    );
     let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
     msg![env; layer setAffineTransform:transform]
 }
@@ -689,10 +894,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setAutoresizingMask:(NSUInteger)mask {
-    todo_objc_setter!(this, mask);
+    log_dbg!("Ignoring setAutoresizingMask:{} for view {:?}", mask, this);
 }
 - (())setAutoresizesSubviews:(bool)enabled {
-    todo_objc_setter!(this, enabled);
+    log_dbg!("Ignoring setAutoresizesSubviews:{} for view {:?}", enabled, this);
 }
 
 - (CGSize)sizeThatFits:(CGSize)size {

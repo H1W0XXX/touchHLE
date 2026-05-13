@@ -111,7 +111,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setDelegate:(id)delegate {
-    todo_objc_setter!(this, delegate);
+    log_dbg!("Ignoring AVAudioPlayer setDelegate:{:?} for {:?}", delegate, this);
 }
 - (())setMeteringEnabled:(bool)enabled {
     todo_objc_setter!(this, enabled);

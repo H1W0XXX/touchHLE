@@ -38,6 +38,7 @@ impl HostObject for ObjectEnumeratorHostObject {}
 #[derive(Debug, Default)]
 pub(super) struct ArrayHostObject {
     pub(super) array: Vec<id>,
+    pub(super) plist_source_path: Option<String>,
 }
 impl HostObject for ArrayHostObject {}
 
@@ -162,6 +163,21 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (bool)containsObject:(id)object {
     let idx: NSUInteger = msg![env; this indexOfObject:object];
     idx != NSNotFound as NSUInteger
+}
+
+- (id)filteredArrayUsingPredicate:(id)predicate {
+    let count: NSUInteger = msg![env; this count];
+    let mut objects = Vec::new();
+    for i in 0..count {
+        let object: id = msg![env; this objectAtIndex:i];
+        let keep: bool = msg![env; predicate evaluateWithObject:object];
+        if keep {
+            retain(env, object);
+            objects.push(object);
+        }
+    }
+    let array = from_vec(env, objects);
+    autorelease(env, array)
 }
 
 - (id)firstObject {
@@ -350,6 +366,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)allocWithZone:(NSZonePtr)_zone {
     let host_object = Box::new(ArrayHostObject {
         array: Vec::new(),
+        plist_source_path: None,
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -363,17 +380,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)initWithArray:(id)array { // NSArray*
-    let mut objects = Vec::new();
-    let enumerator: id = msg![env; array objectEnumerator];
-    loop {
-        let next: id = msg![env; enumerator nextObject];
-        if next == nil {
-            break;
-        }
-        objects.push(next);
-        retain(env, next);
-    }
-    env.objc.borrow_mut::<ArrayHostObject>(this).array = objects;
+    let objects = retained_objects_from_array(env, array, false);
+    replace_array_contents(env, this, objects);
+    this
+}
+
+- (id)initWithArray:(id)array copyItems:(bool)copy_items { // NSArray*
+    let objects = retained_objects_from_array(env, array, copy_items);
+    replace_array_contents(env, this, objects);
     this
 }
 
@@ -507,6 +521,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)allocWithZone:(NSZonePtr)_zone {
     let host_object = Box::new(ArrayHostObject {
         array: Vec::new(),
+        plist_source_path: None,
     });
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
@@ -517,17 +532,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)initWithArray:(id)array { // NSArray*
-    let mut objects = Vec::new();
-    let enumerator: id = msg![env; array objectEnumerator];
-    loop {
-        let next: id = msg![env; enumerator nextObject];
-        if next == nil {
-            break;
-        }
-        objects.push(next);
-        retain(env, next);
-    }
-    env.objc.borrow_mut::<ArrayHostObject>(this).array = objects;
+    let objects = retained_objects_from_array(env, array, false);
+    replace_array_contents(env, this, objects);
+    this
+}
+
+- (id)initWithArray:(id)array copyItems:(bool)copy_items { // NSArray*
+    let objects = retained_objects_from_array(env, array, copy_items);
+    replace_array_contents(env, this, objects);
     this
 }
 
@@ -677,8 +689,16 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
     }
     // TODO: runtime here is O(n^2), it could be O(n) instead
-    for i in to_remove {
+    for i in to_remove.into_iter().rev() {
         () = msg![env; this removeObjectAtIndex:i];
+    }
+}
+
+- (())removeObjectsInArray:(id)other_array {
+    let count: NSUInteger = msg![env; other_array count];
+    for i in 0..count {
+        let object: id = msg![env; other_array objectAtIndex:i];
+        () = msg![env; this removeObject:object];
     }
 }
 
@@ -819,6 +839,34 @@ fn mutable_copy_inner(env: &mut Environment, arr: id) -> id {
     }
     env.objc.borrow_mut::<ArrayHostObject>(mut_arr).array = array;
     mut_arr
+}
+
+fn retained_objects_from_array(env: &mut Environment, array: id, copy_items: bool) -> Vec<id> {
+    let mut objects = Vec::new();
+    let enumerator: id = msg![env; array objectEnumerator];
+    loop {
+        let next: id = msg![env; enumerator nextObject];
+        if next == nil {
+            break;
+        }
+        if copy_items {
+            let copied: id = msg![env; next copy];
+            objects.push(copied);
+        } else {
+            retain(env, next);
+            objects.push(next);
+        }
+    }
+    objects
+}
+
+fn replace_array_contents(env: &mut Environment, arr: id, objects: Vec<id>) {
+    let host_obj = env.objc.borrow_mut::<ArrayHostObject>(arr);
+    host_obj.plist_source_path = None;
+    let old = std::mem::replace(&mut host_obj.array, objects);
+    for object in old {
+        release(env, object);
+    }
 }
 
 fn init_with_coder_inner(env: &mut Environment, arr: id, coder: id) -> id {

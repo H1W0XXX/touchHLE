@@ -35,7 +35,9 @@ pub(super) struct ThreadInitializer {
 }
 
 fn maybe_initialize_class(env: &mut Environment, receiver: id) {
-    let class_host_object = env.objc.get_host_object(receiver).unwrap();
+    let Some(class_host_object) = env.objc.get_host_object(receiver) else {
+        return;
+    };
     let Some(&super::ClassHostObject {
         superclass,
         is_metaclass,
@@ -156,6 +158,60 @@ fn maybe_initialize_class(env: &mut Environment, receiver: id) {
     }
 }
 
+fn trace_zombie_farm_status_message(class_name: &str, selector_name: &str) -> bool {
+    class_name == "StatusBar"
+        || class_name == "NSNotificationCenter"
+        || class_name == "NSInvocation"
+        || (class_name == "MainMenu"
+            && matches!(
+                selector_name,
+                "startupInternet"
+                    | "reachabilityChanged"
+                    | "enableProfileView"
+                    | "updateOnlineStatus"
+                    | "checkServerNotice"
+                    | "playTapped"
+                    | "startGame"
+            ))
+        || matches!(
+            selector_name,
+            "hide"
+                | "statusBar"
+                | "showMessage:"
+                | "showMessage:withCancelTimeout:andCancelNotification:"
+                | "updateMessage:andCancelTimeout:andCancelNotification:"
+                | "setCancelNotification:"
+                | "cancelTapped"
+                | "showCancelButton"
+                | "cancelNotification"
+                | "postNotification:"
+                | "postNotificationName:object:"
+                | "postNotificationName:object:userInfo:"
+                | "addObserver:selector:name:object:"
+                | "removeObserver:"
+                | "removeObserver:name:object:"
+                | "invoke"
+                | "invokeWithTarget:"
+                | "setTarget:"
+                | "setSelector:"
+                | "setArgument:atIndex:"
+                | "retainArguments"
+                | "beginAnimations:context:"
+                | "setAnimationDelegate:"
+                | "setAnimationWillStartSelector:"
+                | "setAnimationDidStopSelector:"
+                | "commitAnimations"
+                | "removeFromSuperview"
+                | "setHidden:"
+                | "setAlpha:"
+                | "setFrame:"
+                | "setBounds:"
+                | "setCenter:"
+                | "setTransform:"
+                | "setUserInteractionEnabled:"
+        )
+}
+
 /// The core implementation of `objc_msgSend`, the main function of Objective-C.
 ///
 /// Note that while only two parameters (usually receiver and selector) are
@@ -191,7 +247,21 @@ fn objc_msgSend_inner(
     }
 
     let orig_class = super2.unwrap_or_else(|| ObjC::read_isa(receiver, &env.mem));
-    assert!(orig_class != nil);
+    if orig_class == nil {
+        let selector_name = selector.as_str(&env.mem);
+        if matches!(selector_name, "release" | "retain" | "autorelease") {
+            log!(
+                "Warning: ignoring {} sent to object {:?} with nil isa",
+                selector_name,
+                receiver
+            );
+            return;
+        }
+        panic!(
+            "Receiver {:?} for selector \"{}\" has nil isa",
+            receiver, selector_name
+        );
+    }
     maybe_initialize_class(env, receiver);
 
     // Traverse the chain of superclasses to find the method implementation.
@@ -224,7 +294,25 @@ fn objc_msgSend_inner(
             );
         }
 
-        let host_object = env.objc.get_host_object(class).unwrap();
+        let Some(host_object) = env.objc.get_host_object(class) else {
+            let selector_name = selector.as_str(&env.mem);
+            if matches!(selector_name, "release" | "retain" | "autorelease") {
+                log!(
+                    "Warning: ignoring {} sent to object {:?} with unregistered class {:?}",
+                    selector_name,
+                    receiver,
+                    class
+                );
+                if selector_name == "retain" || selector_name == "autorelease" {
+                    env.cpu.regs_mut()[0] = receiver.to_bits();
+                }
+                return;
+            }
+            panic!(
+                "Receiver {:?} for selector \"{}\" has unregistered class {:?}",
+                receiver, selector_name, class
+            );
+        };
 
         if let Some(&super::ClassHostObject {
             superclass,
@@ -242,6 +330,24 @@ fn objc_msgSend_inner(
 
             if let Some(imp) = methods.get(&selector) {
                 log_dbg!("Found method on: {}", name);
+                let selector_name = selector.as_str(&env.mem);
+                let receiver_class_name = env.objc.try_get_class_name(orig_class).unwrap_or(name);
+                if trace_zombie_farm_status_message(receiver_class_name, selector_name)
+                    || trace_zombie_farm_status_message(name, selector_name)
+                {
+                    let imp_description = match imp {
+                        IMP::Host(_) => "host".to_string(),
+                        IMP::Guest(guest_imp) => format!("{:?}", guest_imp),
+                    };
+                    log!(
+                        "ZombieFarm trace: [{} {}] receiver {:?}, implementation class {}, imp {}",
+                        receiver_class_name,
+                        selector_name,
+                        receiver,
+                        name,
+                        imp_description,
+                    );
+                }
                 match imp {
                     IMP::Host(host_imp) => {
                         // TODO: do type checks when calling GuestIMPs too.
@@ -298,7 +404,7 @@ Type mismatch when sending message {} to {:?}!
             is_metaclass,
         }) = host_object.as_any().downcast_ref()
         {
-            log!(
+            log_dbg!(
                 "Call to faked class \"{}\" ({:?}) {} method \"{}\". Behaving as if message was sent to nil.",
                 name,
                 class,

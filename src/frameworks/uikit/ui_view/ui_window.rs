@@ -12,7 +12,7 @@
 use super::UIViewHostObject;
 use crate::dyld::{ConstantExports, HostConstant};
 use crate::frameworks::core_graphics::cg_affine_transform::CGAffineTransform;
-use crate::frameworks::core_graphics::{CGPoint, CGRect};
+use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect};
 use crate::frameworks::foundation::ns_string;
 use crate::frameworks::uikit::ui_application::{
     UIInterfaceOrientationLandscapeLeft, UIInterfaceOrientationLandscapeRight,
@@ -243,8 +243,27 @@ pub const UIKeyboardDidShowNotification: &str = "UIKeyboardDidShowNotification";
 pub const UIKeyboardWillHideNotification: &str = "UIKeyboardWillHideNotification";
 pub const UIKeyboardDidHideNotification: &str = "UIKeyboardDidHideNotification";
 pub const UIKeyboardBoundsUserInfoKey: &str = "UIKeyboardBoundsUserInfoKey";
+pub const UIKeyboardFrameEndUserInfoKey: &str = "UIKeyboardFrameEndUserInfoKey";
 
 pub const CONSTANTS: ConstantExports = &[
+    (
+        "_UIWindowLevelAlert",
+        HostConstant::Custom(|env| {
+            env.mem
+                .alloc_and_write(2000.0 as CGFloat)
+                .cast()
+                .cast_const()
+        }),
+    ),
+    (
+        "_UIWindowLevelStatusBar",
+        HostConstant::Custom(|env| {
+            env.mem
+                .alloc_and_write(1000.0 as CGFloat)
+                .cast()
+                .cast_const()
+        }),
+    ),
     (
         "_UIWindowDidBecomeKeyNotification",
         HostConstant::NSString(UIWindowDidBecomeKeyNotification),
@@ -268,5 +287,9 @@ pub const CONSTANTS: ConstantExports = &[
     (
         "_UIKeyboardBoundsUserInfoKey",
         HostConstant::NSString(UIKeyboardBoundsUserInfoKey),
+    ),
+    (
+        "_UIKeyboardFrameEndUserInfoKey",
+        HostConstant::NSString(UIKeyboardFrameEndUserInfoKey),
     ),
 ];

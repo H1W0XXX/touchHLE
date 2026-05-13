@@ -7,8 +7,7 @@
 
 use crate::frameworks::foundation::NSInteger;
 use crate::objc::{
-    id, impl_HostObject_with_superclass, msg, objc_classes, todo_objc_setter, ClassExports,
-    NSZonePtr,
+    id, impl_HostObject_with_superclass, msg, objc_classes, ClassExports, NSZonePtr,
 };
 
 type UIActivityIndicatorViewStyle = NSInteger;
@@ -34,20 +33,19 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)initWithActivityIndicatorStyle:(UIActivityIndicatorViewStyle)_style {
-    // TODO: proper init
-    msg![env; this init]
+    let this: id = msg![env; this init];
+    () = msg![env; this setUserInteractionEnabled:false];
+    this
 }
 
 - (())setActivityIndicatorViewStyle:(UIActivityIndicatorViewStyle)style {
-    todo_objc_setter!(this, style);
+    log_dbg!("Ignoring setActivityIndicatorViewStyle:{} for {:?}", style, this);
 }
 
 - (())startAnimating {
-    log!("TODO: [(UIActivityIndicatorView *){:?} startAnimating]", this);
     env.objc.borrow_mut::<UIActivityIndicatorViewHostObject>(this).animating = true;
 }
 - (())stopAnimating {
-    log!("TODO: [(UIActivityIndicatorView *){:?} stopAnimating]", this);
     env.objc.borrow_mut::<UIActivityIndicatorViewHostObject>(this).animating = false;
 }
 

@@ -179,6 +179,25 @@ impl ObjC {
         }
     }
 
+    /// Returns the implementation for a method in the class chain.
+    pub fn class_get_method_imp(&self, class: Class, sel: SEL) -> Option<&IMP> {
+        let mut class = class;
+        loop {
+            let &ClassHostObject {
+                superclass,
+                ref methods,
+                ..
+            } = self.borrow(class);
+            if let Some(imp) = methods.get(&sel) {
+                return Some(imp);
+            } else if superclass == nil {
+                return None;
+            } else {
+                class = superclass;
+            }
+        }
+    }
+
     /// Same as [Self::class_has_method], but using a named selector (rather
     /// than a pointer).
     pub fn class_has_method_named(&self, class: Class, sel_name: &str) -> bool {

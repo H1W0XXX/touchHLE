@@ -532,7 +532,7 @@ impl Dyld {
         // Collecting unhandled relocations for the same symbol onto one line
         // makes the log output much less spammy.
         for (name, addrs) in unhandled_relocations {
-            log!(
+            log_dbg!(
                 "Warning: unhandled external relocation {:?} in {:?} at {}",
                 name,
                 bin.name,
@@ -593,7 +593,7 @@ impl Dyld {
                 continue;
             }
 
-            log!(
+            log_dbg!(
                 "Warning: unhandled non-lazy symbol {:?} at {:?} in \"{}\"",
                 symbol,
                 ptr_ptr,

@@ -93,8 +93,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)initWithContentURL:(id)url { // NSURL*
-    log!(
-        "TODO: [(MPMoviePlayerController*){:?} initWithContentURL:{:?} ({:?})]",
+    if env.bundle.bundle_identifier().starts_with("com.playforge.ZFR") {
+        log_dbg!("Applying game-specific hack for Zombie Farm Rescue: ignoring movie player content");
+        release(env, this);
+        return nil;
+    }
+
+    log_dbg!(
+        "[(MPMoviePlayerController*){:?} initWithContentURL:{:?} ({:?})]",
         this,
         url,
         ns_url::to_rust_path(env, url),
@@ -164,7 +170,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // MPMediaPlayback implementation
 - (())play {
-    log!("TODO: [(MPMoviePlayerController*){:?} play]", this);
+    log_dbg!("[(MPMoviePlayerController*){:?} play]", this);
     if let Some(old) = env.framework_state.media_player.movie_player.active_player {
         let _: () = msg![env; old stop];
     }

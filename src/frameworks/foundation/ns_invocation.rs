@@ -139,6 +139,46 @@ pub const CLASSES: ClassExports = objc_classes! {
             let arg = env.mem.read(arg_loc);
             env.mem.alloc_and_write(arg).cast()
         }
+        "d" => {
+            let arg_loc: MutPtr<f64> = arg_loc.cast();
+            let arg = env.mem.read(arg_loc);
+            env.mem.alloc_and_write(arg).cast()
+        }
+        "c" | "B" => {
+            let arg_loc: MutPtr<u8> = arg_loc.cast();
+            let arg = env.mem.read(arg_loc);
+            env.mem.alloc_and_write(arg).cast()
+        }
+        "s" => {
+            let arg_loc: MutPtr<i16> = arg_loc.cast();
+            let arg = env.mem.read(arg_loc);
+            env.mem.alloc_and_write(arg).cast()
+        }
+        "S" => {
+            let arg_loc: MutPtr<u16> = arg_loc.cast();
+            let arg = env.mem.read(arg_loc);
+            env.mem.alloc_and_write(arg).cast()
+        }
+        "i" | "l" => {
+            let arg_loc: MutPtr<i32> = arg_loc.cast();
+            let arg = env.mem.read(arg_loc);
+            env.mem.alloc_and_write(arg).cast()
+        }
+        "I" | "L" => {
+            let arg_loc: MutPtr<u32> = arg_loc.cast();
+            let arg = env.mem.read(arg_loc);
+            env.mem.alloc_and_write(arg).cast()
+        }
+        "q" => {
+            let arg_loc: MutPtr<i64> = arg_loc.cast();
+            let arg = env.mem.read(arg_loc);
+            env.mem.alloc_and_write(arg).cast()
+        }
+        "Q" => {
+            let arg_loc: MutPtr<u64> = arg_loc.cast();
+            let arg = env.mem.read(arg_loc);
+            env.mem.alloc_and_write(arg).cast()
+        }
         "@" => {
             assert!(!arguments_retained); // TODO
             let arg_loc: MutPtr<id> = arg_loc.cast();
@@ -169,15 +209,19 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())invoke {
-    // Safeguard: all arguments must be set (except first two)
-    let arguments: &Vec<Option<MutVoidPtr>> = env.objc.borrow::<NSInvocationHostObject>(this).arguments.as_ref();
-    let set_count = arguments.iter().flatten().count();
-    let all_count = arguments.len();
-    assert_eq!(set_count + 2, all_count);
-
     let sig = env.objc.borrow::<NSInvocationHostObject>(this).sig;
     let ret_type: ConstPtr<u8> = msg![env; sig methodReturnType];
     assert!(env.mem.read(ret_type) == b'v'); // TODO
+
+    let &NSInvocationHostObject { target, selector, .. } = env.objc.borrow::<NSInvocationHostObject>(this);
+    if target == nil {
+        log_dbg!(
+            "Ignoring NSInvocation {:?} with nil target for selector {:?}",
+            this,
+            selector.map(|sel| sel.as_str(&env.mem).to_string()),
+        );
+        return;
+    }
 
     // `call_from_host` re-use
     // TODO: retval_ptr
@@ -190,7 +234,14 @@ pub const CLASSES: ClassExports = objc_classes! {
             "@" => <id as GuestArg>::REG_COUNT,
             ":" => <SEL as GuestArg>::REG_COUNT,
             "f" => <f32 as GuestArg>::REG_COUNT,
-            "c" => <u8 as GuestArg>::REG_COUNT,
+            "d" => <f64 as GuestArg>::REG_COUNT,
+            "c" | "B" => <u8 as GuestArg>::REG_COUNT,
+            "s" => <i16 as GuestArg>::REG_COUNT,
+            "S" => <u16 as GuestArg>::REG_COUNT,
+            "i" | "l" => <i32 as GuestArg>::REG_COUNT,
+            "I" | "L" => <u32 as GuestArg>::REG_COUNT,
+            "q" => <i64 as GuestArg>::REG_COUNT,
+            "Q" => <u64 as GuestArg>::REG_COUNT,
             "*" => <MutPtr<u8> as GuestArg>::REG_COUNT,
             // pointer cases
             _ if arg_type.starts_with('^') => <MutVoidPtr as GuestArg>::REG_COUNT,
@@ -223,8 +274,29 @@ pub const CLASSES: ClassExports = objc_classes! {
             write_next_arg::<SEL>(&mut reg_offset, regs, &mut env.mem, selector);
             continue;
         }
-        let arg_slot = arguments[i].unwrap();
         let arg_type = argument_types[i].as_str();
+        let Some(arg_slot) = arguments[i] else {
+            log!("Warning: invoking NSInvocation {:?} with unset argument {} of type {}", this, i, arg_type);
+            let regs = env.cpu.regs_mut();
+            match arg_type {
+                "@" => write_next_arg::<id>(&mut reg_offset, regs, &mut env.mem, nil),
+                "f" => write_next_arg::<f32>(&mut reg_offset, regs, &mut env.mem, 0.0),
+                "d" => write_next_arg::<f64>(&mut reg_offset, regs, &mut env.mem, 0.0),
+                "c" | "B" => write_next_arg::<u8>(&mut reg_offset, regs, &mut env.mem, 0),
+                "s" => write_next_arg::<i16>(&mut reg_offset, regs, &mut env.mem, 0),
+                "S" => write_next_arg::<u16>(&mut reg_offset, regs, &mut env.mem, 0),
+                "i" | "l" => write_next_arg::<i32>(&mut reg_offset, regs, &mut env.mem, 0),
+                "I" | "L" => write_next_arg::<u32>(&mut reg_offset, regs, &mut env.mem, 0),
+                "q" => write_next_arg::<i64>(&mut reg_offset, regs, &mut env.mem, 0),
+                "Q" => write_next_arg::<u64>(&mut reg_offset, regs, &mut env.mem, 0),
+                "*" => write_next_arg::<MutPtr<u8>>(&mut reg_offset, regs, &mut env.mem, MutPtr::null()),
+                _ if arg_type.starts_with('^') => {
+                    write_next_arg::<MutVoidPtr>(&mut reg_offset, regs, &mut env.mem, MutVoidPtr::null())
+                }
+                _ => unimplemented!("default unset arg for {arg_type}"),
+            }
+            continue;
+        };
         // TODO: refactor and simplify
         match arg_type {
             "@" => {
@@ -239,11 +311,53 @@ pub const CLASSES: ClassExports = objc_classes! {
                 let regs = env.cpu.regs_mut();
                 write_next_arg::<f32>(&mut reg_offset, regs, &mut env.mem, arg_val);
             },
-            "c" => {
+            "d" => {
+                let arg: ConstPtr<f64> = arg_slot.cast().cast_const();
+                let arg_val = env.mem.read(arg);
+                let regs = env.cpu.regs_mut();
+                write_next_arg::<f64>(&mut reg_offset, regs, &mut env.mem, arg_val);
+            },
+            "c" | "B" => {
                 let arg: ConstPtr<u8> = arg_slot.cast().cast_const();
                 let arg_val = env.mem.read(arg);
                 let regs = env.cpu.regs_mut();
                 write_next_arg::<u8>(&mut reg_offset, regs, &mut env.mem, arg_val);
+            }
+            "s" => {
+                let arg: ConstPtr<i16> = arg_slot.cast().cast_const();
+                let arg_val = env.mem.read(arg);
+                let regs = env.cpu.regs_mut();
+                write_next_arg::<i16>(&mut reg_offset, regs, &mut env.mem, arg_val);
+            }
+            "S" => {
+                let arg: ConstPtr<u16> = arg_slot.cast().cast_const();
+                let arg_val = env.mem.read(arg);
+                let regs = env.cpu.regs_mut();
+                write_next_arg::<u16>(&mut reg_offset, regs, &mut env.mem, arg_val);
+            }
+            "i" | "l" => {
+                let arg: ConstPtr<i32> = arg_slot.cast().cast_const();
+                let arg_val = env.mem.read(arg);
+                let regs = env.cpu.regs_mut();
+                write_next_arg::<i32>(&mut reg_offset, regs, &mut env.mem, arg_val);
+            }
+            "I" | "L" => {
+                let arg: ConstPtr<u32> = arg_slot.cast().cast_const();
+                let arg_val = env.mem.read(arg);
+                let regs = env.cpu.regs_mut();
+                write_next_arg::<u32>(&mut reg_offset, regs, &mut env.mem, arg_val);
+            }
+            "q" => {
+                let arg: ConstPtr<i64> = arg_slot.cast().cast_const();
+                let arg_val = env.mem.read(arg);
+                let regs = env.cpu.regs_mut();
+                write_next_arg::<i64>(&mut reg_offset, regs, &mut env.mem, arg_val);
+            }
+            "Q" => {
+                let arg: ConstPtr<u64> = arg_slot.cast().cast_const();
+                let arg_val = env.mem.read(arg);
+                let regs = env.cpu.regs_mut();
+                write_next_arg::<u64>(&mut reg_offset, regs, &mut env.mem, arg_val);
             }
             "*" => {
                 let arg: ConstPtr<MutPtr<u8>> = arg_slot.cast().cast_const();
@@ -263,7 +377,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     // actual invocation
-    let &NSInvocationHostObject { target, selector, .. } = env.objc.borrow::<NSInvocationHostObject>(this);
     objc_msgSend(env, target, selector.unwrap());
 
     let regs = env.cpu.regs_mut(); // re-borrow

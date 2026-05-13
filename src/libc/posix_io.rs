@@ -901,6 +901,42 @@ fn truncate(env: &mut Environment, path_ptr: ConstPtr<u8>, len: off_t) -> i32 {
     res
 }
 
+fn setxattr(
+    env: &mut Environment,
+    path: ConstPtr<u8>,
+    name: ConstPtr<u8>,
+    _value: ConstVoidPtr,
+    size: GuestUSize,
+    position: u32,
+    options: i32,
+) -> i32 {
+    set_errno(env, 0);
+
+    let path_string = env
+        .mem
+        .cstr_at_utf8(path)
+        .map_or("<invalid utf8>".to_string(), ToOwned::to_owned);
+    let name_string = env
+        .mem
+        .cstr_at_utf8(name)
+        .map_or("<invalid utf8>".to_string(), ToOwned::to_owned);
+    log_once!(
+        "Warning: setxattr() extended attributes are not persisted by touchHLE's file system"
+    );
+    log_dbg!(
+        "setxattr({:?} {:?}, {:?} {:?}, size {}, position {}, options {:#x}) => 0",
+        path,
+        path_string,
+        name,
+        name_string,
+        size,
+        position,
+        options
+    );
+
+    0
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(open(_, _, _)),
     export_c_func!(read(_, _, _)),
@@ -917,6 +953,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(fsync(_)),
     export_c_func!(ftruncate(_, _)),
     export_c_func!(truncate(_, _)),
+    export_c_func!(setxattr(_, _, _, _, _, _)),
 ];
 
 /// Helper function, not part of API

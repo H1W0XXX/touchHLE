@@ -20,6 +20,8 @@ type NSSearchPathDirectory = NSUInteger;
 const NSApplicationDirectory: NSSearchPathDirectory = 1;
 const NSLibraryDirectory: NSSearchPathDirectory = 5;
 const NSDocumentDirectory: NSSearchPathDirectory = 9;
+const NSCachesDirectory: NSSearchPathDirectory = 13;
+const NSApplicationSupportDirectory: NSSearchPathDirectory = 14;
 
 type NSSearchPathDomainMask = NSUInteger;
 const NSUserDomainMask: NSSearchPathDomainMask = 1;
@@ -72,6 +74,12 @@ fn NSSearchPathForDirectoriesInDomains(
         }
         NSDocumentDirectory => env.fs.home_directory().join("Documents"),
         NSLibraryDirectory => env.fs.home_directory().join("Library"),
+        NSCachesDirectory => env.fs.home_directory().join("Library").join("Caches"),
+        NSApplicationSupportDirectory => env
+            .fs
+            .home_directory()
+            .join("Library")
+            .join("Application Support"),
         _ => todo!("NSSearchPathDirectory {}", directory),
     };
     let dir = ns_string::from_rust_string(env, String::from(dir));
@@ -219,6 +227,38 @@ pub const CLASSES: ClassExports = objc_classes! {
         Err(()) => {
             if !error.is_null() {
                todo!(); // TODO: create an NSError if requested
+            }
+            false
+        }
+    }
+}
+
+- (bool)createSymbolicLinkAtPath:(id)path // NSString*
+              withDestinationPath:(id)dest_path // NSString*
+                            error:(MutPtr<id>)error { // NSError**
+    let path = ns_string::to_rust_string(env, path);
+    let dest_path = ns_string::to_rust_string(env, dest_path);
+    let path = GuestPath::new(&path);
+    let dest_path = GuestPath::new(&dest_path);
+
+    // The guest FS has no symlink node type. Approximate this as a copy of the
+    // current destination so apps that use symlinks as path aliases can proceed.
+    let result = if env.fs.is_file(dest_path) {
+        env.fs
+            .read(dest_path)
+            .and_then(|data| env.fs.write(path, &data))
+            .map_err(|_| ())
+    } else if env.fs.is_dir(dest_path) {
+        env.fs.create_dir_all(path).map_err(|_| ())
+    } else {
+        Err(())
+    };
+
+    match result {
+        Ok(()) => true,
+        Err(()) => {
+            if !error.is_null() {
+                env.mem.write(error, nil);
             }
             false
         }

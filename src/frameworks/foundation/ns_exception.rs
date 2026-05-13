@@ -279,8 +279,8 @@ pub const CONSTANTS: ConstantExports = &[
 /// This exception handler is supposed to do last-minute logging before the
 /// program terminates. For our purposes, it's completely safe to ignore that.
 fn NSSetUncaughtExceptionHandler(_env: &mut Environment, handler: MutVoidPtr) {
-    log!(
-        "TODO: Ignoring uncaught exception handler at address {:?}",
+    log_dbg!(
+        "Ignoring uncaught exception handler at address {:?}",
         handler
     );
 }

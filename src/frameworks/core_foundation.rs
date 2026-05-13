@@ -30,6 +30,7 @@ pub mod cf_socket;
 pub mod cf_string;
 pub mod cf_type;
 pub mod cf_url;
+pub mod cf_uuid;
 pub mod time;
 
 pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
@@ -62,6 +63,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         cf_string::FUNCTIONS,
         cf_type::FUNCTIONS,
         cf_url::FUNCTIONS,
+        cf_uuid::FUNCTIONS,
         time::FUNCTIONS,
     ],
 };

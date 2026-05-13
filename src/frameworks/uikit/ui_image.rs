@@ -44,6 +44,16 @@ struct UIImageHostObject {
 }
 impl HostObject for UIImageHostObject {}
 
+fn zombie_farm_image_alias(name: &str) -> Option<&'static str> {
+    match name {
+        "textBox.png" => Some("slide_panel_input_cell.png"),
+        "cellTextBg_82.png" => Some("slide_panel_name_cell.png"),
+        "cellTextBg_small_42.png" => Some("slide_panel_btn_cell.png"),
+        "icon_person.png" => Some("main_panel_name_cell_image_cover.png"),
+        _ => None,
+    }
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -62,10 +72,47 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (id)imageNamed:(id)name { // NSString*
-    // TODO: figure out whether this is actually correct in all cases
     let bundle: id = msg_class![env; NSBundle mainBundle];
-    let path: id = msg![env; bundle pathForResource:name ofType:nil];
+    let bundle_id = env.bundle.bundle_identifier().to_string();
     let name_str = ns_string::to_rust_string(env, name).to_string();
+    let mut path: id = msg![env; bundle pathForResource:name ofType:nil];
+    if path == nil && !name_str.rsplit_once('.').is_some() {
+        // UIKit accepts extensionless image names and resolves common image
+        // resources such as "Foo" -> "Foo.png".
+        for extension in ["png", "jpg", "jpeg"] {
+            let extension = get_static_str(env, extension);
+            path = msg![env; bundle pathForResource:name ofType:extension];
+            if path != nil {
+                break;
+            }
+        }
+    }
+    if path == nil
+        && (bundle_id.starts_with("com.playforge.ZombieFarm")
+            || bundle_id.starts_with("com.playforge.ZFR"))
+    {
+        if let Some(alias) = zombie_farm_image_alias(&name_str) {
+            let alias = ns_string::from_rust_string(env, alias.to_string());
+            autorelease(env, alias);
+            path = msg![env; bundle pathForResource:alias ofType:nil];
+            if path == nil {
+                for extension in ["png", "jpg", "jpeg"] {
+                    let extension = get_static_str(env, extension);
+                    path = msg![env; bundle pathForResource:alias ofType:extension];
+                    if path != nil {
+                        break;
+                    }
+                }
+            }
+            if path != nil {
+                log_dbg!(
+                    "ZombieFarm image alias: {:?} -> {:?}",
+                    name_str,
+                    ns_string::to_rust_string(env, alias),
+                );
+            }
+        }
+    }
     if path == nil {
         log!("Warning: [UIImage imageNamed:{:?}] => nil", name_str);
         return nil;

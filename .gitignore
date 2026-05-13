@@ -23,3 +23,10 @@ android/build
 # Default developer dump file
 
 DUMP.txt
+
+# Local game/debug artifacts
+/zombie_farm/
+/_tmp*/
+/.tmp*/
+/touchhle_*.log
+/tools/__pycache__/

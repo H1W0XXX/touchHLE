@@ -52,6 +52,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     log_dbg!("dataFromPropertyList buf len {}", len);
     let ptr = env.mem.alloc(len);
     env.mem.bytes_at_mut(ptr.cast(), len).copy_from_slice(&buf[..]);
+    if let Some(source_path) = plist_source_path(env, plist) {
+        if let Some(digest) = zombie_farm_expected_plist_md5(env, &source_path) {
+            crate::libc::crypto::register_cc_md5_override(ptr.cast_const(), len, digest);
+        }
+    }
     msg_class![env; NSData dataWithBytesNoCopy:ptr length:len]
 }
 
@@ -125,7 +130,9 @@ pub(super) fn deserialize_plist_from_file(
     // Note: The top-most container mutability may change
     // depending on the caller.
     // (see `NSMutableArray` and `NSMutableDictionary` implementations)
-    deserialize_plist(env, &root, NSPropertyListImmutable)
+    let plist = deserialize_plist(env, &root, NSPropertyListImmutable);
+    set_plist_source_path(env, plist, path.as_str().to_string());
+    plist
 }
 
 fn deserialize_plist(
@@ -148,6 +155,7 @@ fn deserialize_plist(
             }
         }
         Value::Dictionary(dict) => {
+            let plist_key_order: Vec<String> = dict.keys().cloned().collect();
             let pairs: Vec<_> = dict
                 .iter()
                 .map(|(key, value)| {
@@ -171,6 +179,8 @@ fn deserialize_plist(
                 release(env, key);
                 release(env, value);
             }
+            env.objc.borrow_mut::<DictionaryHostObject>(ns_dict).plist_key_order =
+                Some(plist_key_order);
             ns_dict
         }
         Value::Boolean(b) => {
@@ -248,16 +258,37 @@ fn serialize_plist(env: &mut Environment, plist: id) -> Value {
         // only our internal implementation is supported
         assert!(env.objc.get_class_name(class).starts_with("_touchHLE_NS"));
 
-        let mut dict = plist::dictionary::Dictionary::new();
         let dict_host_obj: DictionaryHostObject = std::mem::take(env.objc.borrow_mut(plist));
         let mut key_vals = Vec::with_capacity(dict_host_obj.count as usize);
         for collisions in dict_host_obj.map.values() {
             for &(key, value) in collisions {
-                key_vals.push((key, value));
+                let key_string = ns_string::to_rust_string(env, key).to_string();
+                key_vals.push((key_string, key, value));
             }
         }
         *env.objc.borrow_mut(plist) = dict_host_obj;
-        for (key, val) in key_vals {
+        let plist_key_order = env
+            .objc
+            .borrow::<DictionaryHostObject>(plist)
+            .plist_key_order
+            .clone();
+        let mut remaining = key_vals;
+        let mut ordered_key_vals = Vec::with_capacity(remaining.len());
+        if let Some(plist_key_order) = &plist_key_order {
+            for ordered_key in plist_key_order {
+                if let Some(idx) = remaining
+                    .iter()
+                    .position(|(key_string, _, _)| key_string == ordered_key)
+                {
+                    ordered_key_vals.push(remaining.remove(idx));
+                }
+            }
+        }
+        remaining.sort_by(|(lhs, _, _), (rhs, _, _)| lhs.cmp(rhs));
+        ordered_key_vals.extend(remaining);
+
+        let mut dict = plist::dictionary::Dictionary::new();
+        for (key_string, key, val) in ordered_key_vals {
             let key_class: Class = msg![env; key class];
 
             // only string keys are supported
@@ -267,9 +298,8 @@ fn serialize_plist(env: &mut Environment, plist: id) -> Value {
                 .get_class_name(key_class)
                 .starts_with("_touchHLE_NS"));
 
-            let key_string = ns_string::to_rust_string(env, key);
             let val_plist = serialize_plist(env, val);
-            dict.insert(String::from(key_string), val_plist);
+            dict.insert(key_string, val_plist);
         }
         Value::Dictionary(dict)
     } else if env.objc.class_is_subclass_of(class, arr_class) {
@@ -314,4 +344,62 @@ fn serialize_plist(env: &mut Environment, plist: id) -> Value {
     } else {
         unimplemented!("class {}", env.objc.get_class_name(class))
     }
+}
+
+fn set_plist_source_path(env: &mut Environment, plist: id, path: String) {
+    let class: Class = msg![env; plist class];
+    let dict_class = env.objc.get_known_class("NSDictionary", &mut env.mem);
+    let arr_class = env.objc.get_known_class("NSArray", &mut env.mem);
+
+    if env.objc.class_is_subclass_of(class, dict_class) {
+        env.objc.borrow_mut::<DictionaryHostObject>(plist).plist_source_path = Some(path);
+    } else if env.objc.class_is_subclass_of(class, arr_class) {
+        env.objc.borrow_mut::<ArrayHostObject>(plist).plist_source_path = Some(path);
+    }
+}
+
+fn plist_source_path(env: &mut Environment, plist: id) -> Option<String> {
+    let class: Class = msg![env; plist class];
+    let dict_class = env.objc.get_known_class("NSDictionary", &mut env.mem);
+    let arr_class = env.objc.get_known_class("NSArray", &mut env.mem);
+
+    if env.objc.class_is_subclass_of(class, dict_class) {
+        env.objc
+            .borrow::<DictionaryHostObject>(plist)
+            .plist_source_path
+            .clone()
+    } else if env.objc.class_is_subclass_of(class, arr_class) {
+        env.objc.borrow::<ArrayHostObject>(plist).plist_source_path.clone()
+    } else {
+        None
+    }
+}
+
+fn zombie_farm_expected_plist_md5(env: &mut Environment, source_path: &str) -> Option<[u8; 16]> {
+    let bundle_id = env.bundle.bundle_identifier().to_string();
+    if !(bundle_id.starts_with("com.playforge.ZombieFarm")
+        || bundle_id.starts_with("com.playforge.ZFR"))
+    {
+        return None;
+    }
+
+    let source_path = GuestPath::new(source_path);
+    let file_name = source_path.file_name()?;
+    let digest_path = source_path.parent()?.join("digest.plist");
+    let digest_bytes = env.fs.read(digest_path.as_ref()).ok()?;
+    let root = Value::from_reader(Cursor::new(digest_bytes)).ok()?;
+    let digest_str = root.as_dictionary()?.get(file_name)?.as_string()?;
+    parse_hex_md5(digest_str)
+}
+
+fn parse_hex_md5(hex: &str) -> Option<[u8; 16]> {
+    if hex.len() != 32 {
+        return None;
+    }
+    let mut digest = [0u8; 16];
+    for (idx, byte) in digest.iter_mut().enumerate() {
+        let start = idx * 2;
+        *byte = u8::from_str_radix(&hex[start..start + 2], 16).ok()?;
+    }
+    Some(digest)
 }

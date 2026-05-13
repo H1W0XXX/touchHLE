@@ -49,6 +49,12 @@ pub const NSUTF16StringEncoding: NSUInteger = NSUnicodeStringEncoding;
 pub const NSUTF16BigEndianStringEncoding: NSUInteger = 0x90000100;
 pub const NSUTF16LittleEndianStringEncoding: NSUInteger = 0x94000100;
 
+fn is_zombie_farm_save_path(path: &str) -> bool {
+    path.ends_with("/Documents/saveGame.bin2")
+        || path.ends_with("/Documents/saveGame.preview")
+        || path.ends_with("/Documents/playerProfileManager.txt")
+}
+
 pub type NSStringCompareOptions = NSUInteger;
 pub const NSCaseInsensitiveSearch: NSUInteger = 1;
 pub const NSLiteralSearch: NSUInteger = 2;
@@ -685,6 +691,11 @@ pub const CLASSES: ClassExports = objc_classes! {
           encoding:(NSStringEncoding)encoding {
     get_bytes_buffer_inner(env, this, buffer, buffer_size, encoding, true)
 }
+
+- (NSUInteger)lengthOfBytesUsingEncoding:(NSStringEncoding)encoding {
+    length_of_bytes_using_encoding_inner(env, this, encoding)
+}
+
 - (())getCString:(MutPtr<u8>)buffer {
     let encoding: NSStringEncoding = msg_class![env; NSString defaultCStringEncoding];
 
@@ -1147,6 +1158,15 @@ pub const CLASSES: ClassExports = objc_classes! {
     assert!(encoding == NSUTF8StringEncoding || encoding == NSASCIIStringEncoding);
 
     let string = to_rust_string(env, this);
+    let path_str = to_rust_string(env, path);
+    if is_zombie_farm_save_path(&path_str) {
+        log!(
+            "ZombieFarm save: NSString write '{}' ({} chars, encoding {})",
+            path_str,
+            string.len(),
+            encoding
+        );
+    }
     let c_string = env.mem.alloc_and_write_cstr(string.as_bytes());
     // This should not include a NULL terminator!
     let length: NSUInteger = string.len().try_into().unwrap();
@@ -1357,7 +1377,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     // TODO: avoid copy?
     let path = to_rust_string(env, path);
+    if is_zombie_farm_save_path(&path) {
+        log!("ZombieFarm save: NSString read '{}'", path);
+    }
     let Ok(bytes) = env.fs.read(GuestPath::new(&path)) else {
+        if is_zombie_farm_save_path(&path) {
+            log!("ZombieFarm save: NSString read missing '{}'", path);
+        }
         return nil;
     };
     let len = bytes.len();
@@ -1380,7 +1406,13 @@ pub const CLASSES: ClassExports = objc_classes! {
                        error:(MutPtr<id>)error { // NSError**
     // TODO: avoid copy?
     let path = to_rust_string(env, path);
+    if is_zombie_farm_save_path(&path) {
+        log!("ZombieFarm save: NSString read '{}' encoding {}", path, encoding);
+    }
     let Ok(bytes) = env.fs.read(GuestPath::new(&path)) else {
+        if is_zombie_farm_save_path(&path) {
+            log!("ZombieFarm save: NSString read missing '{}' encoding {}", path, encoding);
+        }
         assert!(error.is_null()); // TODO: error handling
         return nil;
     };
@@ -1629,6 +1661,43 @@ fn data_using_encoding_lossy_inner(
     let length: NSUInteger = (string.len() + 1).try_into().unwrap();
 
     msg_class![env; NSData dataWithBytesNoCopy:(c_string.cast_void()) length:length]
+}
+
+fn length_of_bytes_using_encoding_inner(
+    env: &mut Environment,
+    this: id,
+    encoding: NSStringEncoding,
+) -> NSUInteger {
+    match encoding {
+        NSASCIIStringEncoding | NSMacOSRomanStringEncoding | NSISOLatin1StringEncoding => {
+            let string = to_rust_string(env, this);
+            assert!(string.as_bytes().iter().all(|byte| byte.is_ascii()));
+            string.len().try_into().unwrap()
+        }
+        NSUTF8StringEncoding => to_rust_string(env, this).len().try_into().unwrap(),
+        NSWindowsCP1252StringEncoding => {
+            let string = to_rust_string(env, this);
+            let (bytes, encoding_used, had_errors) = WINDOWS_1252.encode(&string);
+            assert_eq!(encoding_used, WINDOWS_1252);
+            assert!(!had_errors);
+            bytes.len().try_into().unwrap()
+        }
+        NSShiftJISStringEncoding => {
+            let string = to_rust_string(env, this);
+            let (bytes, encoding_used, had_errors) = SHIFT_JIS.encode(&string);
+            assert_eq!(encoding_used, SHIFT_JIS);
+            assert!(!had_errors);
+            bytes.len().try_into().unwrap()
+        }
+        NSUTF16StringEncoding
+        | NSUTF16BigEndianStringEncoding
+        | NSUTF16LittleEndianStringEncoding => {
+            let mut code_units = 0usize;
+            for_each_code_unit(env, this, |_, _| code_units += 1);
+            (code_units * std::mem::size_of::<unichar>()).try_into().unwrap()
+        }
+        _ => unimplemented!("{}", encoding),
+    }
 }
 
 /// For use by [crate::dyld]: Handle static strings listed in the app binary.

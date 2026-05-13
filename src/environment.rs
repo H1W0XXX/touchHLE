@@ -231,7 +231,7 @@ fn generate_binary_load_order(graph: &[BinaryDependencyNode]) -> Result<Vec<usiz
             graph.get(index).unwrap().name
         ));
     }
-    log!(
+    log_dbg!(
         "Found sorted order {:?}",
         sorted_indices
             .iter()
@@ -381,7 +381,6 @@ impl Environment {
             /* slide: */ 0,
         )
         .map_err(|e| format!("Could not load executable: {e}"))?;
-
         let mut dylibs = Vec::new();
         for dylib in &executable.dynamic_libraries {
             // There are some Free Software libraries bundled with touchHLE and
@@ -417,7 +416,7 @@ impl Environment {
                 .iter()
                 .any(|d| d.path == dylib || d.aliases.contains(&dylib.as_str()))
             {
-                log!(
+                log_dbg!(
                     "Warning: app binary depends on unimplemented or missing dylib \"{}\"",
                     dylib
                 );
@@ -1457,6 +1456,8 @@ impl Environment {
         }
 
         if self.gdb_server.is_none() {
+            self.dump_all_regs();
+            self.stack_trace_current();
             panic!("Error during CPU execution: {error:?}");
         }
 

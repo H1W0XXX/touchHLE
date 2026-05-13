@@ -938,6 +938,21 @@ impl Fs {
         }
     }
 
+    /// Return the host path backing a guest file, if it has one.
+    ///
+    /// Files inside IPA archives and touchHLE's bundled resource files do not
+    /// have a directly writable host path.
+    pub fn host_path_for_file<P: AsRef<GuestPath>>(&self, path: P) -> Option<PathBuf> {
+        let node = self.lookup_node(path.as_ref())?;
+        let FsNode::File { location, .. } = node else {
+            return None;
+        };
+        match location {
+            FileLocation::Path(host_path) => Some(host_path.clone()),
+            FileLocation::IpaFileRef(_) | FileLocation::ResourceFilePath(_) => None,
+        }
+    }
+
     pub fn rename<P: AsRef<GuestPath> + Copy>(&mut self, from: P, to: P) -> Result<(), ()> {
         let from_node = self.lookup_node(from.as_ref()).ok_or(())?;
         let from_host_path = match from_node {

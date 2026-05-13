@@ -64,8 +64,8 @@ fn AudioSessionInitialize(
     in_client_data: MutVoidPtr,
 ) -> OSStatus {
     let result = 0; // success
-    log!(
-        "TODO: AudioSessionInitialize({:?}, {:?}, {:?}, {:?}) -> {:?}",
+    log_dbg!(
+        "AudioSessionInitialize({:?}, {:?}, {:?}, {:?}) -> {:?}",
         in_run_loop,
         in_run_loop_mode,
         in_interruption_listener,
@@ -161,7 +161,7 @@ fn AudioSessionSetProperty(
             .audio_toolbox
             .audio_session
             .current_hardware_sample_rate = env.mem.read(in_data.cast::<f64>());
-        log!(
+        log_dbg!(
             "AudioSessionSetProperty current_hardware_sample_rate {}",
             env.framework_state
                 .audio_toolbox
@@ -171,8 +171,8 @@ fn AudioSessionSetProperty(
     }
 
     let result = 0; // success
-    log!(
-        "TODO: AudioSessionSetProperty({:?}, {:?}, {:?} ({:?})) -> {:?}",
+    log_dbg!(
+        "AudioSessionSetProperty({:?}, {:?}, {:?} ({:?})) -> {:?}",
         in_ID,
         in_data_size,
         in_data,
@@ -184,7 +184,7 @@ fn AudioSessionSetProperty(
 
 fn AudioSessionSetActive(_env: &mut Environment, active: bool) -> OSStatus {
     let result = 0; // success
-    log!("TODO: AudioSessionSetActive({:?}) -> {:?}", active, result);
+    log_dbg!("AudioSessionSetActive({:?}) -> {:?}", active, result);
     result
 }
 
@@ -195,8 +195,8 @@ fn AudioSessionAddPropertyListener(
     inClientData: MutVoidPtr,
 ) -> OSStatus {
     let result = 0; // success
-    log!(
-        "TODO: AudioSessionAddPropertyListener({:?}, {:?}, {:?}) -> {}",
+    log_dbg!(
+        "AudioSessionAddPropertyListener({:?}, {:?}, {:?}) -> {}",
         inID,
         inProc,
         inClientData,
@@ -211,8 +211,8 @@ fn AudioSessionRemovePropertyListenerWithUserData(
     in_client_data: MutVoidPtr,
 ) -> OSStatus {
     let result = 0; // success
-    log!(
-        "TODO: AudioSessionRemovePropertyListenerWithUserData({:?}, {:?}, {:?}) -> {}",
+    log_dbg!(
+        "AudioSessionRemovePropertyListenerWithUserData({:?}, {:?}, {:?}) -> {}",
         in_property_id,
         in_listener,
         in_client_data,

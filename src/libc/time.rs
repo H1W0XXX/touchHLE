@@ -11,6 +11,7 @@ use crate::libc::errno::set_errno;
 use crate::libc::stdio::printf::{isspace, isspace_inner};
 use crate::mem::{guest_size_of, ConstPtr, GuestUSize, MutPtr, Ptr, SafeRead};
 use crate::Environment;
+use chrono::{Datelike, Local, Offset, TimeZone, Timelike};
 use std::ops::Range;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -217,6 +218,26 @@ pub fn timestamp_to_calendar_date(timestamp: time_t) -> tm {
         // TODO: this probably shouldn't be NULL?
         tm_zone: Ptr::null(),
     }
+}
+
+fn chrono_to_tm<Tz: chrono::TimeZone>(date: chrono::DateTime<Tz>) -> tm {
+    tm {
+        tm_sec: date.second().try_into().unwrap(),
+        tm_min: date.minute().try_into().unwrap(),
+        tm_hour: date.hour().try_into().unwrap(),
+        tm_mday: date.day().try_into().unwrap(),
+        tm_mon: date.month0().try_into().unwrap(),
+        tm_year: date.year() - 1900,
+        tm_wday: date.weekday().num_days_from_sunday().try_into().unwrap(),
+        tm_yday: date.ordinal0().try_into().unwrap(),
+        tm_isdst: 0,
+        tm_gmtoff: date.offset().fix().local_minus_utc(),
+        tm_zone: Ptr::null(),
+    }
+}
+
+pub fn current_local_timezone_offset_seconds() -> i32 {
+    Local::now().offset().fix().local_minus_utc()
 }
 #[cfg(test)]
 #[test]
@@ -426,20 +447,39 @@ fn gmtime(env: &mut Environment, timestamp: ConstPtr<time_t>) -> MutPtr<tm> {
 }
 
 fn localtime_r(env: &mut Environment, timestamp: ConstPtr<time_t>, res: MutPtr<tm>) -> MutPtr<tm> {
-    // TODO: don't assume local time is UTC?
-    gmtime_r(env, timestamp, res)
+    let timestamp = env.mem.read(timestamp);
+    let calendar_date = Local
+        .timestamp_opt(i64::from(timestamp), 0)
+        .single()
+        .map(chrono_to_tm)
+        .unwrap_or_else(|| timestamp_to_calendar_date(timestamp));
+    env.mem.write(res, calendar_date);
+    res
 }
 fn localtime(env: &mut Environment, timestamp: ConstPtr<time_t>) -> MutPtr<tm> {
-    // TODO: don't assume local time is UTC?
     // This doesn't have to be a unique temporary, gmtime and localtime are
     // allowed to share it.
-    gmtime(env, timestamp)
+    let tmp = *env
+        .libc_state
+        .time
+        .gmtime_tmp
+        .get_or_insert_with(|| env.mem.alloc(guest_size_of::<tm>()).cast());
+    localtime_r(env, timestamp, tmp)
 }
 
 fn mktime(env: &mut Environment, tm: MutPtr<tm>) -> time_t {
-    // TODO: respect the current timezone setting
     let tm_value = env.mem.read(tm);
-    let res = calendar_date_to_timestamp(tm_value);
+    let year = tm_value.tm_year + 1900;
+    let month = u32::try_from(tm_value.tm_mon + 1).unwrap_or(1);
+    let day = u32::try_from(tm_value.tm_mday).unwrap_or(1);
+    let hour = u32::try_from(tm_value.tm_hour).unwrap_or(0);
+    let minute = u32::try_from(tm_value.tm_min).unwrap_or(0);
+    let second = u32::try_from(tm_value.tm_sec).unwrap_or(0);
+    let res = Local
+        .with_ymd_and_hms(year, month, day, hour, minute, second)
+        .earliest()
+        .map(|date| date.timestamp() as time_t)
+        .unwrap_or_else(|| calendar_date_to_timestamp(tm_value));
     log_dbg!("mktime({:?}) => {}", tm_value, res);
     res
 }
@@ -484,10 +524,11 @@ fn gettimeofday(
     set_errno(env, 0);
 
     if !timezone_ptr.is_null() {
+        let offset = current_local_timezone_offset_seconds();
         env.mem.write(
             timezone_ptr,
             timezone {
-                tz_minuteswest: 0,
+                tz_minuteswest: -offset / 60,
                 tz_dsttime: 0,
             },
         );

@@ -64,6 +64,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; main_bundle objectForInfoDictionaryKey:name_key]
 }
 
+- (id)globallyUniqueString {
+    assert_process_info_singleton(env, this); // TODO
+    ns_string::from_rust_string(env, "touchHLE-00000000-0000-4000-8000-000000000000".to_string())
+}
+
 @end
 
 };

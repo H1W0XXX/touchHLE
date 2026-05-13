@@ -33,6 +33,9 @@ const LANG_ID_TO_LANG_PROJ: &[(&str, &[&str])] = &[
     ("no", &["Norwegian.lproj", "no.lproj"]),
     ("es", &["Spanish.lproj", "es.lproj"]),
     ("sv", &["Swedish.lproj", "sv.lproj"]),
+    ("zh", &["zh-Hans.lproj", "Chinese.lproj", "zh.lproj"]),
+    ("zh-Hans", &["zh-Hans.lproj", "zh.lproj"]),
+    ("zh-Hant", &["zh-Hant.lproj"]),
 ];
 
 #[derive(Default)]
@@ -187,7 +190,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // TODO: fallback to a development language (CFBundleDevelopmentRegion from
     // Info.plist)
     if !unknown_codes.is_empty() {
-        log!("TODO: language codes {:?} aren't mapped to a language name, falling back to English", unknown_codes);
+        log_dbg!("Language codes {:?} aren't mapped to a language name, falling back to English", unknown_codes);
     }
 
     for lproj in ["English.lproj", "en.lproj"] {

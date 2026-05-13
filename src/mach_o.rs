@@ -290,7 +290,7 @@ impl MachO {
         if header.cputype != mach_object::CPU_TYPE_ARM {
             return Err("Executable is not for an ARM CPU!");
         }
-        log!(
+        log_dbg!(
             "Loading {} slice for {:?}",
             cpu_subtype_to_str(header.cpusubtype),
             name

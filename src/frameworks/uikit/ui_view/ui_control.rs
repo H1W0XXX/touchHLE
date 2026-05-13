@@ -143,6 +143,16 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow::<UIControlHostObject>(this).enabled
 }
 - (())setEnabled:(bool)enabled {
+    let bundle_id = env.bundle.bundle_identifier();
+    if bundle_id.starts_with("com.playforge.ZombieFarm")
+        || bundle_id.starts_with("com.playforge.ZFR")
+    {
+        log!(
+            "ZombieFarm trace: UIControl {:?} setEnabled:{}",
+            this,
+            enabled,
+        );
+    }
     env.objc.borrow_mut::<UIControlHostObject>(this).enabled = enabled;
 }
 
@@ -184,14 +194,47 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())touchesBegan:(id)touches // NSSet* of UITouch*
          withEvent:(id)event { // UIEvent*
-    if !msg![env; this isEnabled] {
+    let bundle_id = env.bundle.bundle_identifier();
+    let is_zombie_farm = bundle_id.starts_with("com.playforge.ZombieFarm")
+        || bundle_id.starts_with("com.playforge.ZFR");
+    let is_zombie_farm_start_button_ready = if is_zombie_farm
+        && crate::frameworks::foundation::ns_notification_center::zombie_farm_startup_player_determined(env)
+    {
+        let play_tapped = env.objc.lookup_selector("playTapped").unwrap();
+        env.objc
+            .borrow::<UIControlHostObject>(this)
+            .action_targets
+            .iter()
+            .any(|&(_target, action, _events)| action == play_tapped)
+    } else {
+        false
+    };
+    if !msg![env; this isEnabled] && !is_zombie_farm_start_button_ready {
+        if is_zombie_farm {
+            log!(
+                "ZombieFarm trace: UIControl {:?} ignored touchesBegan because it is disabled",
+                this,
+            );
+        }
         return;
+    }
+    if is_zombie_farm_start_button_ready && !msg![env; this isEnabled] {
+        log!(
+            "ZombieFarm trace: allowing Play touch on disabled control {:?} after startup player determination",
+            this,
+        );
     }
 
     // UIControl's documentation implies that only one touch is ever tracked
     // at once.
     let touch: id = msg![env; touches anyObject];
     if !msg![env; this beginTrackingWithTouch:touch withEvent:event] {
+        if is_zombie_farm {
+            log!(
+                "ZombieFarm trace: UIControl {:?} beginTrackingWithTouch returned false",
+                this,
+            );
+        }
         return;
     }
 
@@ -282,6 +325,18 @@ forControlEvents:(UIControlEvents)events {
     let sel_str = action.as_str(&env.mem);
     let colon_count = sel_str.bytes().filter(|&b| b == b':').count();
     assert!([0, 1, 2].contains(&colon_count));
+    let bundle_id = env.bundle.bundle_identifier();
+    if bundle_id.starts_with("com.playforge.ZombieFarm")
+        || bundle_id.starts_with("com.playforge.ZFR")
+    {
+        log!(
+            "ZombieFarm trace: UIControl {:?} addTarget {:?} action {:?} events {:?}",
+            this,
+            target,
+            sel_str,
+            events,
+        );
+    }
 
     env.objc.borrow_mut::<UIControlHostObject>(this).action_targets.push((target, action, events));
 }

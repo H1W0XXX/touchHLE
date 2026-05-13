@@ -26,8 +26,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)sendSynchronousRequest:(id)request // NSURLRequest *
            returningResponse:(MutPtr<id>)response // NSURLResponse **
                        error:(MutPtr<id>)out_error { // NSError **
-    log!(
-        "TODO: [NSURLConnection sendSynchronousRequest:{:?} ('{}') response:{:?} error:{:?}] -> nil",
+    log_dbg!(
+        "[NSURLConnection sendSynchronousRequest:{:?} ('{}') response:{:?} error:{:?}] -> nil",
         request,
         url_string_from_request(env, request),
         response,
@@ -39,7 +39,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     if !out_error.is_null() {
         let domain = ns_string::get_static_str(env, NSURLErrorDomain);
         let error = msg_class![env; NSError alloc];
-        // TODO: fill userInfo
         let error = msg![env; error initWithDomain:domain code:NSURLErrorNotConnectedToInternet userInfo:nil];
         autorelease(env, error);
         env.mem.write(out_error, error);
@@ -62,9 +61,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)initWithRequest:(id)request // NSURLRequest *
              delegate:(id)delegate
      startImmediately:(bool)start_immediately {
-    log!(
-        "TODO: [(NSURLConnection *){:?} initWithRequest:{:?} ('{}') delegate:{:?} startImmediately:{}] -> nil",
-        this,
+    log_dbg!(
+        "[NSURLConnection initWithRequest:{:?} ('{}') delegate:{:?} startImmediately:{}] -> nil (network unavailable)",
         request,
         url_string_from_request(env, request),
         delegate,

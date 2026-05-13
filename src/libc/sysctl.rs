@@ -15,6 +15,7 @@ use crate::Environment;
 
 // Top level constants
 const CTL_KERN: i32 = 1;
+const CTL_NET: i32 = 4;
 const CTL_HW: i32 = 6;
 
 // CTL_KERN
@@ -28,6 +29,11 @@ const KERN_OSVERSION: i32 = 65;
 
 // KERN_PROC
 const KERN_PROC_ALL: i32 = 0;
+
+// CTL_NET
+const PF_ROUTE: i32 = 17;
+const AF_LINK: i32 = 18;
+const NET_RT_IFLIST: i32 = 3;
 
 // CTL_HW
 const HW_MACHINE: i32 = 1;
@@ -189,8 +195,87 @@ fn sysctl(
                 newlen,
             )
         }
-        _ => unimplemented!("sysctl() for name length {name_len} is unimplemented!"),
+        6 => {
+            let names: Vec<i32> = (0..name_len).map(|idx| env.mem.read(name + idx)).collect();
+            if names[0..5] == [CTL_NET, PF_ROUTE, 0, AF_LINK, NET_RT_IFLIST] {
+                return sysctl_net_rt_iflist(env, names[5] as u16, oldp, oldlenp, newp, newlen);
+            }
+
+            set_errno(env, ENOENT);
+            log!("TODO: sysctl() for name {:?}, returning -1", names);
+            -1
+        }
+        _ => {
+            let names: Vec<i32> = (0..name_len).map(|idx| env.mem.read(name + idx)).collect();
+            set_errno(env, ENOENT);
+            log!("TODO: sysctl() for name {:?}, returning -1", names);
+            -1
+        }
     }
+}
+
+fn write_bytes(env: &mut Environment, ptr: MutVoidPtr, offset: GuestUSize, bytes: &[u8]) {
+    let ptr = ptr.cast::<u8>();
+    for (idx, byte) in bytes.iter().enumerate() {
+        env.mem.write(ptr + offset + idx as GuestUSize, *byte);
+    }
+}
+
+fn sysctl_net_rt_iflist(
+    env: &mut Environment,
+    if_index: u16,
+    oldp: MutVoidPtr,
+    oldlenp: MutPtr<GuestUSize>,
+    newp: MutVoidPtr,
+    newlen: GuestUSize,
+) -> i32 {
+    assert!(newp.is_null());
+    assert_eq!(newlen, 0);
+
+    // 32-bit Darwin if_msghdr is 88 bytes. sockaddr_dl with "en0" and a
+    // six-byte link-layer address fits in its 20-byte fixed storage.
+    const IFMSGHDR_SIZE: GuestUSize = 88;
+    const SOCKADDR_DL_SIZE: GuestUSize = 20;
+    const MSG_LEN: GuestUSize = IFMSGHDR_SIZE + SOCKADDR_DL_SIZE;
+
+    if oldp.is_null() {
+        env.mem.write(oldlenp, MSG_LEN);
+        return 0;
+    }
+
+    let oldlen = env.mem.read(oldlenp);
+    if oldlen < MSG_LEN {
+        log!("sysctl() for net.route.iflist: buffer of size {oldlen} is too small for {MSG_LEN}");
+        return -1;
+    }
+
+    for idx in 0..MSG_LEN {
+        env.mem.write(oldp.cast::<u8>() + idx, 0);
+    }
+
+    write_bytes(env, oldp, 0, &(MSG_LEN as u16).to_le_bytes()); // ifm_msglen
+    write_bytes(env, oldp, 2, &[5]); // ifm_version
+    write_bytes(env, oldp, 3, &[0x0e]); // ifm_type: RTM_IFINFO
+    write_bytes(env, oldp, 4, &0x10_u32.to_le_bytes()); // ifm_addrs: RTA_IFP
+    write_bytes(env, oldp, 12, &if_index.to_le_bytes()); // ifm_index
+
+    let sdl_offset = IFMSGHDR_SIZE;
+    write_bytes(env, oldp, sdl_offset, &[SOCKADDR_DL_SIZE as u8]); // sdl_len
+    write_bytes(env, oldp, sdl_offset + 1, &[AF_LINK as u8]); // sdl_family
+    write_bytes(env, oldp, sdl_offset + 2, &if_index.to_le_bytes()); // sdl_index
+    write_bytes(env, oldp, sdl_offset + 4, &[6]); // sdl_type: IFT_ETHER
+    write_bytes(env, oldp, sdl_offset + 5, &[3]); // sdl_nlen
+    write_bytes(env, oldp, sdl_offset + 6, &[6]); // sdl_alen
+    write_bytes(env, oldp, sdl_offset + 8, b"en0");
+    write_bytes(
+        env,
+        oldp,
+        sdl_offset + 11,
+        &[0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+    );
+
+    env.mem.write(oldlenp, MSG_LEN);
+    0
 }
 
 fn sysctlbyname(

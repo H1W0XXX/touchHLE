@@ -26,7 +26,7 @@ use crate::fs::GuestPath;
 use crate::mem::{ConstPtr, MutPtr, Ptr, SafeRead};
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, Class, ClassExports,
-    HostObject, NSZonePtr,
+    HostObject, NSZonePtr, SEL,
 };
 use crate::{impl_HostObject_with_superclass, Environment};
 use std::collections::hash_map::Entry;
@@ -46,6 +46,9 @@ pub(super) struct DictionaryHostObject {
     /// where the keys have the same hash value.
     pub(super) map: HashMap<Hash, Vec<(id, id)>>,
     pub(super) count: NSUInteger,
+    /// Preserved key order for property-list backed dictionaries.
+    pub(super) plist_key_order: Option<Vec<String>>,
+    pub(super) plist_source_path: Option<String>,
 }
 impl HostObject for DictionaryHostObject {}
 impl DictionaryHostObject {
@@ -62,6 +65,7 @@ impl DictionaryHostObject {
         nil
     }
     pub(super) fn insert(&mut self, env: &mut Environment, key: id, value: id, copy_key: bool) {
+        self.plist_source_path = None;
         let key: id = if copy_key {
             msg![env; key copy]
         } else {
@@ -85,8 +89,16 @@ impl DictionaryHostObject {
         }
         collisions.push((key, value));
         self.count += 1;
+        if let Some(plist_key_order) = &mut self.plist_key_order {
+            let key_class: Class = msg![env; key class];
+            let string_class = env.objc.get_known_class("NSString", &mut env.mem);
+            if env.objc.class_is_subclass_of(key_class, string_class) {
+                plist_key_order.push(to_rust_string(env, key).to_string());
+            }
+        }
     }
     pub(super) fn remove(&mut self, env: &mut Environment, key: id) {
+        self.plist_source_path = None;
         let hash: Hash = msg![env; key hash];
         let Some(collisions) = self.map.get_mut(&hash) else {
             return;
@@ -97,6 +109,14 @@ impl DictionaryHostObject {
             return;
         };
         let (existing_key, value) = collisions[idx];
+        if let Some(plist_key_order) = &mut self.plist_key_order {
+            let key_class: Class = msg![env; existing_key class];
+            let string_class = env.objc.get_known_class("NSString", &mut env.mem);
+            if env.objc.class_is_subclass_of(key_class, string_class) {
+                let existing_key = to_rust_string(env, existing_key).to_string();
+                plist_key_order.retain(|candidate| candidate != &existing_key);
+            }
+        }
         release(env, existing_key);
         release(env, value);
         collisions.remove(idx);
@@ -313,17 +333,19 @@ pub fn init_with_objects_and_keys(
 
 /// Helper function to share `initWithDictionary:` implementations
 fn init_with_dictionary_common(env: &mut Environment, this: id, other_dict: id) -> id {
-    let other_host_object: DictionaryHostObject = std::mem::take(env.objc.borrow_mut(other_dict));
-
     let mut host_object = <DictionaryHostObject as Default>::default();
 
-    for key in other_host_object.iter_keys() {
-        let object = other_host_object.lookup(env, key);
-        host_object.insert(env, key, object, /* copy_key: */ true);
+    if other_dict != nil {
+        let keys: id = msg![env; other_dict allKeys];
+        let count: NSUInteger = msg![env; keys count];
+        for i in 0..count {
+            let key: id = msg![env; keys objectAtIndex:i];
+            let object: id = msg![env; other_dict objectForKey:key];
+            host_object.insert(env, key, object, /* copy_key: */ true);
+        }
     }
 
     *env.objc.borrow_mut(this) = host_object;
-    *env.objc.borrow_mut(other_dict) = other_host_object;
     this
 }
 
@@ -382,10 +404,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 @implementation NSDictionary: NSObject
 
 + (id)allocWithZone:(NSZonePtr)zone {
-    // NSDictionary might be subclassed by something which needs allocWithZone:
-    // to have the normal behaviour. Unimplemented: call superclass alloc then.
-    assert!(this == env.objc.get_known_class("NSDictionary", &mut env.mem));
-    msg_class![env; _touchHLE_NSDictionary allocWithZone:zone]
+    let ns_dictionary = env.objc.get_known_class("NSDictionary", &mut env.mem);
+    if this == ns_dictionary {
+        msg_class![env; _touchHLE_NSDictionary allocWithZone:zone]
+    } else {
+        let host_object = Box::<DictionaryHostObject>::default();
+        env.objc.alloc_object(this, host_object, &mut env.mem)
+    }
 }
 
 + (id)dictionary {
@@ -433,7 +458,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)init {
-    todo!("TODO: Implement [dictionary init] for custom subclasses")
+    *env.objc.borrow_mut(this) = <DictionaryHostObject as Default>::default();
+    this
 }
 
 // These probably comes from some category related to plists.
@@ -538,6 +564,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; this objectForKey:file_type_key]
 }
 
+- (id)keysSortedByValueUsingSelector:(SEL)_comparator {
+    msg![env; this allKeys]
+}
+
 @end
 
 // NSMutableDictionary is an abstract class. A subclass must provide everything
@@ -549,10 +579,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 @implementation NSMutableDictionary: NSDictionary
 
 + (id)allocWithZone:(NSZonePtr)zone {
-    // NSDictionary might be subclassed by something which needs allocWithZone:
-    // to have the normal behaviour. Unimplemented: call superclass alloc then.
-    assert!(this == env.objc.get_known_class("NSMutableDictionary", &mut env.mem));
-    msg_class![env; _touchHLE_NSMutableDictionary allocWithZone:zone]
+    let ns_mutable_dictionary = env.objc.get_known_class("NSMutableDictionary", &mut env.mem);
+    if this == ns_mutable_dictionary {
+        msg_class![env; _touchHLE_NSMutableDictionary allocWithZone:zone]
+    } else {
+        let host_object = Box::<DictionaryHostObject>::default();
+        env.objc.alloc_object(this, host_object, &mut env.mem)
+    }
 }
 
 + (id)dictionaryWithCapacity:(NSUInteger)capacity {
@@ -642,6 +675,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)allKeys {
     all_keys_common(env, this)
+}
+
+- (id)keyEnumerator { // NSEnumerator*
+    let keys: id = msg![env; this allKeys];
+    msg![env; keys objectEnumerator]
 }
 
 // NSFastEnumeration implementation
@@ -832,6 +870,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)allKeys {
     all_keys_common(env, this)
+}
+
+- (id)keyEnumerator { // NSEnumerator*
+    let keys: id = msg![env; this allKeys];
+    msg![env; keys objectEnumerator]
 }
 
 - (id)allValues {

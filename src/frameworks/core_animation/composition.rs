@@ -301,6 +301,14 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         gles.ClearColor(0.0, 0.0, 0.0, 1.0);
         gles.Clear(gles11::COLOR_BUFFER_BIT);
         gles.Color4f(1.0, 1.0, 1.0, 1.0);
+        // The internal compositor draws premultiplied-alpha RGBA textures.
+        // Keep the fixed-function texture stage in a known state instead of
+        // inheriting stale defaults from earlier internal draws.
+        gles.TexEnvi(
+            gles11::TEXTURE_ENV,
+            gles11::TEXTURE_ENV_MODE,
+            gles11::MODULATE as _,
+        );
 
         gles.MatrixMode(gles11::PROJECTION);
         // Scale down screen-space to normalized device co-ordinates, shift the
@@ -725,5 +733,15 @@ unsafe fn upload_rgba8_pixels(gles: &mut dyn GLES, pixels: &[u8], dimensions: (u
         gles11::TEXTURE_2D,
         gles11::TEXTURE_MAG_FILTER,
         gles11::LINEAR as _,
+    );
+    gles.TexParameteri(
+        gles11::TEXTURE_2D,
+        gles11::TEXTURE_WRAP_S,
+        gles11::CLAMP_TO_EDGE as _,
+    );
+    gles.TexParameteri(
+        gles11::TEXTURE_2D,
+        gles11::TEXTURE_WRAP_T,
+        gles11::CLAMP_TO_EDGE as _,
     );
 }

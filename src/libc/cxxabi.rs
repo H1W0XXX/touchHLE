@@ -15,24 +15,14 @@ use crate::Environment;
 
 fn __cxa_atexit(
     _env: &mut Environment,
-    func: GuestFunction, // void (*func)(void *)
-    p: MutVoidPtr,
-    d: MutVoidPtr,
+    _func: GuestFunction, // void (*func)(void *)
+    _p: MutVoidPtr,
+    _d: MutVoidPtr,
 ) -> i32 {
-    // TODO: when this is implemented, make sure it's properly compatible with
-    // C atexit.
-    log!(
-        "TODO: __cxa_atexit({:?}, {:?}, {:?}) (unimplemented)",
-        func,
-        p,
-        d
-    );
     0 // success
 }
 
-fn __cxa_finalize(_env: &mut Environment, d: MutVoidPtr) {
-    log!("TODO: __cxa_finalize({:?}) (unimplemented)", d);
-}
+fn __cxa_finalize(_env: &mut Environment, _d: MutVoidPtr) {}
 
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(__cxa_atexit(_, _, _)),

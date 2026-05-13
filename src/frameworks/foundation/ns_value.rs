@@ -16,7 +16,7 @@ use crate::frameworks::core_foundation::cf_number::{
 use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_keyed_archiver::get_value_to_encode_for_current_key;
 use crate::frameworks::foundation::NSInteger;
-use crate::mem::{ConstVoidPtr, MutVoidPtr};
+use crate::mem::{ConstPtr, ConstVoidPtr, MutVoidPtr};
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, Class, ClassExports,
     HostObject, NSZonePtr,
@@ -414,6 +414,21 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (i8)charValue {
     env.objc.borrow::<NSNumberHostObject>(this).as_char()
+}
+
+- (ConstPtr<u8>)objCType {
+    let encoding = match env.objc.borrow::<NSNumberHostObject>(this) {
+        NSNumberHostObject::Bool(_) | NSNumberHostObject::Char(_) => b"c".as_slice(),
+        NSNumberHostObject::UnsignedLongLong(_) => b"Q".as_slice(),
+        NSNumberHostObject::UnsignedInt(_) => b"I".as_slice(),
+        NSNumberHostObject::Int(_) => b"i".as_slice(),
+        NSNumberHostObject::LongLong(_) => b"q".as_slice(),
+        NSNumberHostObject::Float(_) => b"f".as_slice(),
+        NSNumberHostObject::Double(_) => b"d".as_slice(),
+        NSNumberHostObject::Short(_) => b"s".as_slice(),
+        NSNumberHostObject::UnsignedShort(_) => b"S".as_slice(),
+    };
+    env.mem.alloc_and_write_cstr(encoding).cast_const()
 }
 
 - (id)description {

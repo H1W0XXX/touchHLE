@@ -33,11 +33,19 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.alloc_object(this, host_object, &mut env.mem)
 }
 
+- (id)init {
+    let this: id = msg_super![env; this init];
+    () = msg![env; this setOpaque:false];
+    () = msg![env; this setUserInteractionEnabled:false];
+    this
+}
+
 - (id)initWithFrame:(CGRect)frame {
     let this: id = msg_super![env; this initWithFrame:frame];
     // Not sure if UIImageView does this unconditionally, or only for images
     // with alpha channels.
     () = msg![env; this setOpaque:false];
+    () = msg![env; this setUserInteractionEnabled:false];
     this
 }
 
@@ -58,6 +66,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     let image: id = msg![env; coder decodeObjectForKey:key_ns_string];
 
     () = msg![env; this setImage:image];
+    // UIImageView should not flatten alpha from decoded bundle art into
+    // opaque layer rectangles.
+    () = msg![env; this setOpaque:false];
+    () = msg![env; this setUserInteractionEnabled:false];
 
     this
 }
@@ -73,6 +85,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // Not sure if UIImageView does this unconditionally, or only for images
     // with alpha channels.
     () = msg![env; this setOpaque:false];
+    () = msg![env; this setUserInteractionEnabled:false];
     this
 }
 

@@ -10,7 +10,7 @@ use crate::frameworks::core_foundation::CFTypeRef;
 use crate::frameworks::foundation::NSTimeInterval;
 use crate::libc::time::{time_t, timestamp_to_calendar_date};
 use crate::mem::SafeRead;
-use crate::objc::nil;
+use crate::objc::{id, msg, msg_class, nil};
 use crate::{impl_GuestRet_for_large_struct, Environment};
 use std::ops::Add;
 use std::time::{Duration, SystemTime};
@@ -51,21 +51,23 @@ fn CFAbsoluteTimeGetCurrent(_env: &mut Environment) -> CFAbsoluteTime {
 type CFTimeZoneRef = CFTypeRef;
 
 fn CFTimeZoneCopySystem(_env: &mut Environment) -> CFTimeZoneRef {
-    // TODO: implement (nil seems to correspond to GMT)
-    nil
+    msg_class![_env; NSTimeZone localTimeZone]
 }
 
 pub fn CFAbsoluteTimeGetGregorianDate(
-    _env: &mut Environment,
+    env: &mut Environment,
     at: CFAbsoluteTime,
     tz: CFTimeZoneRef,
 ) -> CFGregorianDate {
-    assert!(tz.is_null());
-    let time64 = apple_epoch()
+    let mut time64 = apple_epoch()
         .add(Duration::from_secs_f64(at))
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_secs();
+    if tz != nil {
+        let offset: i32 = msg![env; (tz as id) secondsFromGMT];
+        time64 = time64.saturating_add_signed(i64::from(offset));
+    }
     let time = time64 as time_t;
     let tm = timestamp_to_calendar_date(time);
     CFGregorianDate {
@@ -79,7 +81,6 @@ pub fn CFAbsoluteTimeGetGregorianDate(
 }
 
 fn CFAbsoluteTimeGetDayOfWeek(env: &mut Environment, at: CFAbsoluteTime, tz: CFTimeZoneRef) -> i32 {
-    assert!(tz.is_null());
     CFAbsoluteTimeGetGregorianDate(env, at, tz).day.into()
 }
 

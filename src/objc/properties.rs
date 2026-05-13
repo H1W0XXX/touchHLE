@@ -136,9 +136,9 @@ pub(super) fn objc_getProperty(
     // safeguard: any real ivar offset will be after the isa pointer.
     assert!(offset >= 4);
 
-    if atomic {
-        log_once!("TODO: Lock when atomic is set to true in objc_getProperty");
-    }
+    // touchHLE runs guest threads cooperatively, and this helper does not yield
+    // back into guest code, so a plain ivar read is effectively atomic here.
+    let _ = atomic;
 
     let ivar: MutPtr<id> = Ptr::from_bits(this.to_bits().checked_add_signed(offset).unwrap());
     env.mem.read(ivar)
@@ -164,9 +164,10 @@ pub(super) fn objc_setProperty(
     // safeguard: any real ivar offset will be after the isa pointer.
     assert!(offset >= 4);
 
-    if atomic {
-        log_once!("TODO: Lock when atomic is set to true in objc_setProperty");
-    }
+    // touchHLE runs guest threads cooperatively, and this helper does not yield
+    // back into guest code, so the retain/write/release sequence is not
+    // interleaved with another guest property accessor.
+    let _ = atomic;
 
     let ivar: MutPtr<id> = Ptr::from_bits(this.to_bits().checked_add_signed(offset).unwrap());
     let old = env.mem.read(ivar);

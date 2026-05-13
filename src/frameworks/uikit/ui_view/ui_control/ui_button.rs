@@ -6,10 +6,12 @@
 //! `UIButton`.
 
 use super::{UIControlState, UIControlStateNormal};
+use crate::abi::{impl_GuestRet_for_large_struct, GuestArg};
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect};
 use crate::frameworks::foundation::ns_string::{from_rust_string, get_static_str, to_rust_string};
-use crate::frameworks::foundation::NSInteger;
+use crate::frameworks::foundation::{NSInteger, NSUInteger};
 use crate::frameworks::uikit::ui_font::UITextAlignmentCenter;
+use crate::mem::SafeRead;
 use crate::objc::{
     autorelease, id, impl_HostObject_with_superclass, msg, msg_class, msg_super, nil, objc_classes,
     release, retain, todo_objc_setter, ClassExports, HostObject, NSZonePtr,
@@ -29,6 +31,36 @@ const UIButtonTypeInfoDark: UIButtonType = 4;
 #[allow(dead_code)]
 const UIButtonTypeContactAdd: UIButtonType = 5;
 
+#[derive(Copy, Clone, Debug, Default)]
+#[repr(C, packed)]
+struct UIEdgeInsets {
+    top: CGFloat,
+    left: CGFloat,
+    bottom: CGFloat,
+    right: CGFloat,
+}
+unsafe impl SafeRead for UIEdgeInsets {}
+impl_GuestRet_for_large_struct!(UIEdgeInsets);
+impl GuestArg for UIEdgeInsets {
+    const REG_COUNT: usize = 4;
+
+    fn from_regs(regs: &[u32]) -> Self {
+        UIEdgeInsets {
+            top: GuestArg::from_regs(&regs[0..1]),
+            left: GuestArg::from_regs(&regs[1..2]),
+            bottom: GuestArg::from_regs(&regs[2..3]),
+            right: GuestArg::from_regs(&regs[3..4]),
+        }
+    }
+
+    fn to_regs(self, regs: &mut [u32]) {
+        self.top.to_regs(&mut regs[0..1]);
+        self.left.to_regs(&mut regs[1..2]);
+        self.bottom.to_regs(&mut regs[2..3]);
+        self.right.to_regs(&mut regs[3..4]);
+    }
+}
+
 // Host object for an intermediate object
 // used for decoding of UIButton from a NIB
 #[derive(Default)]
@@ -37,6 +69,10 @@ struct UIButtonContentHostObject {
     title: id,
     /// `UIColor*`
     title_color: id,
+    /// `UIImage*`
+    image: id,
+    /// `UIImage*`
+    background_image: id,
 }
 impl HostObject for UIButtonContentHostObject {}
 
@@ -57,6 +93,9 @@ pub struct UIButtonHostObject {
     images_for_states: HashMap<UIControlState, id>,
     /// Values are `UIImage*`
     background_images_for_states: HashMap<UIControlState, id>,
+    title_edge_insets: UIEdgeInsets,
+    image_edge_insets: UIEdgeInsets,
+    content_edge_insets: UIEdgeInsets,
 }
 impl_HostObject_with_superclass!(UIButtonHostObject);
 impl Default for UIButtonHostObject {
@@ -71,6 +110,9 @@ impl Default for UIButtonHostObject {
             title_colors_for_states: HashMap::new(),
             images_for_states: HashMap::new(),
             background_images_for_states: HashMap::new(),
+            title_edge_insets: Default::default(),
+            image_edge_insets: Default::default(),
+            content_edge_insets: Default::default(),
         }
     }
 }
@@ -121,6 +163,7 @@ fn init_common(env: &mut Environment, this: id) -> id {
     () = msg![env; this addSubview:title_label];
     () = msg![env; this addSubview:image_view];
     update(env, this);
+    () = msg![env; this setNeedsLayout];
 
     this
 }
@@ -198,7 +241,26 @@ pub const CLASSES: ClassExports = objc_classes! {
     // in this dict.
     // TODO: support decoding properties of other states
     let key_idx: id = msg_class![env; NSNumber numberWithLongLong:0i64];
-    let button_content: id = msg![env; dict objectForKey:key_idx];
+    let mut button_content: id = msg![env; dict objectForKey:key_idx];
+    if button_content == nil {
+        let values: id = msg![env; dict allValues];
+        let value_count: NSUInteger = msg![env; values count];
+        if value_count != 0 {
+            button_content = msg![env; values objectAtIndex:0u32];
+            log!("UIButton initWithCoder: no state 0 content, falling back to first stateful value");
+        }
+    }
+    let bundle_id = env.bundle.bundle_identifier().to_string();
+    if bundle_id.starts_with("com.playforge.ZombieFarm")
+        || bundle_id.starts_with("com.playforge.ZFR")
+    {
+        if button_content != nil {
+            let desc: id = msg![env; button_content description];
+            log!("ZombieFarm UIButton content: {}", to_rust_string(env, desc));
+        } else {
+            log!("ZombieFarm UIButton content: nil");
+        }
+    }
 
     let title: id = msg![env; button_content title];
     if title != nil {
@@ -212,7 +274,22 @@ pub const CLASSES: ClassExports = objc_classes! {
         () = msg![env; this setTitleColor:title_color forState:UIControlStateNormal];
     }
 
-    // TODO: decode other properties
+    let image: id = msg![env; button_content image];
+    if image != nil {
+        log_dbg!("UIButton initWithCoder: found normal-state image {:?}", image);
+        () = msg![env; this setImage:image forState:UIControlStateNormal];
+    }
+
+    let background_image: id = msg![env; button_content backgroundImage];
+    if background_image != nil {
+        log_dbg!(
+            "UIButton initWithCoder: found normal-state background image {:?}",
+            background_image
+        );
+        () = msg![env; this setBackgroundImage:background_image
+                                   forState:UIControlStateNormal];
+    }
+
     update(env, this);
 
     this
@@ -228,7 +305,10 @@ pub const CLASSES: ClassExports = objc_classes! {
         titles_for_states,
         title_colors_for_states,
         images_for_states,
-        background_images_for_states
+        background_images_for_states,
+        title_edge_insets: _,
+        image_edge_insets: _,
+        content_edge_insets: _,
     } = std::mem::take(env.objc.borrow_mut(this));
 
     release(env, title_label);
@@ -250,13 +330,37 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())layoutSubviews {
-    let label = env.objc.borrow_mut::<UIButtonHostObject>(this).title_label;
-    let background_image_view = env.objc.borrow_mut::<UIButtonHostObject>(this).background_image_view;
+    let host_obj = env.objc.borrow::<UIButtonHostObject>(this);
+    let label = host_obj.title_label;
+    let image_view = host_obj.image_view;
+    let background_image_view = host_obj.background_image_view;
+    let title_edge_insets = host_obj.title_edge_insets;
+    let image_edge_insets = host_obj.image_edge_insets;
     let bounds: CGRect = msg![env; this bounds];
 
     () = msg![env; background_image_view setFrame:bounds];
-    () = msg![env; label setFrame:bounds];
-    // TODO: layout for image
+    let label_frame = CGRect {
+        origin: CGPoint {
+            x: bounds.origin.x + title_edge_insets.left,
+            y: bounds.origin.y + title_edge_insets.top,
+        },
+        size: crate::frameworks::core_graphics::CGSize {
+            width: (bounds.size.width - title_edge_insets.left - title_edge_insets.right).max(0.0),
+            height: (bounds.size.height - title_edge_insets.top - title_edge_insets.bottom).max(0.0),
+        },
+    };
+    () = msg![env; label setFrame:label_frame];
+    let image_frame = CGRect {
+        origin: CGPoint {
+            x: bounds.origin.x + image_edge_insets.left,
+            y: bounds.origin.y + image_edge_insets.top,
+        },
+        size: crate::frameworks::core_graphics::CGSize {
+            width: (bounds.size.width - image_edge_insets.left - image_edge_insets.right).max(0.0),
+            height: (bounds.size.height - image_edge_insets.top - image_edge_insets.bottom).max(0.0),
+        },
+    };
+    () = msg![env; image_view setFrame:image_frame];
 
 }
 
@@ -292,6 +396,27 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (())setShowsTouchWhenHighlighted:(bool)shows {
     todo_objc_setter!(this, shows);
+}
+- (UIEdgeInsets)titleEdgeInsets {
+    env.objc.borrow::<UIButtonHostObject>(this).title_edge_insets
+}
+- (())setTitleEdgeInsets:(UIEdgeInsets)insets {
+    env.objc.borrow_mut::<UIButtonHostObject>(this).title_edge_insets = insets;
+    () = msg![env; this setNeedsLayout];
+}
+- (UIEdgeInsets)imageEdgeInsets {
+    env.objc.borrow::<UIButtonHostObject>(this).image_edge_insets
+}
+- (())setImageEdgeInsets:(UIEdgeInsets)insets {
+    env.objc.borrow_mut::<UIButtonHostObject>(this).image_edge_insets = insets;
+    () = msg![env; this setNeedsLayout];
+}
+- (UIEdgeInsets)contentEdgeInsets {
+    env.objc.borrow::<UIButtonHostObject>(this).content_edge_insets
+}
+- (())setContentEdgeInsets:(UIEdgeInsets)insets {
+    env.objc.borrow_mut::<UIButtonHostObject>(this).content_edge_insets = insets;
+    () = msg![env; this setNeedsLayout];
 }
 - (())setFont:(id)font { // UIFont*
     let label = env.objc.borrow_mut::<UIButtonHostObject>(this).title_label;
@@ -416,13 +541,23 @@ pub const CLASSES: ClassExports = objc_classes! {
     let title_color: id = msg![env; coder decodeObjectForKey:title_color_key];
     log_dbg!("UIButtonContent: UITitleColor -> {:?}", title_color);
 
-    // TODO: decode other properties
+    let image_key = get_static_str(env, "UIImage");
+    let image: id = msg![env; coder decodeObjectForKey:image_key];
+    log_dbg!("UIButtonContent: UIImage -> {:?}", image);
+
+    let background_image_key = get_static_str(env, "UIBackgroundImage");
+    let background_image: id = msg![env; coder decodeObjectForKey:background_image_key];
+    log_dbg!("UIButtonContent: UIBackgroundImage -> {:?}", background_image);
 
     retain(env, title);
     retain(env, title_color);
+    retain(env, image);
+    retain(env, background_image);
     let host_obj = env.objc.borrow_mut::<UIButtonContentHostObject>(this);
     host_obj.title = title;
     host_obj.title_color = title_color;
+    host_obj.image = image;
+    host_obj.background_image = background_image;
 
     this
 }
@@ -433,12 +568,20 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)titleColor {
     env.objc.borrow::<UIButtonContentHostObject>(this).title_color
 }
+- (id)image {
+    env.objc.borrow::<UIButtonContentHostObject>(this).image
+}
+- (id)backgroundImage {
+    env.objc.borrow::<UIButtonContentHostObject>(this).background_image
+}
 
 - (id)description {
     let title = env.objc.borrow::<UIButtonContentHostObject>(this).title;
     let title_color = env.objc.borrow::<UIButtonContentHostObject>(this).title_color;
+    let image = env.objc.borrow::<UIButtonContentHostObject>(this).image;
+    let background_image = env.objc.borrow::<UIButtonContentHostObject>(this).background_image;
     let desc_str = format!(
-        "UIButtonContent({this:?}, title {title:?}, title_color {title_color:?})"
+        "UIButtonContent({this:?}, title {title:?}, title_color {title_color:?}, image {image:?}, background_image {background_image:?})"
     );
     let desc = from_rust_string(env, desc_str);
     autorelease(env, desc)
@@ -447,10 +590,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())dealloc {
     let &UIButtonContentHostObject {
         title,
-        title_color
+        title_color,
+        image,
+        background_image,
     } = env.objc.borrow(this);
     release(env, title);
     release(env, title_color);
+    release(env, image);
+    release(env, background_image);
 
     env.objc.dealloc_object(this, &mut env.mem)
 }

@@ -5,13 +5,13 @@
  */
 //! `NSDate`.
 
-use super::ns_string::{from_rust_ordering, from_rust_string};
+use super::ns_string::{from_rust_ordering, from_rust_string, get_static_str};
 use super::{NSComparisonResult, NSTimeInterval};
 use crate::frameworks::core_foundation::time::{
     apple_epoch, CFAbsoluteTimeGetGregorianDate, SECS_FROM_UNIX_TO_APPLE_EPOCHS,
 };
 use crate::objc::{
-    autorelease, id, msg, msg_class, nil, objc_classes, release, ClassExports, HostObject,
+    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
     NSZonePtr,
 };
 
@@ -150,6 +150,18 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, this);
     // Note: Assuming NSKeyedUnarchiver as coder here
     decode_current_date(env, coder)
+}
+
+- (())encodeWithCoder:(id)coder {
+    let key = get_static_str(env, "NS.time");
+    let time_interval = env.objc.borrow::<NSDateHostObject>(this).time_interval;
+    () = msg![env; coder encodeDouble:time_interval forKey:key];
+}
+
+// NSCopying implementation
+- (id)copyWithZone:(NSZonePtr)_zone {
+    // NSDate is immutable, so copying preserves the exact stored timestamp.
+    retain(env, this)
 }
 
 - (NSTimeInterval)timeIntervalSinceDate:(id)anotherDate {

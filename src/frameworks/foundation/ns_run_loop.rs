@@ -21,7 +21,7 @@ use crate::frameworks::{core_animation, media_player, uikit};
 use crate::libc::semaphore::{host_create_semaphore, sem_post, sem_t};
 use crate::mem::MutPtr;
 use crate::objc::{
-    id, msg, msg_send, objc_classes, release, retain, Class, ClassExports, HostObject, SEL,
+    id, msg, msg_send, nil, objc_classes, release, retain, Class, ClassExports, HostObject, SEL,
 };
 use crate::Environment;
 use std::collections::{HashMap, VecDeque};
@@ -99,6 +99,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())addTimer:(id)timer // NSTimer*
        forMode:(NSRunLoopMode)mode {
+    if timer == nil {
+        return;
+    }
+
     let default_mode = ns_string::get_static_str(env, NSDefaultRunLoopMode);
     let common_modes = ns_string::get_static_str(env, NSRunLoopCommonModes);
     // TODO: handle other modes
@@ -215,6 +219,19 @@ pub(super) fn add_perform_request(
     delay: Option<f64>,
     should_sync: bool,
 ) -> MutPtr<sem_t> {
+    if target == nil {
+        log_dbg!(
+            "Ignoring object selector request with nil target for {:?}",
+            selector.as_str(env.mem.as_mut()),
+        );
+        if should_sync {
+            let semaphore = host_create_semaphore(env, 0);
+            sem_post(env, semaphore);
+            return semaphore;
+        }
+        return MutPtr::null();
+    }
+
     log_dbg!(
         "Adding object selector request {target:?} {:?} {argument:?} on run loop {run_loop:?}",
         selector.as_str(env.mem.as_mut())
@@ -415,11 +432,13 @@ pub fn run_run_loop(
                     } = selector_objects.remove(index).unwrap();
                     log_dbg!("Running object selector request {target:?} {:?} {argument:?} on run loop {run_loop:?}", selector.as_str(env.mem.as_mut()));
 
-                    if selector.as_str(&env.mem).ends_with(':') {
-                        () = msg_send(env, (target, selector, argument));
-                    } else {
-                        assert!(argument.is_null());
-                        () = msg_send(env, (target, selector));
+                    if target != nil {
+                        if selector.as_str(&env.mem).ends_with(':') {
+                            () = msg_send(env, (target, selector, argument));
+                        } else {
+                            assert!(argument.is_null());
+                            () = msg_send(env, (target, selector));
+                        }
                     }
 
                     release(env, target);

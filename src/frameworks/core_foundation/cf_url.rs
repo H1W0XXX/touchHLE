@@ -16,7 +16,7 @@ use crate::frameworks::core_foundation::cf_string::{
     CFStringRef,
 };
 use crate::frameworks::foundation::ns_string::{
-    get_static_str, to_rust_string, NSUTF8StringEncoding,
+    from_rust_string, get_static_str, to_rust_string, NSUTF8StringEncoding,
 };
 use crate::frameworks::foundation::NSUInteger;
 use crate::mem::{ConstPtr, MutPtr, Ptr};
@@ -182,6 +182,50 @@ fn CFURLHasDirectoryPath(env: &mut Environment, url: CFURLRef) -> bool {
         || msg![env; last isEqual:(get_static_str(env, ".."))]
 }
 
+fn CFURLCreateStringByAddingPercentEscapes(
+    env: &mut Environment,
+    allocator: CFAllocatorRef,
+    original_string: CFStringRef,
+    characters_to_leave_unescaped: CFStringRef,
+    legal_url_characters_to_be_escaped: CFStringRef,
+    _encoding: CFStringEncoding,
+) -> CFStringRef {
+    assert!(allocator == kCFAllocatorDefault || env.mem.read(allocator).is_system_default()); // unimplemented
+
+    if original_string.is_null() {
+        return Ptr::null();
+    }
+
+    let force_escape = if legal_url_characters_to_be_escaped.is_null() {
+        String::new()
+    } else {
+        to_rust_string(env, legal_url_characters_to_be_escaped).into_owned()
+    };
+    let leave_unescaped = if characters_to_leave_unescaped.is_null() {
+        String::new()
+    } else {
+        to_rust_string(env, characters_to_leave_unescaped).into_owned()
+    };
+
+    let mut escaped = String::new();
+    for ch in to_rust_string(env, original_string).chars() {
+        let is_url_legal = ch.is_ascii_alphanumeric() || "-_.~!*'();:@&=+$,/?#[]%".contains(ch);
+        let should_escape =
+            (!is_url_legal || force_escape.contains(ch)) && !leave_unescaped.contains(ch);
+
+        if should_escape {
+            let mut bytes = [0u8; 4];
+            for byte in ch.encode_utf8(&mut bytes).as_bytes() {
+                escaped.push_str(&format!("%{byte:02X}"));
+            }
+        } else {
+            escaped.push(ch);
+        }
+    }
+
+    from_rust_string(env, escaped)
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CFURLGetFileSystemRepresentation(_, _, _, _)),
     export_c_func!(CFURLCreateFromFileSystemRepresentation(_, _, _, _)),
@@ -192,4 +236,5 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CFURLCreateCopyAppendingPathComponent(_, _, _, _)),
     export_c_func!(CFURLCreateCopyDeletingLastPathComponent(_, _)),
     export_c_func!(CFURLHasDirectoryPath(_)),
+    export_c_func!(CFURLCreateStringByAddingPercentEscapes(_, _, _, _, _)),
 ];
