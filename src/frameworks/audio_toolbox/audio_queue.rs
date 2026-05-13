@@ -510,13 +510,17 @@ pub fn is_supported_audio_format(format: &AudioStreamBasicDescription) -> bool {
     match format_id {
         kAudioFormatAppleIMA4 => (channels_per_frame == 1) || (channels_per_frame == 2),
         kAudioFormatLinearPCM => {
+            let is_float = (format_flags & kAudioFormatFlagIsFloat) != 0;
             // TODO: support more PCM formats
             (channels_per_frame == 1 || channels_per_frame == 2)
-                && (bits_per_channel == 8 || bits_per_channel == 16 || bits_per_channel == 32)
+                && if is_float {
+                    bits_per_channel == 32
+                } else {
+                    bits_per_channel == 8 || bits_per_channel == 16 || bits_per_channel == 32
+                }
                 && ((format_flags & kAudioFormatFlagIsPacked) != 0
                     || ((bits_per_channel / 8) * channels_per_frame) == bytes_per_frame)
                 && (format_flags & kAudioFormatFlagIsBigEndian) == 0
-                && (format_flags & kAudioFormatFlagIsFloat) == 0
         }
         _ => false,
     }
@@ -530,6 +534,16 @@ pub fn decode_buffer(
     audio_data: MutPtr<u8>,
     audio_data_byte_size: GuestUSize,
 ) -> (ALenum, ALsizei, Vec<u8>) {
+    fn f32_to_i16(sample: f32) -> i16 {
+        if sample <= -1.0 {
+            i16::MIN
+        } else if sample >= 1.0 {
+            i16::MAX
+        } else {
+            (sample * f32::from(i16::MAX)).round() as i16
+        }
+    }
+
     let data_slice = mem.bytes_at(audio_data, audio_data_byte_size);
 
     assert!(is_supported_audio_format(format));
@@ -624,19 +638,38 @@ pub fn decode_buffer(
                 processed_data
             };
 
+            let is_float = (format.format_flags & kAudioFormatFlagIsFloat) != 0;
             let f = match (actual_channels_per_frame, format.bits_per_channel) {
                 (1, 8) => al::AL_FORMAT_MONO8,
                 (1, 16) => al::AL_FORMAT_MONO16,
                 (2, 8) => al::AL_FORMAT_STEREO8,
                 (2, 16) => al::AL_FORMAT_STEREO16,
+                (1, 32) if is_float => {
+                    assert!(processed_data.len().is_multiple_of(4));
+                    let mut new_processed_data = Vec::<u8>::with_capacity((processed_data.len() / 4) * 2);
+                    for chunk in processed_data.chunks_exact(4) {
+                        let val = f32::from_le_bytes(chunk.try_into().unwrap());
+                        new_processed_data.extend_from_slice(&f32_to_i16(val).to_le_bytes());
+                    }
+                    return (
+                        al::AL_FORMAT_MONO16,
+                        format.sample_rate as ALsizei,
+                        new_processed_data,
+                    );
+                }
                 (2, 32) => {
-                    assert!((format.format_flags & kAudioFormatFlagIsSignedInteger) != 0);
                     assert!(processed_data.len().is_multiple_of(4));
                     let new_size = (processed_data.len() / 4) * 2; // size from 32-bit to 16-bit
                     let mut new_processed_data = Vec::<u8>::with_capacity(new_size);
                     for chunk in processed_data.chunks(4) {
-                        let val: i32 = i32::from_le_bytes(chunk.try_into().unwrap());
-                        let new_val: i16 = (val >> 16) as i16;
+                        let new_val: i16 = if is_float {
+                            let val = f32::from_le_bytes(chunk.try_into().unwrap());
+                            f32_to_i16(val)
+                        } else {
+                            assert!((format.format_flags & kAudioFormatFlagIsSignedInteger) != 0);
+                            let val: i32 = i32::from_le_bytes(chunk.try_into().unwrap());
+                            (val >> 16) as i16
+                        };
                         new_processed_data.extend(new_val.to_le_bytes());
                     }
                     return (
