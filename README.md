@@ -116,6 +116,12 @@ If the emulator crashes almost immediately while running a **known-working** ver
 
 See the `CONTRIBUTING.md` file in the git repo if you want to contribute. If you just want build touchHLE, look at `dev-docs/building.md`.
 
+## Branch note
+
+The `zombiefarm` branch contains local compatibility work for the Playforge versions of Zombie Farm.
+
+To build this branch you still need the normal touchHLE development environment: a Rust toolchain, CMake, the bundled fonts in `touchHLE_fonts/`, and the platform-specific native build prerequisites described in `dev-docs/building.md` (for example Visual Studio Build Tools on Windows). On Windows this repo also includes `build_windows.bat` as a convenience wrapper around the standard release/debug builds.
+
 # License
 
 touchHLE © 2023–2026 touchHLE project contributors.
