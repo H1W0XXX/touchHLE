@@ -15,6 +15,7 @@
 
 use crate::paths;
 use rusttype::{Point, Scale};
+use std::fs;
 use std::io::Read;
 
 pub struct Font {
@@ -67,22 +68,36 @@ impl RasterGlyph<'_> {
 }
 
 impl Font {
-    fn from_resource_file(filename: &str) -> Font {
-        let mut bytes = Vec::new();
-        let path = format!("{}/{}", paths::FONTS_DIR, filename);
-        if let Err(e) = paths::ResourceFile::open(&path)
-            .and_then(|mut f| f.get().read_to_end(&mut bytes).map_err(|e| e.to_string()))
-        {
-            panic!(
-                "Couldn't read bundled font file {path:?}: {e}. Perhaps the directory is missing?"
-            );
-        }
-
+    fn from_bytes(bytes: Vec<u8>, path_desc: &str) -> Font {
         let Some(font) = rusttype::Font::try_from_vec(bytes) else {
-            panic!("Couldn't parse bundled font file {path:?}. This probably means the file is corrupt. Try re-downloading it.");
+            panic!("Couldn't parse font file {path_desc:?}. This probably means the file is corrupt.");
         };
 
         Font { font }
+    }
+
+    fn try_from_resource_file(filename: &str) -> Option<Font> {
+        let mut bytes = Vec::new();
+        let path = format!("{}/{}", paths::FONTS_DIR, filename);
+        paths::ResourceFile::open(&path)
+            .and_then(|mut f| f.get().read_to_end(&mut bytes).map_err(|e| e.to_string()))
+            .ok()?;
+        Some(Self::from_bytes(bytes, &path))
+    }
+
+    fn from_resource_file(filename: &str) -> Font {
+        Self::try_from_resource_file(filename).unwrap_or_else(|| {
+            let path = format!("{}/{}", paths::FONTS_DIR, filename);
+            panic!(
+                "Couldn't read bundled font file {path:?}. Perhaps the directory is missing?"
+            );
+        })
+    }
+
+    #[cfg(target_os = "windows")]
+    fn try_from_host_file(path: &str) -> Option<Font> {
+        let bytes = fs::read(path).ok()?;
+        Some(Self::from_bytes(bytes, path))
     }
 
     pub fn mono_regular() -> Font {
@@ -126,6 +141,36 @@ impl Font {
     }
     pub fn sans_bold_ja() -> Font {
         Self::from_resource_file("NotoSansJP-Bold.otf")
+    }
+    pub fn sans_regular_sc() -> Font {
+        if let Some(font) = Self::try_from_resource_file("NotoSansSC-Regular.otf") {
+            return font;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(font) = Self::try_from_host_file(r"C:\Windows\Fonts\Deng.ttf") {
+                return font;
+            }
+            if let Some(font) = Self::try_from_host_file(r"C:\Windows\Fonts\simhei.ttf") {
+                return font;
+            }
+        }
+        Self::sans_regular_ja()
+    }
+    pub fn sans_bold_sc() -> Font {
+        if let Some(font) = Self::try_from_resource_file("NotoSansSC-Bold.otf") {
+            return font;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(font) = Self::try_from_host_file(r"C:\Windows\Fonts\Dengb.ttf") {
+                return font;
+            }
+            if let Some(font) = Self::try_from_host_file(r"C:\Windows\Fonts\simhei.ttf") {
+                return font;
+            }
+        }
+        Self::sans_bold_ja()
     }
 
     pub fn ascent(&self, font_size: f32) -> f32 {

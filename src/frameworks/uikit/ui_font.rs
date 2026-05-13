@@ -19,8 +19,8 @@ use std::ops::Range;
 #[derive(Default)]
 pub(super) struct State {
     fonts: HashMap<FontKind, Font>,
-    sans_regular_ja: Option<Font>,
-    sans_bold_ja: Option<Font>,
+    sans_regular_sc: Option<Font>,
+    sans_bold_sc: Option<Font>,
 }
 impl State {
     fn get_font_by_kind(&mut self, font_kind: FontKind) -> &Font {
@@ -178,8 +178,8 @@ fn convert_line_break_mode(ui_mode: UILineBreakMode) -> WrapMode {
 fn get_font<'a>(state: &'a mut State, kind: FontKind, text: &str) -> &'a Font {
     // The default fonts (see font.rs) are the Liberation family, which are a
     // good substitute for Helvetica, the iPhone OS system font. Unfortunately,
-    // there is no CJK support in these fonts. To support Super Monkey Ball in
-    // Japanese, let's fall back to Noto Sans JP when necessary.
+    // there is no CJK support in these fonts. For Chinese text, prefer a
+    // Simplified Chinese font if available; otherwise fall back to Noto Sans JP.
     // FIXME: This heuristic is incomplete and a proper font fallback system
     // should be used instead.
     for c in text.chars() {
@@ -196,16 +196,16 @@ fn get_font<'a>(state: &'a mut State, kind: FontKind, text: &str) -> &'a Font {
             match kind {
                 // CJK has no italic equivalent
                 FontKind::MonoRegular | FontKind::MonoItalic | FontKind::SansRegular | FontKind::SansItalic | FontKind::SerifRegular | FontKind::SerifItalic => {
-                    if state.sans_regular_ja.is_none() {
-                        state.sans_regular_ja = Some(Font::sans_regular_ja());
+                    if state.sans_regular_sc.is_none() {
+                        state.sans_regular_sc = Some(Font::sans_regular_sc());
                     }
-                    return state.sans_regular_ja.as_ref().unwrap();
+                    return state.sans_regular_sc.as_ref().unwrap();
                 },
                 FontKind::MonoBold | FontKind::MonoBoldItalic | FontKind::SansBold | FontKind::SansBoldItalic | FontKind::SerifBold | FontKind::SerifBoldItalic => {
-                    if state.sans_bold_ja.is_none() {
-                        state.sans_bold_ja = Some(Font::sans_bold_ja());
+                    if state.sans_bold_sc.is_none() {
+                        state.sans_bold_sc = Some(Font::sans_bold_sc());
                     }
-                    return state.sans_bold_ja.as_ref().unwrap();
+                    return state.sans_bold_sc.as_ref().unwrap();
                 },
             }
         }
