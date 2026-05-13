@@ -87,6 +87,11 @@ impl CALayerHostObject {
     }
 }
 
+pub fn diagnostic_snapshot(objc: &ObjC, layer: id) -> (id, CGRect, Vec<id>) {
+    let host_obj = objc.borrow::<CALayerHostObject>(layer);
+    (host_obj.delegate, host_obj.bounds, host_obj.sublayers.clone())
+}
+
 pub const kCAFilterLinear: &str = "kCAFilterLinear";
 pub const kCAFilterNearest: &str = "kCAFilterNearest";
 pub const kCAFilterTrilinear: &str = "kCAFilterTrilinear";

@@ -68,6 +68,7 @@ pub(super) struct UIViewHostObject {
     /// The view controller that controls this view. This is a weak reference
     view_controller: id,
     tag: NSInteger,
+    clips_to_bounds: bool,
     clears_context_before_drawing: bool,
     user_interaction_enabled: bool,
     multiple_touch_enabled: bool,
@@ -83,11 +84,16 @@ impl Default for UIViewHostObject {
             superview: nil,
             view_controller: nil,
             tag: 0,
+            clips_to_bounds: false,
             clears_context_before_drawing: true,
             user_interaction_enabled: true,
             multiple_touch_enabled: false,
         }
     }
+}
+
+pub fn get_clips_to_bounds(objc: &ObjC, view: id) -> bool {
+    objc.borrow::<UIViewHostObject>(view).clips_to_bounds
 }
 
 fn call_animation_selector(
@@ -591,6 +597,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         subviews,
         view_controller,
         tag: _,
+        clips_to_bounds: _,
         clears_context_before_drawing: _,
         user_interaction_enabled: _,
         multiple_touch_enabled: _,
@@ -630,8 +637,28 @@ pub const CLASSES: ClassExports = objc_classes! {
     msg![env; layer setHidden:hidden]
 }
 
+- (bool)clipsToBounds {
+    env.objc.borrow::<UIViewHostObject>(this).clips_to_bounds
+}
 - (())setClipsToBounds:(bool)clips {
-    todo_objc_setter!(this, clips);
+    env.objc.borrow_mut::<UIViewHostObject>(this).clips_to_bounds = clips;
+    if env.bundle.bundle_identifier().starts_with("com.playforge.Z") {
+        log!(
+            "ZombieFarm trace: UIView {:?} setClipsToBounds:{} frame:{:?} bounds:{:?}",
+            this,
+            clips,
+            {
+                let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+                let frame: CGRect = msg![env; layer frame];
+                frame
+            },
+            {
+                let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+                let bounds: CGRect = msg![env; layer bounds];
+                bounds
+            },
+        );
+    }
 }
 
 - (bool)isOpaque {

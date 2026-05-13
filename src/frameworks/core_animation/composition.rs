@@ -11,10 +11,11 @@
 #![allow(clippy::zero_ptr)] // alas, as you know, opengl
 
 use super::ca_eagl_layer::find_fullscreen_eagl_layer;
-use super::ca_layer::CALayerHostObject;
+use super::ca_layer::{diagnostic_snapshot, CALayerHostObject};
 use crate::frameworks::core_animation::animation;
 use crate::frameworks::core_graphics::cg_color::CGColorHostObject;
 use crate::frameworks::core_graphics::{cg_bitmap_context, cg_image, CGFloat, CGRect};
+use crate::frameworks::uikit::ui_view::get_clips_to_bounds;
 use crate::gles::gles11_raw as gles11; // constants only
 use crate::gles::gles11_raw::types::*;
 use crate::gles::present::{present_frame, FpsCounter};
@@ -640,9 +641,40 @@ unsafe fn composite_layer_recursive(
     }
     std::mem::drop(gles);
 
-    // avoid holding mutable borrow while recursing
-    let original_host_obj = env.objc.borrow_mut::<CALayerHostObject>(layer);
-    for &child_layer in &original_host_obj.sublayers.clone() {
+    // Avoid holding a borrow while querying ObjC and recursing.
+    let (delegate, bounds, sublayers) = diagnostic_snapshot(&env.objc, layer);
+    if delegate != nil {
+        let ui_view_class = env.objc.get_known_class("UIView", &mut env.mem);
+        if msg![env; delegate isKindOfClass:ui_view_class] {
+            if get_clips_to_bounds(&env.objc, delegate) {
+                for &child_layer in &sublayers {
+                    let child_frame: CGRect = msg![env; child_layer frame];
+                    let child_min_x = child_frame.origin.x;
+                    let child_max_x = child_frame.origin.x + child_frame.size.width;
+                    let child_min_y = child_frame.origin.y;
+                    let child_max_y = child_frame.origin.y + child_frame.size.height;
+                    let bounds_min_x = bounds.origin.x;
+                    let bounds_max_x = bounds.origin.x + bounds.size.width;
+                    let bounds_min_y = bounds.origin.y;
+                    let bounds_max_y = bounds.origin.y + bounds.size.height;
+                    let extends_outside = child_min_x < bounds_min_x
+                        || child_min_y < bounds_min_y
+                        || child_max_x > bounds_max_x
+                        || child_max_y > bounds_max_y;
+                    if extends_outside {
+                        log!(
+                            "ZombieFarm trace: clipping needed for parent view {:?} bounds {:?}, child layer {:?} frame {:?}",
+                            delegate,
+                            bounds,
+                            child_layer,
+                            child_frame,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    for &child_layer in &sublayers {
         // TODO: clipping/masksToBounds support
         composite_layer_recursive(
             env,
