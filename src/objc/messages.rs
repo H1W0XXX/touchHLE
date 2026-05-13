@@ -212,6 +212,31 @@ fn trace_zombie_farm_status_message(class_name: &str, selector_name: &str) -> bo
         )
 }
 
+fn trace_zombie_farm_layout_message(class_name: &str, selector_name: &str) -> bool {
+    let interesting_selector = matches!(
+        selector_name,
+        "setContentSize:"
+            | "contentSize"
+            | "setAnchorPoint:"
+            | "anchorPoint"
+            | "setPosition:"
+            | "position"
+            | "setScale:"
+            | "setScaleX:"
+            | "setScaleY:"
+            | "setTextureRect:"
+            | "setVertexZ:"
+            | "setVisible:"
+            | "setFlipX:"
+            | "setFlipY:"
+    );
+    interesting_selector
+        && (class_name.starts_with("CC")
+            || class_name.starts_with("ZF")
+            || class_name == "CCTableView"
+            || class_name == "CCTableViewCell")
+}
+
 /// The core implementation of `objc_msgSend`, the main function of Objective-C.
 ///
 /// Note that while only two parameters (usually receiver and selector) are
@@ -334,6 +359,8 @@ fn objc_msgSend_inner(
                 let receiver_class_name = env.objc.try_get_class_name(orig_class).unwrap_or(name);
                 if trace_zombie_farm_status_message(receiver_class_name, selector_name)
                     || trace_zombie_farm_status_message(name, selector_name)
+                    || trace_zombie_farm_layout_message(receiver_class_name, selector_name)
+                    || trace_zombie_farm_layout_message(name, selector_name)
                 {
                     let imp_description = match imp {
                         IMP::Host(_) => "host".to_string(),
