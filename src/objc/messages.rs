@@ -216,11 +216,8 @@ fn trace_zombie_farm_layout_message(class_name: &str, selector_name: &str) -> bo
     let interesting_selector = matches!(
         selector_name,
         "setContentSize:"
-            | "contentSize"
             | "setAnchorPoint:"
-            | "anchorPoint"
             | "setPosition:"
-            | "position"
             | "setScale:"
             | "setScaleX:"
             | "setScaleY:"
