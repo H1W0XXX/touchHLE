@@ -31,8 +31,93 @@ struct NSInvocationHostObject {
     retained_objects: Vec<id>,
     /// C string copies made by `retainArguments`
     copied_strings: Vec<MutPtr<u8>>,
+    /// Owned buffer for the last return value, if non-void.
+    return_value: Option<MutVoidPtr>,
 }
 impl HostObject for NSInvocationHostObject {}
+
+fn scalar_size_for_type(type_: &str) -> Option<usize> {
+    Some(match type_ {
+        "c" | "B" => 1,
+        "s" | "S" => 2,
+        "i" | "I" | "l" | "L" | "f" | "@" | ":" | "*" => 4,
+        "q" | "Q" | "d" => 8,
+        _ if type_.starts_with('^') => 4,
+        _ => return None,
+    })
+}
+
+fn store_return_value(env: &mut crate::Environment, this: id, ret_type: &str) {
+    if ret_type == "v" {
+        if let Some(ptr) = env.objc.borrow_mut::<NSInvocationHostObject>(this).return_value.take() {
+            env.mem.free(ptr.cast());
+        }
+        return;
+    }
+
+    let old = env.objc.borrow_mut::<NSInvocationHostObject>(this).return_value.take();
+    if let Some(ptr) = old {
+        env.mem.free(ptr.cast());
+    }
+
+    let new_value: MutVoidPtr = match ret_type {
+        "@" => {
+            let value = env.cpu.regs()[0];
+            env.mem.alloc_and_write(id::from_bits(value)).cast()
+        }
+        ":" => {
+            let value = <SEL as crate::abi::GuestRet>::from_regs(env.cpu.regs());
+            env.mem.alloc_and_write(value).cast()
+        }
+        "f" => {
+            let value = <f32 as crate::abi::GuestRet>::from_regs(env.cpu.regs());
+            env.mem.alloc_and_write(value).cast()
+        }
+        "d" => {
+            let value = <f64 as crate::abi::GuestRet>::from_regs(env.cpu.regs());
+            env.mem.alloc_and_write(value).cast()
+        }
+        "c" | "B" => {
+            let value = env.cpu.regs()[0] as u8;
+            env.mem.alloc_and_write(value).cast()
+        }
+        "s" => {
+            let value = env.cpu.regs()[0] as i16;
+            env.mem.alloc_and_write(value).cast()
+        }
+        "S" => {
+            let value = env.cpu.regs()[0] as u16;
+            env.mem.alloc_and_write(value).cast()
+        }
+        "i" | "l" => {
+            let value = env.cpu.regs()[0] as i32;
+            env.mem.alloc_and_write(value).cast()
+        }
+        "I" | "L" => {
+            let value = env.cpu.regs()[0];
+            env.mem.alloc_and_write(value).cast()
+        }
+        "q" => {
+            let value = <i64 as crate::abi::GuestRet>::from_regs(env.cpu.regs());
+            env.mem.alloc_and_write(value).cast()
+        }
+        "Q" => {
+            let value = <u64 as crate::abi::GuestRet>::from_regs(env.cpu.regs());
+            env.mem.alloc_and_write(value).cast()
+        }
+        "*" => {
+            let value = MutPtr::<u8>::from_bits(env.cpu.regs()[0]);
+            env.mem.alloc_and_write(value).cast()
+        }
+        _ if ret_type.starts_with('^') => {
+            let value = MutVoidPtr::from_bits(env.cpu.regs()[0]);
+            env.mem.alloc_and_write(value).cast()
+        }
+        _ => unimplemented!("NSInvocation return type {ret_type}"),
+    };
+
+    env.objc.borrow_mut::<NSInvocationHostObject>(this).return_value = Some(new_value);
+}
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -57,6 +142,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         arguments_retained: false,
         retained_objects: Vec::new(),
         copied_strings: Vec::new(),
+        return_value: None,
     });
     let res = env.objc.alloc_object(this, host_object, &mut env.mem);
     autorelease(env, res)
@@ -211,7 +297,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())invoke {
     let sig = env.objc.borrow::<NSInvocationHostObject>(this).sig;
     let ret_type: ConstPtr<u8> = msg![env; sig methodReturnType];
-    assert!(env.mem.read(ret_type) == b'v'); // TODO
+    let ret_type = env.mem.cstr_at_utf8(ret_type).unwrap().to_string();
 
     let &NSInvocationHostObject { target, selector, .. } = env.objc.borrow::<NSInvocationHostObject>(this);
     if target == nil {
@@ -379,9 +465,36 @@ pub const CLASSES: ClassExports = objc_classes! {
     // actual invocation
     objc_msgSend(env, target, selector.unwrap());
 
+    store_return_value(env, this, &ret_type);
+
     let regs = env.cpu.regs_mut(); // re-borrow
     regs[Cpu::SP] = old_sp;
-    // TODO: non-void return
+}
+
+- (())getReturnValue:(MutVoidPtr)ret_loc {
+    let sig = env.objc.borrow::<NSInvocationHostObject>(this).sig;
+    let ret_type_ptr: ConstPtr<u8> = msg![env; sig methodReturnType];
+    let ret_type = env.mem.cstr_at_utf8(ret_type_ptr).unwrap();
+
+    if ret_type == "v" {
+        return;
+    }
+
+    let ret_val = env.objc.borrow::<NSInvocationHostObject>(this).return_value;
+    let Some(ret_val) = ret_val else {
+        log!(
+            "Warning: NSInvocation {:?} getReturnValue called before invoke for return type {}",
+            this,
+            ret_type
+        );
+        return;
+    };
+
+    let size = scalar_size_for_type(ret_type).unwrap_or_else(|| {
+        unimplemented!("NSInvocation getReturnValue size for {ret_type}")
+    });
+    let src = env.mem.bytes_at(ret_val.cast().cast_const(), size.try_into().unwrap()).to_vec();
+    env.mem.bytes_at_mut(ret_loc.cast(), size.try_into().unwrap()).copy_from_slice(&src);
 }
 
 - (())dealloc {
@@ -404,6 +517,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     } else {
         assert!(env.objc.borrow::<NSInvocationHostObject>(this).retained_objects.is_empty());
         assert!(env.objc.borrow::<NSInvocationHostObject>(this).copied_strings.is_empty());
+    }
+    if let Some(ptr) = env.objc.borrow_mut::<NSInvocationHostObject>(this).return_value.take() {
+        env.mem.free(ptr.cast());
     }
     for ptr in env.objc.borrow::<NSInvocationHostObject>(this).arguments.iter().flatten() {
         env.mem.free(ptr.cast());
