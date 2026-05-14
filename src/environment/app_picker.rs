@@ -32,7 +32,7 @@ use crate::mem::Ptr;
 use crate::objc::{id, msg, msg_class, nil, objc_classes, release, ClassExports, HostObject};
 use crate::options::Options;
 use crate::paths;
-use crate::window::DeviceOrientation;
+use crate::window::{DeviceFamily, DeviceOrientation};
 use crate::Environment;
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -142,6 +142,9 @@ struct AppPickerDelegateHostObject {
     scale_hack2: bool,
     scale_hack3: bool,
     scale_hack4: bool,
+    device_family_default: bool,
+    device_family_iphone: bool,
+    device_family_ipad: bool,
     orientation_default: bool,
     orientation_landscape_left: bool,
     orientation_landscape_right: bool,
@@ -211,6 +214,15 @@ const CLASSES: ClassExports = objc_classes! {
 }
 - (())scaleHack4 {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).scale_hack4 = true;
+}
+- (())deviceFamilyDefault {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).device_family_default = true;
+}
+- (())deviceFamilyIPhone {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).device_family_iphone = true;
+}
+- (())deviceFamilyIPad {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).device_family_ipad = true;
 }
 - (())orientationDefault {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).orientation_default = true;
@@ -524,6 +536,7 @@ fn app_picker_inner(
 
     let quick_options_stuff = setup_quick_options(env, delegate, main_view, app_frame);
     let mut quick_options_scale_hack: Option<NonZeroU32> = None;
+    let mut quick_options_device_family: Option<DeviceFamily> = None;
     let mut quick_options_fullscreen: Option<()> = None;
     let mut quick_options_orientation: Option<DeviceOrientation> = None;
     let mut quick_options_analog_stick_tilt_controls = true;
@@ -541,6 +554,20 @@ fn app_picker_inner(
     }
     fn update_scale_hack_buttons(env: &mut Environment, buttons: &[id], value: Option<NonZeroU32>) {
         update_quick_option_buttons(env, buttons, value.map_or(0, |v| v.get() as usize));
+    }
+    fn update_device_family_buttons(
+        env: &mut Environment,
+        buttons: &[id],
+        value: Option<DeviceFamily>,
+    ) {
+        update_quick_option_buttons(
+            env,
+            buttons,
+            value.map_or(0, |v| match v {
+                DeviceFamily::iPhone => 1,
+                DeviceFamily::iPad => 2,
+            }),
+        );
     }
     fn update_orientation_buttons(
         env: &mut Environment,
@@ -561,6 +588,11 @@ fn app_picker_inner(
         env,
         &quick_options_stuff.scale_hack_buttons,
         quick_options_scale_hack,
+    );
+    update_device_family_buttons(
+        env,
+        &quick_options_stuff.device_family_buttons,
+        quick_options_device_family,
     );
     update_orientation_buttons(
         env,
@@ -677,6 +709,27 @@ fn app_picker_inner(
                 &quick_options_stuff.scale_hack_buttons,
                 quick_options_scale_hack,
             );
+        } else if std::mem::take(&mut host_obj.device_family_default) {
+            quick_options_device_family = None;
+            update_device_family_buttons(
+                env,
+                &quick_options_stuff.device_family_buttons,
+                quick_options_device_family,
+            );
+        } else if std::mem::take(&mut host_obj.device_family_iphone) {
+            quick_options_device_family = Some(DeviceFamily::iPhone);
+            update_device_family_buttons(
+                env,
+                &quick_options_stuff.device_family_buttons,
+                quick_options_device_family,
+            );
+        } else if std::mem::take(&mut host_obj.device_family_ipad) {
+            quick_options_device_family = Some(DeviceFamily::iPad);
+            update_device_family_buttons(
+                env,
+                &quick_options_stuff.device_family_buttons,
+                quick_options_device_family,
+            );
         } else if std::mem::take(&mut host_obj.orientation_default) {
             quick_options_orientation = None;
             update_orientation_buttons(
@@ -713,6 +766,15 @@ fn app_picker_inner(
     // Apply user-specified overrides
     if let Some(scale_hack) = quick_options_scale_hack {
         option_args.push(format!("--scale-hack={}", scale_hack.get()));
+    }
+    if let Some(device_family) = quick_options_device_family {
+        option_args.push(format!(
+            "--device-family={}",
+            match device_family {
+                DeviceFamily::iPhone => "iphone",
+                DeviceFamily::iPad => "ipad",
+            }
+        ));
     }
     if let Some(orientation) = quick_options_orientation {
         option_args.push(
@@ -1250,6 +1312,7 @@ fn change_copyright_page(
 struct QuickOptionsStuff {
     main_view: id,
     scale_hack_buttons: [id; 5],
+    device_family_buttons: [id; 3],
     orientation_buttons: [id; 3],
 }
 
@@ -1322,6 +1385,12 @@ fn setup_quick_options(
             ("2×", "scaleHack2"),
             ("3×", "scaleHack3"),
             ("4×", "scaleHack4"),
+        ]),
+        RowKind::Label("Device"),
+        RowKind::Buttons(&[
+            ("Default", "deviceFamilyDefault"),
+            ("iPhone", "deviceFamilyIPhone"),
+            ("iPad", "deviceFamilyIPad"),
         ]),
         RowKind::Label("Orientation"),
         RowKind::Buttons(&[
@@ -1406,6 +1475,7 @@ fn setup_quick_options(
     QuickOptionsStuff {
         main_view,
         scale_hack_buttons: button_rows[0][..].try_into().unwrap(),
-        orientation_buttons: button_rows[1][..].try_into().unwrap(),
+        device_family_buttons: button_rows[1][..].try_into().unwrap(),
+        orientation_buttons: button_rows[2][..].try_into().unwrap(),
     }
 }
