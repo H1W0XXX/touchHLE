@@ -115,6 +115,14 @@ jobs:
       - name: Generate local.properties
         run: echo "sdk.dir=$ANDROID_SDK_ROOT" > android/local.properties
 
+      - name: Decode Android signing key
+        run: |
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/app/zombiefarm-release.jks
+          fi
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+
       - name: Build release APK
         run: |
           cd android
@@ -124,6 +132,10 @@ jobs:
           ANDROID_NDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.ANDROID_NDK_VERSION }}
           ANDROID_NDK: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.ANDROID_NDK_VERSION }}
           ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.ANDROID_NDK_VERSION }}
+          ANDROID_KEYSTORE_PATH: ${{ github.workspace }}/android/app/zombiefarm-release.jks
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
           CMAKE: ${{ github.workspace }}/vendor/cmake/bin/cmake
 
       - name: Upload APK

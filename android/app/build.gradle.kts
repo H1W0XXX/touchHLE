@@ -37,7 +37,22 @@ fun join(prefix: String, separator: String, branding: String): String {
     return if (branding.isEmpty()) prefix else prefix + separator + branding
 }
 
+fun env(name: String): String? {
+    return System.getenv(name)?.takeIf { it.isNotBlank() }
+}
+
 android {
+    val releaseStoreFile = env("ANDROID_KEYSTORE_PATH")
+    val releaseStorePassword = env("ANDROID_KEYSTORE_PASSWORD")
+    val releaseKeyAlias = env("ANDROID_KEY_ALIAS")
+    val releaseKeyPassword = env("ANDROID_KEY_PASSWORD")
+    val hasReleaseSigning = listOf(
+        releaseStoreFile,
+        releaseStorePassword,
+        releaseKeyAlias,
+        releaseKeyPassword,
+    ).all { it != null }
+
     ndkVersion = "25.2.9519653"
     compileSdk = 31
     buildFeatures {
@@ -80,9 +95,23 @@ android {
     kotlinOptions {
         jvmTarget = "11"
     }
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = file(releaseStoreFile!!)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
     buildTypes {
         release {
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = if (hasReleaseSigning) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
             isMinifyEnabled = false
             isDebuggable = true // allow use of ADB to manage files, etc
         }

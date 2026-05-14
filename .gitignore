@@ -19,6 +19,10 @@ local.properties
 android/app/src/main/jniLibs
 android/app/build
 android/build
+android/app/*.jks
+android/app/*.keystore
+*.jks
+*.keystore
 
 # Default developer dump file
 
