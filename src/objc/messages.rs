@@ -159,79 +159,31 @@ fn maybe_initialize_class(env: &mut Environment, receiver: id) {
 }
 
 fn trace_zombie_farm_status_message(class_name: &str, selector_name: &str) -> bool {
-    class_name == "StatusBar"
-        || class_name == "NSNotificationCenter"
-        || class_name == "NSInvocation"
-        || (class_name == "MainMenu"
-            && matches!(
-                selector_name,
-                "startupInternet"
-                    | "reachabilityChanged"
-                    | "enableProfileView"
-                    | "updateOnlineStatus"
-                    | "checkServerNotice"
-                    | "playTapped"
-                    | "startGame"
-            ))
-        || matches!(
-            selector_name,
-            "hide"
-                | "statusBar"
-                | "showMessage:"
-                | "showMessage:withCancelTimeout:andCancelNotification:"
-                | "updateMessage:andCancelTimeout:andCancelNotification:"
-                | "setCancelNotification:"
-                | "cancelTapped"
-                | "showCancelButton"
-                | "cancelNotification"
-                | "postNotification:"
-                | "postNotificationName:object:"
-                | "postNotificationName:object:userInfo:"
-                | "addObserver:selector:name:object:"
-                | "removeObserver:"
-                | "removeObserver:name:object:"
-                | "invoke"
-                | "invokeWithTarget:"
-                | "setTarget:"
-                | "setSelector:"
-                | "setArgument:atIndex:"
-                | "retainArguments"
-                | "beginAnimations:context:"
-                | "setAnimationDelegate:"
-                | "setAnimationWillStartSelector:"
-                | "setAnimationDidStopSelector:"
-                | "commitAnimations"
-                | "removeFromSuperview"
-                | "setHidden:"
-                | "setAlpha:"
-                | "setFrame:"
-                | "setBounds:"
-                | "setCenter:"
-                | "setTransform:"
-                | "setUserInteractionEnabled:"
-        )
+    let _ = (class_name, selector_name);
+    false
 }
 
 fn trace_zombie_farm_layout_message(class_name: &str, selector_name: &str) -> bool {
     let interesting_selector = matches!(
         selector_name,
         "setContentSize:"
-            | "setAnchorPoint:"
+            | "setViewSize:"
             | "setPosition:"
-            | "setScale:"
-            | "setScaleX:"
-            | "setScaleY:"
-            | "setTextureRect:"
-            | "setVertexZ:"
-            | "setVisible:"
-            | "setFlipX:"
-            | "setFlipY:"
+            | "setContentOffset:"
+            | "cellSize"
+            | "viewSize"
+            | "contentSize"
+            | "contentOffset"
+            | "setCellLayer:"
+            | "setCellLayer2:"
+            | "setCellActor:"
+            | "setCellID:"
+            | "setCurrentCellIndex:"
     );
     interesting_selector
-        && (class_name.starts_with("CC")
-            || class_name.starts_with("ZF")
-            || class_name == "CCTableView"
-            || class_name == "CCTableViewCell")
+        && (class_name.contains("TableView")
+            || class_name.ends_with("Cell")
+            || class_name == "CCScrollView")
 }
 
 /// The core implementation of `objc_msgSend`, the main function of Objective-C.

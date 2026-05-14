@@ -307,6 +307,17 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 }
 
+- (())addObjectsFromArray:(id)array { // NSArray *
+    let enumerator: id = msg![env; array objectEnumerator];
+    loop {
+        let next: id = msg![env; enumerator nextObject];
+        if next == nil {
+            break;
+        }
+        () = msg![env; this addObject:next];
+    }
+}
+
 @end
 
 };

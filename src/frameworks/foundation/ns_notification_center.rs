@@ -208,7 +208,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             .zombie_farm_startup_player_determined = true;
     }
 
-    log!(
+    log_dbg!(
         "ZombieFarm trace: notification {:?} posted by {:?}",
         name,
         notification_poster
@@ -260,7 +260,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             selector.as_str(&env.mem),
             observer
         );
-        log!(
+        log_dbg!(
             "ZombieFarm trace: notification {:?} observed, sending {:?} to {:?}",
             name,
             selector.as_str(&env.mem),
