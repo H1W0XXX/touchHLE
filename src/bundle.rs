@@ -72,7 +72,11 @@ impl Bundle {
     }
 
     pub fn bundle_identifier(&self) -> &str {
-        self.plist["CFBundleIdentifier"].as_string().unwrap()
+        // The app picker runs with a fake bundle that has no Info.plist.
+        self.plist
+            .get("CFBundleIdentifier")
+            .map(|v| v.as_string().unwrap())
+            .unwrap_or("")
     }
 
     pub fn bundle_version(&self) -> &str {
