@@ -82,6 +82,7 @@ pub fn CGBitmapContextCreate(
         // TODO: is this the correct default?
         rgb_fill_color: (0.0, 0.0, 0.0, 0.0),
         transform: CGAffineTransformIdentity,
+        clip_mask: None,
         state_stack: Vec::new(),
     };
     let isa = env
@@ -466,6 +467,48 @@ impl CGBitmapContextDrawer<'_> {
     }
 }
 
+fn masked_color(
+    drawer: &CGBitmapContextDrawer<'_>,
+    clip_mask: Option<(CGRect, &Image)>,
+    coords: (i32, i32),
+    color: (CGFloat, CGFloat, CGFloat, CGFloat),
+) -> Option<(CGFloat, CGFloat, CGFloat, CGFloat)> {
+    let Some((rect, mask)) = clip_mask else {
+        return Some(color);
+    };
+    let device_rect = drawer.transform.apply_to_rect(rect);
+    if device_rect.size.width <= 0.0 || device_rect.size.height <= 0.0 {
+        return None;
+    }
+
+    let x = coords.0 as f32 + 0.5;
+    let y = coords.1 as f32 + 0.5;
+    let x_within = (x - device_rect.origin.x) / device_rect.size.width;
+    let y_within = (y - device_rect.origin.y) / device_rect.size.height;
+    if !(0.0..1.0).contains(&x_within) || !(0.0..1.0).contains(&y_within) {
+        return None;
+    }
+
+    let (mask_width, mask_height) = mask.dimensions();
+    let mask_x = (mask_width as f32 * x_within) as i32;
+    let mask_y = (mask_height as f32 * (1.0 - y_within)) as i32;
+    let mask_alpha = mask
+        .get_pixel((mask_x, mask_y))
+        .map(|(r, g, b, a)| ((r + g + b) / 3.0) * a)
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    if mask_alpha <= 0.0 {
+        None
+    } else {
+        Some((
+            color.0 * mask_alpha,
+            color.1 * mask_alpha,
+            color.2 * mask_alpha,
+            color.3 * mask_alpha,
+        ))
+    }
+}
+
 #[cfg(test)]
 #[test]
 fn test_iter_transformed_pixels() {
@@ -563,6 +606,11 @@ fn test_iter_transformed_pixels() {
 /// Implementation of `CGContextFillRect` (`clear` == [false]) and
 /// `CGContextClearRect` (`clear` == [true]) for `CGBitmapContext`.
 pub(super) fn fill_rect(env: &mut Environment, context: CGContextRef, rect: CGRect, clear: bool) {
+    let clip_mask = env
+        .objc
+        .borrow::<CGContextHostObject>(context)
+        .clip_mask
+        .map(|(rect, mask)| (rect, cg_image::borrow_image(&env.objc, mask)));
     let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
     let color = if clear {
         (0.0, 0.0, 0.0, 0.0)
@@ -571,7 +619,9 @@ pub(super) fn fill_rect(env: &mut Environment, context: CGContextRef, rect: CGRe
     };
     // TODO: correct anti-aliasing
     for ((x, y), _) in drawer.iter_transformed_pixels(rect) {
-        drawer.put_pixel((x, y), color, /* blend: */ !clear)
+        if let Some(color) = masked_color(&drawer, clip_mask, (x, y), color) {
+            drawer.put_pixel((x, y), color, /* blend: */ !clear)
+        }
     }
 }
 
@@ -583,6 +633,11 @@ pub(super) fn draw_image(
     image: CGImageRef,
 ) {
     let image = cg_image::borrow_image(&env.objc, image);
+    let clip_mask = env
+        .objc
+        .borrow::<CGContextHostObject>(context)
+        .clip_mask
+        .map(|(rect, mask)| (rect, cg_image::borrow_image(&env.objc, mask)));
 
     let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
 
@@ -614,7 +669,9 @@ pub(super) fn draw_image(
         let texel_y = (image_height as f32 * (1.0 - texel_y)) as i32;
         // FIXME: might need alpha format conversion here
         if let Some(color) = image.get_pixel((texel_x, texel_y)) {
-            drawer.put_pixel((x, y), color, /* blend: */ true)
+            if let Some(color) = masked_color(&drawer, clip_mask, (x, y), color) {
+                drawer.put_pixel((x, y), color, /* blend: */ true)
+            }
         }
     }
 

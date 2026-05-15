@@ -58,6 +58,13 @@ fn realloc(env: &mut Environment, ptr: MutVoidPtr, size: GuestUSize) -> MutVoidP
     env.mem.realloc(ptr, size)
 }
 
+fn reallocf(env: &mut Environment, ptr: MutVoidPtr, size: GuestUSize) -> MutVoidPtr {
+    // Darwin's reallocf frees the original allocation when realloc fails. The
+    // touchHLE allocator does not currently report allocation failure, so this
+    // is equivalent to realloc for now.
+    realloc(env, ptr, size)
+}
+
 fn free(env: &mut Environment, ptr: MutVoidPtr) {
     // We need to catch situations of freeing NSObjects early!
     if env.objc.get_host_object(ptr.cast()).is_some() {
@@ -528,6 +535,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(malloc_size(_)),
     export_c_func!(calloc(_, _)),
     export_c_func!(realloc(_, _)),
+    export_c_func!(reallocf(_, _)),
     export_c_func!(free(_)),
     export_c_func!(atexit(_)),
     export_c_func!(atoi(_)),

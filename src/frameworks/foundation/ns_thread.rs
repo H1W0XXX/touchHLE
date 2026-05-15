@@ -118,6 +118,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.current_thread == 0
 }
 
+- (bool)isMainThread {
+    let current_thread: id = msg_class![env; NSThread currentThread];
+    this == current_thread
+}
+
 - (id)initWithTarget:(id)target
             selector:(SEL)selector
               object:(id)object {

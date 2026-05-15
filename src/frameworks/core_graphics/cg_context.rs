@@ -6,7 +6,7 @@
 //! `CGContext.h`
 
 use super::cg_affine_transform::CGAffineTransform;
-use super::cg_image::CGImageRef;
+use super::cg_image::{CGImageRef, CGImageRelease, CGImageRetain};
 use super::{cg_bitmap_context, cg_color, CGFloat, CGRect};
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::frameworks::core_foundation::{CFRelease, CFRetain, CFTypeRef};
@@ -30,10 +30,24 @@ pub const CLASSES: ClassExports = objc_classes! {
 @implementation _touchHLE_CGContext: NSObject
 
 - (())dealloc {
-    let host_obj = env.objc.borrow::<CGContextHostObject>(this);
-    let CGContextSubclass::CGBitmapContext(bitmap_data) = host_obj.subclass;
+    let (bitmap_data, masks_to_release) = {
+        let host_obj = env.objc.borrow::<CGContextHostObject>(this);
+        let CGContextSubclass::CGBitmapContext(bitmap_data) = host_obj.subclass;
+        let mut masks_to_release: Vec<_> = host_obj
+            .state_stack
+            .iter()
+            .filter_map(|state| state.clip_mask.map(|(_, mask)| mask))
+            .collect();
+        if let Some((_, mask)) = host_obj.clip_mask {
+            masks_to_release.push(mask);
+        }
+        (bitmap_data, masks_to_release)
+    };
     if bitmap_data.data_is_owned {
         env.mem.free(bitmap_data.data);
+    }
+    for mask in masks_to_release {
+        CGImageRelease(env, mask);
     }
 
     env.objc.dealloc_object(this, &mut env.mem)
@@ -48,13 +62,20 @@ pub(super) struct CGContextHostObject {
     pub(super) rgb_fill_color: (CGFloat, CGFloat, CGFloat, CGFloat),
     /// Current transform.
     pub(super) transform: CGAffineTransform,
+    pub(super) clip_mask: Option<(CGRect, CGImageRef)>,
     // TODO: keep more states saved once they are implemented
-    pub(super) state_stack: Vec<((CGFloat, CGFloat, CGFloat, CGFloat), CGAffineTransform)>,
+    pub(super) state_stack: Vec<CGContextState>,
 }
 impl HostObject for CGContextHostObject {}
 
 pub(super) enum CGContextSubclass {
     CGBitmapContext(cg_bitmap_context::CGBitmapContextData),
+}
+
+pub(super) struct CGContextState {
+    rgb_fill_color: (CGFloat, CGFloat, CGFloat, CGFloat),
+    transform: CGAffineTransform,
+    clip_mask: Option<(CGRect, CGImageRef)>,
 }
 
 pub type CGContextRef = CFTypeRef;
@@ -127,6 +148,20 @@ fn CGContextClipToRect(env: &mut Environment, context: CGContextRef, rect: CGRec
     todo!();
 }
 
+fn CGContextClipToMask(env: &mut Environment, context: CGContextRef, rect: CGRect, mask: CGImageRef) {
+    if mask.is_null() || rect.size.width <= 0.0 || rect.size.height <= 0.0 {
+        return;
+    }
+    CGImageRetain(env, mask);
+    let old_mask = {
+        let host_obj = env.objc.borrow_mut::<CGContextHostObject>(context);
+        std::mem::replace(&mut host_obj.clip_mask, Some((rect, mask)))
+    };
+    if let Some((_, old_mask)) = old_mask {
+        CGImageRelease(env, old_mask);
+    }
+}
+
 pub fn CGContextConcatCTM(
     env: &mut Environment,
     context: CGContextRef,
@@ -172,17 +207,35 @@ pub fn CGContextDrawImage(
 }
 
 pub fn CGContextSaveGState(env: &mut Environment, context: CGContextRef) {
-    let host_obj = env.objc.borrow_mut::<CGContextHostObject>(context);
-    host_obj
+    let state = {
+        let host_obj = env.objc.borrow::<CGContextHostObject>(context);
+        CGContextState {
+            rgb_fill_color: host_obj.rgb_fill_color,
+            transform: host_obj.transform,
+            clip_mask: host_obj.clip_mask,
+        }
+    };
+    if let Some((_, mask)) = state.clip_mask {
+        CGImageRetain(env, mask);
+    }
+    env.objc
+        .borrow_mut::<CGContextHostObject>(context)
         .state_stack
-        .push((host_obj.rgb_fill_color, host_obj.transform));
+        .push(state);
 }
 
 pub fn CGContextRestoreGState(env: &mut Environment, context: CGContextRef) {
+    let (state, old_mask) = {
+        let host_obj = env.objc.borrow_mut::<CGContextHostObject>(context);
+        (host_obj.state_stack.pop().unwrap(), host_obj.clip_mask)
+    };
+    if let Some((_, mask)) = old_mask {
+        CGImageRelease(env, mask);
+    }
     let host_obj = env.objc.borrow_mut::<CGContextHostObject>(context);
-    let state = host_obj.state_stack.pop().unwrap();
-    host_obj.rgb_fill_color = state.0;
-    host_obj.transform = state.1;
+    host_obj.rgb_fill_color = state.rgb_fill_color;
+    host_obj.transform = state.transform;
+    host_obj.clip_mask = state.clip_mask;
 }
 
 fn CGContextSetInterpolationQuality(
@@ -206,6 +259,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGContextFillRect(_, _)),
     export_c_func!(CGContextClearRect(_, _)),
     export_c_func!(CGContextClipToRect(_, _)),
+    export_c_func!(CGContextClipToMask(_, _, _)),
     export_c_func!(CGContextConcatCTM(_, _)),
     export_c_func!(CGContextGetCTM(_)),
     export_c_func!(CGContextRotateCTM(_, _)),

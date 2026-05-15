@@ -37,6 +37,36 @@ fn method_imp_for_class(env: &mut crate::Environment, class: Class, selector: SE
     }
 }
 
+fn zombie_farm_pressed_target_to_preserve(
+    env: &crate::Environment,
+    object: id,
+) -> Option<String> {
+    if !env.bundle.bundle_identifier().starts_with("com.playforge.Z") {
+        return None;
+    }
+
+    let class = ObjC::read_isa(object, &env.mem);
+    if class == nil {
+        return None;
+    }
+
+    let pressed = env.objc.lookup_selector("pressed:")?;
+    if !env.objc.class_has_method(class, pressed) {
+        return None;
+    }
+
+    let class_name = env.objc.try_get_class_name(class)?.to_string();
+    if !(class_name.starts_with("ZF") && class_name.ends_with("Cell")) {
+        return None;
+    }
+
+    if env.objc.try_get_refcount(object)?.get() == 1 {
+        Some(class_name)
+    } else {
+        None
+    }
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -112,7 +142,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 + (id)instanceMethodSignatureForSelector:(SEL)sel {
     // TODO: support `host` method signatures
-    let sig = *env.objc.class_get_method_signature(this, sel).unwrap();
+    let Some(sig) = env.objc.class_get_method_signature(this, sel) else {
+        log_dbg!("instanceMethodSignatureForSelector: '{}' -> nil", sel.as_str(&env.mem));
+        return nil;
+    };
+    let sig = *sig;
     log_dbg!("instanceMethodSignatureForSelector: '{}' -> {:?}", sel.as_str(&env.mem), env.mem.cstr_at_utf8(sig));
     msg_class![env; NSMethodSignature signatureWithObjCTypes:sig]
 }
@@ -160,6 +194,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (())release {
     log_dbg!("[{:?} release]", this);
+    if let Some(class_name) = zombie_farm_pressed_target_to_preserve(env, this) {
+        log_dbg!(
+            "ZombieFarm workaround: preserving {:?} ({}) because the game can send pressed: after release",
+            this,
+            class_name
+        );
+        return;
+    }
     if env.objc.decrement_refcount(this) {
         () = msg![env; this dealloc];
     }

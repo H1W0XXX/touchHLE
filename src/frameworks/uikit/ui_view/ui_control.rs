@@ -18,7 +18,7 @@ use crate::frameworks::core_graphics::CGPoint;
 use crate::frameworks::foundation::NSUInteger;
 use crate::objc::{
     id, impl_HostObject_with_superclass, msg, msg_send, msg_super, nil, objc_classes, release,
-    retain, ClassExports, NSZonePtr, SEL,
+    retain, ClassExports, NSZonePtr, ObjC, SEL,
 };
 use crate::Environment;
 
@@ -41,9 +41,20 @@ struct UIControlHostObject {
     /// `UITouch*` of the touch currently being tracked, [nil] if none
     tracked_touch: id,
     tracking: bool,
-    /// See `addTarget:action:forControlEvents:`. The target is a weak
-    /// reference!
-    action_targets: Vec<(id, SEL, UIControlEvents)>,
+    /// See `addTarget:action:forControlEvents:`.
+    ///
+    /// UIKit documents targets as weak references, but touchHLE's emulated view
+    /// and table-cell lifetimes are not exact enough yet. Retaining here avoids
+    /// stale action targets when old games keep controls alive across cell
+    /// reuse.
+    action_targets: Vec<ActionTarget>,
+}
+#[derive(Copy, Clone)]
+struct ActionTarget {
+    target: id,
+    action: SEL,
+    events: UIControlEvents,
+    host_retained: bool,
 }
 impl_HostObject_with_superclass!(UIControlHostObject);
 impl Default for UIControlHostObject {
@@ -79,8 +90,8 @@ fn send_actions(env: &mut Environment, this: id, event: id, control_event: UICon
     let UIControlHostObject { action_targets, .. } = env.objc.borrow(this);
     let action_targets: Vec<_> = action_targets
         .iter()
-        .filter(|&(_target, _action, for_control_events)| (for_control_events & control_event) != 0)
-        .map(|&(target, action, _for_control_events)| (target, action))
+        .filter(|action_target| (action_target.events & control_event) != 0)
+        .map(|action_target| (action_target.target, action_target.action))
         .collect();
 
     for (target, action) in action_targets {
@@ -109,10 +120,20 @@ pub const CLASSES: ClassExports = objc_classes! {
         selected: _,
         highlighted: _,
         tracking: _,
-        action_targets: _, // targets are weak references, nothing to do
+        action_targets,
         tracked_touch,
     } = std::mem::take(env.objc.borrow_mut(this));
 
+    for action_target in action_targets {
+        if action_target.host_retained {
+            if env.objc.try_decrement_refcount(action_target.target) == Some(true) {
+                let target = action_target.target;
+                let _: () = msg![env; target dealloc];
+            }
+        } else {
+            release(env, action_target.target);
+        }
+    }
     release(env, tracked_touch);
 
     msg_super![env; this dealloc]
@@ -205,7 +226,7 @@ pub const CLASSES: ClassExports = objc_classes! {
             .borrow::<UIControlHostObject>(this)
             .action_targets
             .iter()
-            .any(|&(_target, action, _events)| action == play_tapped)
+            .any(|action_target| action_target.action == play_tapped)
     } else {
         false
     };
@@ -319,7 +340,10 @@ forControlEvents:(UIControlEvents)events {
         );
         return;
     }
-    // The target is a *weak* reference!
+    let host_retained = env.objc.try_increment_refcount(target);
+    if !host_retained {
+        retain(env, target);
+    }
 
     // The selector must be for a method with zero to two arguments
     let sel_str = action.as_str(&env.mem);
@@ -338,7 +362,15 @@ forControlEvents:(UIControlEvents)events {
         );
     }
 
-    env.objc.borrow_mut::<UIControlHostObject>(this).action_targets.push((target, action, events));
+    env.objc
+        .borrow_mut::<UIControlHostObject>(this)
+        .action_targets
+        .push(ActionTarget {
+            target,
+            action,
+            events,
+            host_retained,
+        });
 }
 
 - (())sendAction:(SEL)action
@@ -347,6 +379,15 @@ forControlEvents:(UIControlEvents)events {
     assert!(target != nil); // TODO
 
     let sel_str = action.as_str(&env.mem);
+    let target_class = ObjC::read_isa(target, &env.mem);
+    if target_class == nil {
+        log!(
+            "Warning: ignoring UIControl action {:?} to stale target {:?} with nil isa",
+            sel_str,
+            target,
+        );
+        return;
+    }
     let colon_count = sel_str.bytes().filter(|&b| b == b':').count();
     match colon_count {
         // - (IBAction)action;

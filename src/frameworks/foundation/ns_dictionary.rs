@@ -333,6 +333,16 @@ pub fn init_with_objects_and_keys(
 
 /// Helper function to share `initWithDictionary:` implementations
 fn init_with_dictionary_common(env: &mut Environment, this: id, other_dict: id) -> id {
+    init_with_dictionary_common_inner(env, this, other_dict, /* copy_items: */ false)
+}
+
+/// Helper function to share `initWithDictionary:copyItems:` implementations
+fn init_with_dictionary_common_inner(
+    env: &mut Environment,
+    this: id,
+    other_dict: id,
+    copy_items: bool,
+) -> id {
     let mut host_object = <DictionaryHostObject as Default>::default();
 
     if other_dict != nil {
@@ -340,8 +350,14 @@ fn init_with_dictionary_common(env: &mut Environment, this: id, other_dict: id) 
         let count: NSUInteger = msg![env; keys count];
         for i in 0..count {
             let key: id = msg![env; keys objectAtIndex:i];
-            let object: id = msg![env; other_dict objectForKey:key];
+            let mut object: id = msg![env; other_dict objectForKey:key];
+            if copy_items {
+                object = msg![env; object copy];
+            }
             host_object.insert(env, key, object, /* copy_key: */ true);
+            if copy_items {
+                release(env, object);
+            }
         }
     }
 
@@ -656,6 +672,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     init_with_dictionary_common(env, this, dictionary)
 }
 
+- (id)initWithDictionary:(id)dictionary
+               copyItems:(bool)copy_items {
+    init_with_dictionary_common_inner(env, this, dictionary, copy_items)
+}
+
 - (id)initWithObjects:(id)objects //NSArray *
               forKeys:(id)keys { //NSArray *
     init_with_objects_for_keys_common(env, this, objects, keys)
@@ -750,6 +771,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)initWithDictionary:(id)dictionary {
     init_with_dictionary_common(env, this, dictionary)
+}
+
+- (id)initWithDictionary:(id)dictionary
+               copyItems:(bool)copy_items {
+    init_with_dictionary_common_inner(env, this, dictionary, copy_items)
 }
 
 - (id)init {

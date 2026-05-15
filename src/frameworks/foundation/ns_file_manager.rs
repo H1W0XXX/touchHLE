@@ -433,7 +433,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)attributesOfItemAtPath:(id)path // NSString *
                        error:(MutPtr<id>)error { // NSError **
-    assert!(error.is_null()); // TODO
+    if !error.is_null() {
+        env.mem.write(error, nil);
+    }
 
     // TODO: other attributes
     log_once!("Warning: NSFileManager attributesOfItemAtPath:error: returns only NSFileType, NSFileModificationDate and NSFileSize attributes!");
@@ -451,7 +453,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     // TODO: other attributes
     log_once!("Warning: NSFileManager attributesOfFileSystemForPath:error: returns only NSFileSystemFreeSize attribute!");
 
-    assert!(error.is_null()); // TODO
+    if !error.is_null() {
+        env.mem.write(error, nil);
+    }
 
     let dict = msg_class![env; NSMutableDictionary new];
 

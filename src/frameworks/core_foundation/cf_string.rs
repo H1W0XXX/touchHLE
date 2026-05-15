@@ -250,6 +250,24 @@ fn CFStringGetCharacters(
     };
     msg![env; string getCharacters:buffer range:range]
 }
+
+fn CFStringGetCharactersPtr(env: &mut Environment, the_string: CFStringRef) -> ConstPtr<unichar> {
+    if the_string == nil {
+        return ConstPtr::null();
+    }
+
+    let len = CFStringGetLength(env, the_string);
+    let bytes = (len as usize)
+        .checked_mul(std::mem::size_of::<unichar>())
+        .unwrap();
+    let buffer = env.mem.alloc((bytes.max(std::mem::size_of::<unichar>())) as u32);
+    if len != 0 {
+        let range = CFRange { location: 0, length: len };
+        CFStringGetCharacters(env, the_string, range, buffer.cast());
+    }
+    buffer.cast_const().cast()
+}
+
 fn CFStringGetCStringPtr(
     env: &mut Environment,
     the_string: CFStringRef,
@@ -387,6 +405,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CFStringDelete(_, _)),
     export_c_func!(CFStringGetCharacterAtIndex(_, _)),
     export_c_func!(CFStringGetCharacters(_, _, _)),
+    export_c_func!(CFStringGetCharactersPtr(_)),
     export_c_func!(CFStringGetCStringPtr(_, _)),
     export_c_func!(CFStringGetCString(_, _, _, _)),
     export_c_func!(CFStringGetIntValue(_)),

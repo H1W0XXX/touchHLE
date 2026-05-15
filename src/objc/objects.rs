@@ -300,6 +300,12 @@ impl super::ObjC {
         *refcount
     }
 
+    /// Get the refcount of a reference-counted object, returning `None` for
+    /// nil, missing, or static-lifetime objects.
+    pub fn try_get_refcount(&self, object: id) -> Option<NonZeroU32> {
+        self.objects.get(&object)?.refcount
+    }
+
     /// Increase the refcount of a reference-counted object. Do not call this
     /// directly unless you're implementing `release` on `NSObject`. That method
     /// may be overridden.
@@ -312,6 +318,19 @@ impl super::ObjC {
             panic!("Attempt to increment refcount on static-lifetime object {object:?}!");
         };
         *refcount = refcount.checked_add(1).unwrap();
+    }
+
+    /// Increase the host-side refcount without sending an Objective-C message.
+    /// Returns false for nil, static objects, or objects that are already gone.
+    pub fn try_increment_refcount(&mut self, object: id) -> bool {
+        let Some(entry) = self.objects.get_mut(&object) else {
+            return false;
+        };
+        let Some(refcount) = entry.refcount.as_mut() else {
+            return false;
+        };
+        *refcount = refcount.checked_add(1).unwrap();
+        true
     }
 
     /// Decrease the refcount of a reference-counted object. Do not call this
@@ -335,6 +354,21 @@ impl super::ObjC {
         } else {
             *refcount = NonZeroU32::new(refcount.get() - 1).unwrap();
             false
+        }
+    }
+
+    /// Decrease a host-side refcount previously increased by
+    /// [Self::try_increment_refcount]. Returns true if the object now needs a
+    /// `dealloc` message.
+    pub fn try_decrement_refcount(&mut self, object: id) -> Option<bool> {
+        let entry = self.objects.get_mut(&object)?;
+        let refcount = entry.refcount.as_mut()?;
+        if refcount.get() == 1 {
+            entry.refcount = None;
+            Some(true)
+        } else {
+            *refcount = NonZeroU32::new(refcount.get() - 1).unwrap();
+            Some(false)
         }
     }
 

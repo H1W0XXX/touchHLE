@@ -86,6 +86,30 @@ fn OSMemoryBarrier(_env: &mut Environment) {
     // no-op
 }
 
+fn OSSpinLockLock(env: &mut Environment, lock: MutPtr<i32>) {
+    if !lock.is_null() {
+        env.mem.write(lock, -1);
+    }
+}
+
+fn OSSpinLockTry(env: &mut Environment, lock: MutPtr<i32>) -> bool {
+    if lock.is_null() {
+        return true;
+    }
+    if env.mem.read(lock) == 0 {
+        env.mem.write(lock, -1);
+        true
+    } else {
+        false
+    }
+}
+
+fn OSSpinLockUnlock(env: &mut Environment, lock: MutPtr<i32>) {
+    if !lock.is_null() {
+        env.mem.write(lock, 0);
+    }
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(OSAtomicAdd32(_, _)),
     export_c_func!(OSAtomicAdd32Barrier(_, _)),
@@ -95,4 +119,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(OSAtomicCompareAndSwapPtr(_, _, _)),
     export_c_func!(OSAtomicCompareAndSwapPtrBarrier(_, _, _)),
     export_c_func!(OSMemoryBarrier()),
+    export_c_func!(OSSpinLockLock(_)),
+    export_c_func!(OSSpinLockTry(_)),
+    export_c_func!(OSSpinLockUnlock(_)),
 ];

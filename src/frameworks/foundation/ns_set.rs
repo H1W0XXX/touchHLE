@@ -273,6 +273,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // TODO: more mutation methods
 
+// NSMutableCopying implementation
+- (id)mutableCopyWithZone:(NSZonePtr)_zone {
+    let new: id = msg_class![env; NSMutableSet alloc];
+    let objects: id = msg![env; this allObjects];
+    () = msg![env; new addObjectsFromArray:objects];
+    new
+}
+
 - (())addObject:(id)object {
     let null: id = msg_class![env; NSNull null];
     let mut host_obj: SetHostObject = std::mem::take(env.objc.borrow_mut(this));

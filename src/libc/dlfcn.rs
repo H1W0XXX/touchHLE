@@ -5,8 +5,9 @@
  */
 //! `dlfcn.h` (`dlopen()` and friends)
 
-use crate::dyld::{export_c_func, FunctionExports};
-use crate::mem::{ConstPtr, MutVoidPtr, Ptr};
+use crate::dyld::{export_c_func, search_host_dylibs, FunctionExports, HostConstant};
+use crate::frameworks::foundation::ns_string;
+use crate::mem::{ConstPtr, ConstVoidPtr, MutVoidPtr, Ptr};
 use crate::Environment;
 
 const RTLD_DEFAULT: MutVoidPtr = Ptr::from_bits(-2 as _);
@@ -40,11 +41,29 @@ fn dlsym(env: &mut Environment, handle: MutVoidPtr, symbol: ConstPtr<u8>) -> Mut
     // no symbol found, since it most likely indicates a missing host function.
     // TODO: Symbol lookup should be scoped to the specific library requested,
     // where appropriate!
-    let addr = env
+    if let Ok(addr) = env
         .dyld
         .create_proc_address(&mut env.mem, &mut env.cpu, &symbol)
-        .unwrap_or_else(|_| panic!("dlsym() for unimplemented function {symbol}"));
-    Ptr::from_bits(addr.addr_with_thumb_bit())
+    {
+        return Ptr::from_bits(addr.addr_with_thumb_bit());
+    }
+
+    if let Some((_, template)) = search_host_dylibs(|dylib| dylib.constant_exports, &symbol) {
+        let symbol_ptr = match template {
+            HostConstant::NSString(static_str) => {
+                let string_ptr = ns_string::get_static_str(env, static_str);
+                env.mem.alloc_and_write(string_ptr).cast_void()
+            }
+            HostConstant::NullPtr => {
+                let null_ptr: ConstVoidPtr = Ptr::null();
+                env.mem.alloc_and_write(null_ptr).cast_void()
+            }
+            HostConstant::Custom(f) => f(env).cast_mut(),
+        };
+        return symbol_ptr.cast();
+    }
+
+    panic!("dlsym() for unimplemented function {symbol}");
 }
 
 fn dlclose(env: &mut Environment, handle: MutVoidPtr) -> i32 {
