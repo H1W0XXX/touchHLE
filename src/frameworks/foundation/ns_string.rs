@@ -1694,7 +1694,9 @@ fn length_of_bytes_using_encoding_inner(
         | NSUTF16LittleEndianStringEncoding => {
             let mut code_units = 0usize;
             for_each_code_unit(env, this, |_, _| code_units += 1);
-            (code_units * std::mem::size_of::<unichar>()).try_into().unwrap()
+            (code_units * std::mem::size_of::<unichar>())
+                .try_into()
+                .unwrap()
         }
         _ => unimplemented!("{}", encoding),
     }

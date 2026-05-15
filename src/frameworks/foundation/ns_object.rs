@@ -37,11 +37,12 @@ fn method_imp_for_class(env: &mut crate::Environment, class: Class, selector: SE
     }
 }
 
-fn zombie_farm_pressed_target_to_preserve(
-    env: &crate::Environment,
-    object: id,
-) -> Option<String> {
-    if !env.bundle.bundle_identifier().starts_with("com.playforge.Z") {
+fn zombie_farm_pressed_target_to_preserve(env: &crate::Environment, object: id) -> Option<String> {
+    if !env
+        .bundle
+        .bundle_identifier()
+        .starts_with("com.playforge.Z")
+    {
         return None;
     }
 

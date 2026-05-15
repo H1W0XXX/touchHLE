@@ -5,7 +5,7 @@
  */
 //! `NSFileManager` etc.
 
-use super::{ns_array, ns_string, NSUInteger};
+use super::{ns_array, ns_property_list_serialization, ns_string, NSUInteger};
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
 use crate::frameworks::foundation::ns_error::{NSCocoaErrorDomain, NSFileReadNoSuchFileError};
 use crate::frameworks::foundation::ns_string::get_static_str;
@@ -154,6 +154,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         // fileExistsAtPath: will return true for directories
         // hence Fs::exists() rather than Fs::is_file() is appropriate.
         env.fs.exists(GuestPath::new(&path))
+            || ns_property_list_serialization::zombie_farm_plist_fallback_path(env, &path)
+                .is_some()
     };
     log_dbg!("[(NSFileManager*) {:?} fileExistsAtPath:{:?}] => {}", this, path, res_exists);
     res_exists
@@ -167,7 +169,15 @@ pub const CLASSES: ClassExports = objc_classes! {
         // TODO: mutualize with fileExistsAtPath:
         let path = ns_string::to_rust_string(env, path); // TODO: avoid copy
         let guest_path = GuestPath::new(&path);
-        (env.fs.exists(guest_path), !env.fs.is_file(guest_path))
+        if env.fs.exists(guest_path) {
+            (true, !env.fs.is_file(guest_path))
+        } else {
+            (
+                ns_property_list_serialization::zombie_farm_plist_fallback_path(env, &path)
+                    .is_some(),
+                false,
+            )
+        }
     };
 
     if !is_dir.is_null() {

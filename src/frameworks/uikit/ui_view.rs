@@ -18,9 +18,13 @@ pub mod ui_web_view;
 pub mod ui_window;
 
 use super::ui_graphics::{UIGraphicsPopContext, UIGraphicsPushContext};
-use crate::frameworks::core_graphics::cg_affine_transform::CGAffineTransform;
+use crate::frameworks::core_animation::ca_layer;
+use crate::frameworks::core_graphics::cg_affine_transform::{
+    CGAffineTransform, CGAffineTransformIdentity,
+};
 use crate::frameworks::core_graphics::cg_color::CGColorRef;
 use crate::frameworks::core_graphics::cg_context::{CGContextClearRect, CGContextRef};
+use crate::frameworks::core_graphics::cg_geometry::CGRectZero;
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::frameworks::foundation::{ns_array, NSInteger, NSTimeInterval, NSUInteger};
@@ -30,6 +34,8 @@ use crate::objc::{
     todo_objc_setter, Class, ClassExports, HostObject, NSZonePtr, ObjC, SEL,
 };
 use crate::Environment;
+use std::collections::HashSet;
+use std::io::Write;
 
 pub struct State {
     /// List of views for internal purposes. Non-retaining!
@@ -94,6 +100,138 @@ impl Default for UIViewHostObject {
 
 pub fn get_clips_to_bounds(objc: &ObjC, view: id) -> bool {
     objc.borrow::<UIViewHostObject>(view).clips_to_bounds
+}
+
+fn is_zombie_farm(env: &Environment) -> bool {
+    env.bundle
+        .bundle_identifier()
+        .starts_with("com.playforge.Z")
+}
+
+fn live_layer_or_nil(env: &mut Environment, view: id, selector_name: &str) -> id {
+    let layer = env.objc.borrow::<UIViewHostObject>(view).layer;
+    if layer == nil || env.objc.get_host_object(layer).is_some() {
+        return layer;
+    }
+
+    if is_zombie_farm(env) {
+        log!(
+            "ZombieFarm workaround: UIView {:?} has released layer {:?} during {}, ignoring layer message",
+            view,
+            layer,
+            selector_name
+        );
+        nil
+    } else {
+        layer
+    }
+}
+
+fn debug_class_name(env: &Environment, object: id) -> String {
+    if object == nil {
+        return "nil".to_string();
+    }
+    let class = ObjC::read_isa(object, &env.mem);
+    if class == nil {
+        return "<nil isa>".to_string();
+    }
+    env.objc
+        .try_get_class_name(class)
+        .unwrap_or("<unknown class>")
+        .to_string()
+}
+
+fn dump_view_tree_inner(
+    env: &Environment,
+    writer: &mut dyn Write,
+    view: id,
+    depth: usize,
+    visited: &mut HashSet<u32>,
+) -> std::io::Result<()> {
+    let indent = "  ".repeat(depth);
+    if view == nil {
+        writeln!(writer, "{indent}<nil view>")?;
+        return Ok(());
+    }
+
+    if !visited.insert(view.to_bits()) {
+        writeln!(
+            writer,
+            "{indent}0x{:x} {} (cycle)",
+            view.to_bits(),
+            debug_class_name(env, view)
+        )?;
+        return Ok(());
+    }
+
+    let host = env.objc.borrow::<UIViewHostObject>(view);
+    let layer = host.layer;
+    let subviews = host.subviews.clone();
+    let tag = host.tag;
+    let user_interaction_enabled = host.user_interaction_enabled;
+    let clips_to_bounds = host.clips_to_bounds;
+    let superview = host.superview;
+
+    let layer_summary = if layer != nil && env.objc.get_host_object(layer).is_some() {
+        let (_delegate, bounds, _sublayers) = ca_layer::diagnostic_snapshot(&env.objc, layer);
+        format!("layer=0x{:x} bounds={:?}", layer.to_bits(), bounds)
+    } else {
+        format!("layer=0x{:x} <missing host object>", layer.to_bits())
+    };
+
+    writeln!(
+        writer,
+        "{indent}0x{:x} {} tag={} super=0x{:x} subviews={} userInteraction={} clips={} {}",
+        view.to_bits(),
+        debug_class_name(env, view),
+        tag,
+        superview.to_bits(),
+        subviews.len(),
+        user_interaction_enabled,
+        clips_to_bounds,
+        layer_summary
+    )?;
+
+    for subview in subviews {
+        dump_view_tree_inner(env, writer, subview, depth + 1, visited)?;
+    }
+
+    Ok(())
+}
+
+pub fn dump_debug_inspector(env: &mut Environment) {
+    let path = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join("zombie_farm_inspector.txt");
+
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&path)?;
+        writeln!(file, "touchHLE inspector dump")?;
+        writeln!(file, "bundle: {}", env.bundle.bundle_identifier())?;
+        writeln!(file)?;
+
+        crate::zombie_farm_debug::write_snapshot(&mut file)?;
+        writeln!(file)?;
+        writeln!(file, "== UIKit View Hierarchy ==")?;
+        let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
+        if windows.is_empty() {
+            writeln!(file, "(no UIWindow objects)")?;
+        }
+        let mut visited = HashSet::new();
+        for window in windows {
+            dump_view_tree_inner(env, &mut file, window, 0, &mut visited)?;
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            log!("Inspector dump written to {}", path.display());
+        }
+        Err(err) => {
+            log!("Failed to write inspector dump {}: {}", path.display(), err);
+        }
+    }
 }
 
 fn call_animation_selector(
@@ -568,7 +706,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())removeFromSuperview {
-    log!(
+    log_dbg!(
         "ZombieFarm trace: UIView {:?} removeFromSuperview",
         this,
     );
@@ -624,16 +762,22 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (bool)isHidden {
-    let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+    let layer = live_layer_or_nil(env, this, "isHidden");
+    if layer == nil {
+        return false;
+    }
     msg![env; layer isHidden]
 }
 - (())setHidden:(bool)hidden {
-    log!(
+    log_dbg!(
         "ZombieFarm trace: UIView {:?} setHidden:{}",
         this,
         hidden,
     );
-    let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+    let layer = live_layer_or_nil(env, this, "setHidden:");
+    if layer == nil {
+        return;
+    }
     msg![env; layer setHidden:hidden]
 }
 
@@ -643,55 +787,81 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())setClipsToBounds:(bool)clips {
     env.objc.borrow_mut::<UIViewHostObject>(this).clips_to_bounds = clips;
     if env.bundle.bundle_identifier().starts_with("com.playforge.Z") {
-        log!(
+        log_dbg!(
             "ZombieFarm trace: UIView {:?} setClipsToBounds:{} frame:{:?} bounds:{:?}",
             this,
             clips,
             {
-                let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
-                let frame: CGRect = msg![env; layer frame];
-                frame
+                let layer = live_layer_or_nil(env, this, "setClipsToBounds: frame");
+                if layer == nil {
+                    CGRectZero
+                } else {
+                    let frame: CGRect = msg![env; layer frame];
+                    frame
+                }
             },
             {
-                let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
-                let bounds: CGRect = msg![env; layer bounds];
-                bounds
+                let layer = live_layer_or_nil(env, this, "setClipsToBounds: bounds");
+                if layer == nil {
+                    CGRectZero
+                } else {
+                    let bounds: CGRect = msg![env; layer bounds];
+                    bounds
+                }
             },
         );
     }
 }
 
 - (bool)isOpaque {
-    let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+    let layer = live_layer_or_nil(env, this, "isOpaque");
+    if layer == nil {
+        return false;
+    }
     msg![env; layer isOpaque]
 }
 - (())setOpaque:(bool)opaque {
-    let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+    let layer = live_layer_or_nil(env, this, "setOpaque:");
+    if layer == nil {
+        return;
+    }
     msg![env; layer setOpaque:opaque]
 }
 
 - (CGFloat)alpha {
-    let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+    let layer = live_layer_or_nil(env, this, "alpha");
+    if layer == nil {
+        return 1.0;
+    }
     msg![env; layer opacity]
 }
 - (())setAlpha:(CGFloat)alpha {
-    log!(
+    log_dbg!(
         "ZombieFarm trace: UIView {:?} setAlpha:{}",
         this,
         alpha,
     );
-    let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+    let layer = live_layer_or_nil(env, this, "setAlpha:");
+    if layer == nil {
+        return;
+    }
     msg![env; layer setOpacity:alpha]
 }
 
 - (id)backgroundColor {
-    let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+    let layer = live_layer_or_nil(env, this, "backgroundColor");
+    if layer == nil {
+        return nil;
+    }
     let cg_color: CGColorRef = msg![env; layer backgroundColor];
     msg_class![env; UIColor colorWithCGColor:cg_color]
 }
 - (())setBackgroundColor:(id)color { // UIColor*
     let color: CGColorRef = msg![env; color CGColor];
-    let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+    let layer = live_layer_or_nil(env, this, "setBackgroundColor:");
+    if layer == nil {
+        return;
+    }
     msg![env; layer setBackgroundColor:color]
 }
 
@@ -719,64 +889,91 @@ pub const CLASSES: ClassExports = objc_classes! {
             .objc
             .class_overrides_method_of_superclass(this_class, draw_layer_sel, ui_view_class)
     {
-        let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+        let layer = live_layer_or_nil(env, this, "setNeedsDisplay");
+        if layer == nil {
+            return;
+        }
         msg![env; layer setNeedsDisplay]
     }
 }
 
 - (CGRect)bounds {
-    let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+    let layer = live_layer_or_nil(env, this, "bounds");
+    if layer == nil {
+        return CGRectZero;
+    }
     msg![env; layer bounds]
 }
 - (())setBounds:(CGRect)bounds {
-    log!(
+    log_dbg!(
         "ZombieFarm trace: UIView {:?} setBounds:{:?}",
         this,
         bounds,
     );
-    let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+    let layer = live_layer_or_nil(env, this, "setBounds:");
+    if layer == nil {
+        return;
+    }
     () = msg![env; layer setBounds:bounds];
     () = msg![env; this layoutSubviews];
 }
 - (CGPoint)center {
     // FIXME: what happens if [layer anchorPoint] isn't (0.5, 0.5)?
-    let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+    let layer = live_layer_or_nil(env, this, "center");
+    if layer == nil {
+        return CGPoint { x: 0.0, y: 0.0 };
+    }
     msg![env; layer position]
 }
 - (())setCenter:(CGPoint)center {
-    log!(
+    log_dbg!(
         "ZombieFarm trace: UIView {:?} setCenter:{:?}",
         this,
         center,
     );
-    let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+    let layer = live_layer_or_nil(env, this, "setCenter:");
+    if layer == nil {
+        return;
+    }
     msg![env; layer setPosition:center]
 }
 - (CGRect)frame {
-    let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+    let layer = live_layer_or_nil(env, this, "frame");
+    if layer == nil {
+        return CGRectZero;
+    }
     msg![env; layer frame]
 }
 - (())setFrame:(CGRect)frame {
-    log!(
+    log_dbg!(
         "ZombieFarm trace: UIView {:?} setFrame:{:?}",
         this,
         frame,
     );
-    let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+    let layer = live_layer_or_nil(env, this, "setFrame:");
+    if layer == nil {
+        return;
+    }
     () = msg![env; layer setFrame:frame];
     () = msg![env; this layoutSubviews];
 }
 - (CGAffineTransform)transform {
-    let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+    let layer = live_layer_or_nil(env, this, "transform");
+    if layer == nil {
+        return CGAffineTransformIdentity;
+    }
     msg![env; layer affineTransform]
 }
 - (())setTransform:(CGAffineTransform)transform {
-    log!(
+    log_dbg!(
         "ZombieFarm trace: UIView {:?} setTransform:{:?}",
         this,
         transform,
     );
-    let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+    let layer = live_layer_or_nil(env, this, "setTransform:");
+    if layer == nil {
+        return;
+    }
     msg![env; layer setAffineTransform:transform]
 }
 

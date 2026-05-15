@@ -13,7 +13,7 @@ use crate::mem::{ConstPtr, MutPtr, MutVoidPtr};
 use crate::msg;
 use crate::objc::{
     autorelease, id, nil, objc_classes, objc_msgSend, release, retain, ClassExports, HostObject,
-    SEL,
+    ObjC, SEL,
 };
 
 struct NSInvocationHostObject {
@@ -49,13 +49,22 @@ fn scalar_size_for_type(type_: &str) -> Option<usize> {
 
 fn store_return_value(env: &mut crate::Environment, this: id, ret_type: &str) {
     if ret_type == "v" {
-        if let Some(ptr) = env.objc.borrow_mut::<NSInvocationHostObject>(this).return_value.take() {
+        if let Some(ptr) = env
+            .objc
+            .borrow_mut::<NSInvocationHostObject>(this)
+            .return_value
+            .take()
+        {
             env.mem.free(ptr.cast());
         }
         return;
     }
 
-    let old = env.objc.borrow_mut::<NSInvocationHostObject>(this).return_value.take();
+    let old = env
+        .objc
+        .borrow_mut::<NSInvocationHostObject>(this)
+        .return_value
+        .take();
     if let Some(ptr) = old {
         env.mem.free(ptr.cast());
     }
@@ -116,7 +125,31 @@ fn store_return_value(env: &mut crate::Environment, this: id, ret_type: &str) {
         _ => unimplemented!("NSInvocation return type {ret_type}"),
     };
 
-    env.objc.borrow_mut::<NSInvocationHostObject>(this).return_value = Some(new_value);
+    env.objc
+        .borrow_mut::<NSInvocationHostObject>(this)
+        .return_value = Some(new_value);
+}
+
+fn should_skip_zombie_farm_unset_invocation(env: &mut crate::Environment, invocation: id) -> bool {
+    let host = env.objc.borrow::<NSInvocationHostObject>(invocation);
+    let target = host.target;
+    let selector_name = host
+        .selector
+        .map(|selector| selector.as_str(&env.mem).to_string());
+    let missing_cancel_notification = host.arguments.get(4).is_some_and(Option::is_none)
+        && host
+            .argument_types
+            .get(4)
+            .is_some_and(|arg_type| arg_type == "@");
+
+    let target_class = ObjC::read_isa(target, &env.mem);
+    let target_class_name = env.objc.try_get_class_name(target_class).unwrap_or("");
+    env.bundle
+        .bundle_identifier()
+        .starts_with("com.playforge.Z")
+        && target_class_name == "StatusBar"
+        && selector_name.as_deref() == Some("updateMessage:andCancelTimeout:andCancelNotification:")
+        && missing_cancel_notification
 }
 
 pub const CLASSES: ClassExports = objc_classes! {
@@ -308,12 +341,20 @@ pub const CLASSES: ClassExports = objc_classes! {
         );
         return;
     }
+    if should_skip_zombie_farm_unset_invocation(env, this) {
+        log_dbg!("ZombieFarm: skipping incomplete StatusBar notification invocation");
+        return;
+    }
 
     // `call_from_host` re-use
     // TODO: retval_ptr
     // TODO: cross check against frame length from NSMethodSignature
     let mut reg_count = 0;
-    let argument_types: &Vec<String> = env.objc.borrow::<NSInvocationHostObject>(this).argument_types.as_ref();
+    let argument_types = env
+        .objc
+        .borrow::<NSInvocationHostObject>(this)
+        .argument_types
+        .clone();
     for arg_type in argument_types.iter() {
         // TODO: refactor and simplify
         reg_count += match arg_type.as_str() {
@@ -340,7 +381,11 @@ pub const CLASSES: ClassExports = objc_classes! {
         regs,
     );
 
-    let arguments: &Vec<Option<MutVoidPtr>> = env.objc.borrow::<NSInvocationHostObject>(this).arguments.as_ref();
+    let arguments = env
+        .objc
+        .borrow::<NSInvocationHostObject>(this)
+        .arguments
+        .clone();
     let mut reg_offset = 0;
     for i in 0..arguments.len() {
         // TODO: do not handle target and sel as special cases
@@ -362,7 +407,22 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
         let arg_type = argument_types[i].as_str();
         let Some(arg_slot) = arguments[i] else {
-            log!("Warning: invoking NSInvocation {:?} with unset argument {} of type {}", this, i, arg_type);
+            let target = env.objc.borrow::<NSInvocationHostObject>(this).target;
+            let selector = env.objc.borrow::<NSInvocationHostObject>(this).selector;
+            let target_class = crate::objc::ObjC::read_isa(target, &env.mem);
+            let target_class_name = env
+                .objc
+                .try_get_class_name(target_class)
+                .unwrap_or("<unknown>");
+            log!(
+                "Warning: invoking NSInvocation {:?} target {:?} ({}) selector {:?} with unset argument {} of type {}",
+                this,
+                target,
+                target_class_name,
+                selector.map(|sel| sel.as_str(&env.mem).to_string()),
+                i,
+                arg_type
+            );
             let regs = env.cpu.regs_mut();
             match arg_type {
                 "@" => write_next_arg::<id>(&mut reg_offset, regs, &mut env.mem, nil),

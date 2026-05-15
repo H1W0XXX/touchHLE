@@ -192,7 +192,8 @@ fn set_value_from_touch(env: &mut Environment, this: id, touch: id) -> bool {
         )
     };
     let usable_width = (bounds.size.width - THUMB_SIZE).max(1.0);
-    let fraction = ((location.x - bounds.origin.x - THUMB_SIZE / 2.0) / usable_width).clamp(0.0, 1.0);
+    let fraction =
+        ((location.x - bounds.origin.x - THUMB_SIZE / 2.0) / usable_width).clamp(0.0, 1.0);
     let new_value = minimum_value + fraction * (maximum_value - minimum_value);
     set_value(env, this, new_value);
     (new_value - old_value).abs() > f32::EPSILON

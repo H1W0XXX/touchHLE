@@ -15,9 +15,7 @@ use crate::frameworks::core_graphics::cg_color_space::{
 use crate::frameworks::core_graphics::cg_context::{
     CGContextRef, CGContextRelease, CGContextRetain,
 };
-use crate::frameworks::core_graphics::cg_image::{
-    kCGImageAlphaPremultipliedLast, CGImageRelease,
-};
+use crate::frameworks::core_graphics::cg_image::{kCGImageAlphaPremultipliedLast, CGImageRelease};
 use crate::frameworks::core_graphics::CGSize;
 use crate::objc::{msg_class, nil};
 use crate::Environment;

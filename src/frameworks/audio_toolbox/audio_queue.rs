@@ -646,7 +646,8 @@ pub fn decode_buffer(
                 (2, 16) => al::AL_FORMAT_STEREO16,
                 (1, 32) if is_float => {
                     assert!(processed_data.len().is_multiple_of(4));
-                    let mut new_processed_data = Vec::<u8>::with_capacity((processed_data.len() / 4) * 2);
+                    let mut new_processed_data =
+                        Vec::<u8>::with_capacity((processed_data.len() / 4) * 2);
                     for chunk in processed_data.chunks_exact(4) {
                         let val = f32::from_le_bytes(chunk.try_into().unwrap());
                         new_processed_data.extend_from_slice(&f32_to_i16(val).to_le_bytes());

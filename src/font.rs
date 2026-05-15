@@ -70,7 +70,9 @@ impl RasterGlyph<'_> {
 impl Font {
     fn from_bytes(bytes: Vec<u8>, path_desc: &str) -> Font {
         let Some(font) = rusttype::Font::try_from_vec(bytes) else {
-            panic!("Couldn't parse font file {path_desc:?}. This probably means the file is corrupt.");
+            panic!(
+                "Couldn't parse font file {path_desc:?}. This probably means the file is corrupt."
+            );
         };
 
         Font { font }
@@ -88,9 +90,7 @@ impl Font {
     fn from_resource_file(filename: &str) -> Font {
         Self::try_from_resource_file(filename).unwrap_or_else(|| {
             let path = format!("{}/{}", paths::FONTS_DIR, filename);
-            panic!(
-                "Couldn't read bundled font file {path:?}. Perhaps the directory is missing?"
-            );
+            panic!("Couldn't read bundled font file {path:?}. Perhaps the directory is missing?");
         })
     }
 

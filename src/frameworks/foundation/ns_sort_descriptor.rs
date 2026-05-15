@@ -5,7 +5,9 @@
  */
 //! `NSSortDescriptor`.
 
-use super::{NSComparisonResult, NSOrderedAscending, NSOrderedDescending, NSOrderedSame, NSUInteger};
+use super::{
+    NSComparisonResult, NSOrderedAscending, NSOrderedDescending, NSOrderedSame, NSUInteger,
+};
 use crate::objc::{
     autorelease, id, msg, msg_class, msg_send, nil, objc_classes, release, retain, ClassExports,
     HostObject, NSZonePtr, SEL,

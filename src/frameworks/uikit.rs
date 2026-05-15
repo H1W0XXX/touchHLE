@@ -146,6 +146,9 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
                     log!("Ignoring EnterDebugger event: no debugger connected.");
                 }
             }
+            Event::DumpInspector => {
+                ui_view::dump_debug_inspector(env);
+            }
             Event::TextInput(text_event) => {
                 let responder = env.framework_state.uikit.ui_responder.first_responder;
                 let class = msg![env; responder class];

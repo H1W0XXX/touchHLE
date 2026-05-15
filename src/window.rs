@@ -158,6 +158,8 @@ pub enum Event {
     /// User pressed F12, requesting that execution be paused and the debugger
     /// take over.
     EnterDebugger,
+    /// User pressed F11, requesting a UI/table inspector dump.
+    DumpInspector,
     TextInput(TextInputEvent),
 }
 
@@ -809,6 +811,13 @@ impl Window {
                         E::FingerDown { .. } => Event::TouchesDown(map),
                         _ => unreachable!(),
                     }
+                }
+                E::KeyDown {
+                    keycode: Some(sdl2::keyboard::Keycode::F11),
+                    ..
+                } => {
+                    echo!("F11 pressed, DumpInspector event queued.");
+                    Event::DumpInspector
                 }
                 E::KeyDown {
                     keycode: Some(sdl2::keyboard::Keycode::F12),

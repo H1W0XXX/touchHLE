@@ -42,6 +42,35 @@ pub(super) struct ArrayHostObject {
 }
 impl HostObject for ArrayHostObject {}
 
+fn is_zombie_farm(env: &Environment) -> bool {
+    let bundle_id = env.bundle.bundle_identifier();
+    bundle_id.starts_with("com.playforge.ZombieFarm") || bundle_id.starts_with("com.playforge.ZFR")
+}
+
+fn object_at_index(env: &mut Environment, this: id, index: NSUInteger) -> id {
+    let array = &env.objc.borrow::<ArrayHostObject>(this).array;
+    if let Some(&object) = array.get(index as usize) {
+        return object;
+    }
+
+    if is_zombie_farm(env) {
+        log!(
+            "ZombieFarm workaround: NSArray {:?} objectAtIndex:{} out of bounds for count {}, returning nil",
+            this,
+            index,
+            array.len()
+        );
+        return nil;
+    }
+
+    panic!(
+        "NSArray {:?} objectAtIndex:{} out of bounds for count {}",
+        this,
+        index,
+        array.len()
+    );
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -178,6 +207,23 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     let array = from_vec(env, objects);
     autorelease(env, array)
+}
+
+- (())makeObjectsPerformSelector:(SEL)sel {
+    let count: NSUInteger = msg![env; this count];
+    for idx in 0..count {
+        let obj: id = msg![env; this objectAtIndex:idx];
+        let _: id = msg![env; obj performSelector:sel];
+    }
+}
+
+- (())makeObjectsPerformSelector:(SEL)sel
+                       withObject:(id)arg {
+    let count: NSUInteger = msg![env; this count];
+    for idx in 0..count {
+        let obj: id = msg![env; this objectAtIndex:idx];
+        let _: id = msg![env; obj performSelector:sel withObject:arg];
+    }
 }
 
 - (id)firstObject {
@@ -381,13 +427,17 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)initWithArray:(id)array { // NSArray*
     let objects = retained_objects_from_array(env, array, false);
+    let source_path = array_plist_source_path(env, array);
     replace_array_contents(env, this, objects);
+    env.objc.borrow_mut::<ArrayHostObject>(this).plist_source_path = source_path;
     this
 }
 
 - (id)initWithArray:(id)array copyItems:(bool)copy_items { // NSArray*
     let objects = retained_objects_from_array(env, array, copy_items);
+    let source_path = array_plist_source_path(env, array);
     replace_array_contents(env, this, objects);
+    env.objc.borrow_mut::<ArrayHostObject>(this).plist_source_path = source_path;
     this
 }
 
@@ -462,7 +512,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (id)objectAtIndex:(NSUInteger)index {
     // TODO: throw real exception rather than panic if out-of-bounds?
-    env.objc.borrow::<ArrayHostObject>(this).array[index as usize]
+    object_at_index(env, this, index)
 }
 
 - (id)description {
@@ -560,11 +610,15 @@ pub const CLASSES: ClassExports = objc_classes! {
 // NSCopying implementation
 - (id)copyWithZone:(NSZonePtr)_zone {
     let arr: id = msg_class![env; NSArray alloc];
-    let array = env.objc.borrow::<ArrayHostObject>(this).array.clone();
+    let host_obj = env.objc.borrow::<ArrayHostObject>(this);
+    let array = host_obj.array.clone();
+    let plist_source_path = host_obj.plist_source_path.clone();
     for &object in &array {
         retain(env, object);
     }
-    env.objc.borrow_mut::<ArrayHostObject>(arr).array = array;
+    let arr_host_obj = env.objc.borrow_mut::<ArrayHostObject>(arr);
+    arr_host_obj.array = array;
+    arr_host_obj.plist_source_path = plist_source_path;
     arr
 }
 
@@ -582,14 +636,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 
     env.objc.dealloc_object(this, &mut env.mem)
-}
-
-- (())makeObjectsPerformSelector:(SEL)sel {
-    let count: NSUInteger = msg![env; this count];
-    for idx in 0..count {
-        let obj: id = msg![env; this objectAtIndex:idx];
-        let _: id = msg![env; obj performSelector:sel];
-    }
 }
 
 - (id)objectEnumerator { // NSEnumerator*
@@ -678,7 +724,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (id)objectAtIndex:(NSUInteger)index {
     // TODO: throw real exception rather than panic if out-of-bounds?
-    env.objc.borrow::<ArrayHostObject>(this).array[index as usize]
+    object_at_index(env, this, index)
 }
 
 - (id)description {
@@ -860,12 +906,23 @@ fn object_enumerator_inner_helper(env: &mut Environment, arr: id, vec: Vec<id>) 
 
 fn mutable_copy_inner(env: &mut Environment, arr: id) -> id {
     let mut_arr: id = msg_class![env; NSMutableArray alloc];
-    let array = env.objc.borrow::<ArrayHostObject>(arr).array.clone();
+    let host_obj = env.objc.borrow::<ArrayHostObject>(arr);
+    let array = host_obj.array.clone();
+    let plist_source_path = host_obj.plist_source_path.clone();
     for &object in &array {
         retain(env, object);
     }
-    env.objc.borrow_mut::<ArrayHostObject>(mut_arr).array = array;
+    let mut_arr_host_obj = env.objc.borrow_mut::<ArrayHostObject>(mut_arr);
+    mut_arr_host_obj.array = array;
+    mut_arr_host_obj.plist_source_path = plist_source_path;
     mut_arr
+}
+
+fn array_plist_source_path(env: &mut Environment, arr: id) -> Option<String> {
+    env.objc
+        .borrow::<ArrayHostObject>(arr)
+        .plist_source_path
+        .clone()
 }
 
 fn retained_objects_from_array(env: &mut Environment, array: id, copy_items: bool) -> Vec<id> {

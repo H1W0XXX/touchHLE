@@ -9,7 +9,10 @@ use super::cg_affine_transform::{CGAffineTransform, CGAffineTransformIdentity};
 use super::cg_color_space::{
     kCGColorSpaceGenericGray, kCGColorSpaceGenericRGB, CGColorSpaceHostObject, CGColorSpaceRef,
 };
-use super::cg_context::{CGContextHostObject, CGContextRef, CGContextSubclass};
+use super::cg_context::{
+    CGContextHostObject, CGContextRef, CGContextSubclass, K_CG_BLEND_MODE_CLEAR,
+    K_CG_BLEND_MODE_COPY,
+};
 use super::cg_image::{
     self, kCGBitmapAlphaInfoMask, kCGBitmapByteOrderMask, kCGImageAlphaFirst, kCGImageAlphaLast,
     kCGImageAlphaNone, kCGImageAlphaNoneSkipFirst, kCGImageAlphaNoneSkipLast, kCGImageAlphaOnly,
@@ -81,6 +84,7 @@ pub fn CGBitmapContextCreate(
         }),
         // TODO: is this the correct default?
         rgb_fill_color: (0.0, 0.0, 0.0, 0.0),
+        blend_mode: super::cg_context::K_CG_BLEND_MODE_NORMAL,
         transform: CGAffineTransformIdentity,
         clip_mask: None,
         state_stack: Vec::new(),
@@ -606,21 +610,27 @@ fn test_iter_transformed_pixels() {
 /// Implementation of `CGContextFillRect` (`clear` == [false]) and
 /// `CGContextClearRect` (`clear` == [true]) for `CGBitmapContext`.
 pub(super) fn fill_rect(env: &mut Environment, context: CGContextRef, rect: CGRect, clear: bool) {
-    let clip_mask = env
-        .objc
-        .borrow::<CGContextHostObject>(context)
-        .clip_mask
-        .map(|(rect, mask)| (rect, cg_image::borrow_image(&env.objc, mask)));
+    let (clip_mask, blend_mode) = {
+        let host_obj = env.objc.borrow::<CGContextHostObject>(context);
+        (
+            host_obj
+                .clip_mask
+                .map(|(rect, mask)| (rect, cg_image::borrow_image(&env.objc, mask))),
+            host_obj.blend_mode,
+        )
+    };
     let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
-    let color = if clear {
+    let color = if clear || blend_mode == K_CG_BLEND_MODE_CLEAR {
         (0.0, 0.0, 0.0, 0.0)
     } else {
         drawer.rgb_fill_color()
     };
+    let should_blend =
+        !clear && blend_mode != K_CG_BLEND_MODE_CLEAR && blend_mode != K_CG_BLEND_MODE_COPY;
     // TODO: correct anti-aliasing
     for ((x, y), _) in drawer.iter_transformed_pixels(rect) {
         if let Some(color) = masked_color(&drawer, clip_mask, (x, y), color) {
-            drawer.put_pixel((x, y), color, /* blend: */ !clear)
+            drawer.put_pixel((x, y), color, should_blend)
         }
     }
 }
@@ -633,13 +643,18 @@ pub(super) fn draw_image(
     image: CGImageRef,
 ) {
     let image = cg_image::borrow_image(&env.objc, image);
-    let clip_mask = env
-        .objc
-        .borrow::<CGContextHostObject>(context)
-        .clip_mask
-        .map(|(rect, mask)| (rect, cg_image::borrow_image(&env.objc, mask)));
+    let (clip_mask, blend_mode) = {
+        let host_obj = env.objc.borrow::<CGContextHostObject>(context);
+        (
+            host_obj
+                .clip_mask
+                .map(|(rect, mask)| (rect, cg_image::borrow_image(&env.objc, mask))),
+            host_obj.blend_mode,
+        )
+    };
 
     let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
+    let should_blend = blend_mode != K_CG_BLEND_MODE_CLEAR && blend_mode != K_CG_BLEND_MODE_COPY;
 
     //let _ = std::fs::write(
     //  format!(
@@ -669,8 +684,13 @@ pub(super) fn draw_image(
         let texel_y = (image_height as f32 * (1.0 - texel_y)) as i32;
         // FIXME: might need alpha format conversion here
         if let Some(color) = image.get_pixel((texel_x, texel_y)) {
-            if let Some(color) = masked_color(&drawer, clip_mask, (x, y), color) {
-                drawer.put_pixel((x, y), color, /* blend: */ true)
+            let color = if blend_mode == K_CG_BLEND_MODE_CLEAR {
+                Some((0.0, 0.0, 0.0, 0.0))
+            } else {
+                masked_color(&drawer, clip_mask, (x, y), color)
+            };
+            if let Some(color) = color {
+                drawer.put_pixel((x, y), color, should_blend)
             }
         }
     }

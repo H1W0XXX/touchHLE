@@ -48,7 +48,12 @@ fn uregex_setText(
     set_success(env, status);
 }
 
-fn uregex_reset(env: &mut Environment, _regexp: URegularExpression, _index: i32, status: MutPtr<UErrorCode>) {
+fn uregex_reset(
+    env: &mut Environment,
+    _regexp: URegularExpression,
+    _index: i32,
+    status: MutPtr<UErrorCode>,
+) {
     set_success(env, status);
 }
 
@@ -82,7 +87,11 @@ fn uregex_find(
     false
 }
 
-fn uregex_groupCount(env: &mut Environment, _regexp: URegularExpression, status: MutPtr<UErrorCode>) -> i32 {
+fn uregex_groupCount(
+    env: &mut Environment,
+    _regexp: URegularExpression,
+    status: MutPtr<UErrorCode>,
+) -> i32 {
     set_success(env, status);
     0
 }
@@ -133,8 +142,16 @@ fn u_strlen(env: &mut Environment, s: ConstPtr<UChar>) -> i32 {
 fn u_strcmp(env: &mut Environment, a: ConstPtr<UChar>, b: ConstPtr<UChar>) -> i32 {
     let mut idx: GuestUSize = 0;
     loop {
-        let ac = if a.is_null() { 0 } else { env.mem.read(a + idx) };
-        let bc = if b.is_null() { 0 } else { env.mem.read(b + idx) };
+        let ac = if a.is_null() {
+            0
+        } else {
+            env.mem.read(a + idx)
+        };
+        let bc = if b.is_null() {
+            0
+        } else {
+            env.mem.read(b + idx)
+        };
         if ac != bc || ac == 0 {
             return i32::from(ac) - i32::from(bc);
         }
@@ -148,7 +165,11 @@ fn u_strcpy(env: &mut Environment, dst: MutPtr<UChar>, src: ConstPtr<UChar>) -> 
     }
     let mut idx: GuestUSize = 0;
     loop {
-        let c = if src.is_null() { 0 } else { env.mem.read(src + idx) };
+        let c = if src.is_null() {
+            0
+        } else {
+            env.mem.read(src + idx)
+        };
         env.mem.write(dst + idx, c);
         if c == 0 {
             return dst;

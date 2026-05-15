@@ -651,6 +651,10 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
         let [x, y, width, height] = get_ints(gles, gles11::VIEWPORT);
         (x, y, width as _, height as _)
     };
+    let old_scissor_box: (GLint, GLint, GLsizei, GLsizei) = {
+        let [x, y, width, height] = get_ints(gles, gles11::SCISSOR_BOX);
+        (x, y, width as _, height as _)
+    };
     let old_clear_color: [GLfloat; 4] = get_floats(gles, gles11::COLOR_CLEAR_VALUE);
     let old_array_buffer: GLuint = get_int(gles, gles11::ARRAY_BUFFER_BINDING) as _;
     let old_vertex_array_binding: GLuint = get_int(gles, gles11::VERTEX_ARRAY_BUFFER_BINDING) as _;
@@ -713,6 +717,12 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
         old_viewport.1,
         old_viewport.2,
         old_viewport.3,
+    );
+    gles.Scissor(
+        old_scissor_box.0,
+        old_scissor_box.1,
+        old_scissor_box.2,
+        old_scissor_box.3,
     );
     gles.ClearColor(
         old_clear_color[0],

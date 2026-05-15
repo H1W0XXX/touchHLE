@@ -340,8 +340,16 @@ fn draw_image_in_rect(env: &mut Environment, image_obj: id, rect: CGRect, contex
     let src_w = [left_src, center_src_w, right_src];
     let src_h = [top_src, center_src_h, bottom_src];
 
-    let dst_x = [rect.origin.x, rect.origin.x + left_dst, rect.origin.x + left_dst + center_dst_w];
-    let dst_y = [rect.origin.y, rect.origin.y + top_dst, rect.origin.y + top_dst + center_dst_h];
+    let dst_x = [
+        rect.origin.x,
+        rect.origin.x + left_dst,
+        rect.origin.x + left_dst + center_dst_w,
+    ];
+    let dst_y = [
+        rect.origin.y,
+        rect.origin.y + top_dst,
+        rect.origin.y + top_dst + center_dst_h,
+    ];
     let dst_w = [left_dst, center_dst_w, right_dst];
     let dst_h = [top_dst, center_dst_h, bottom_dst];
 

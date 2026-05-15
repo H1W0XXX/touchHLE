@@ -111,7 +111,20 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // NSCopying implementation
 - (id)copyWithZone:(NSZonePtr)_zone {
-    todo!(); // TODO: this should produce an immutable copy
+    let new: id = msg_class![env; NSSet alloc];
+    let objects: id = msg![env; this allObjects];
+    let enumerator: id = msg![env; objects objectEnumerator];
+    loop {
+        let next: id = msg![env; enumerator nextObject];
+        if next == nil {
+            break;
+        }
+        let null: id = msg_class![env; NSNull null];
+        let mut host_obj: SetHostObject = std::mem::take(env.objc.borrow_mut(new));
+        host_obj.dict.insert(env, next, null, /* copy_key: */ false);
+        *env.objc.borrow_mut(new) = host_obj;
+    }
+    new
 }
 
 @end

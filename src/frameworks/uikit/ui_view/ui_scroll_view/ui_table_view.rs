@@ -66,7 +66,12 @@ impl Default for UITableViewCellHostObject {
 }
 
 fn ensure_default_subviews(env: &mut crate::Environment, this: id) {
-    if env.objc.borrow::<UITableViewCellHostObject>(this).content_view != nil {
+    if env
+        .objc
+        .borrow::<UITableViewCellHostObject>(this)
+        .content_view
+        != nil
+    {
         return;
     }
 

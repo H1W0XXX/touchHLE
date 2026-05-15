@@ -14,6 +14,8 @@
 use super::{id, nil, Class, ObjC, IMP, SEL};
 use crate::abi::{CallFromHost, GuestRet};
 use crate::environment::ThreadId;
+use crate::frameworks::core_graphics::{CGPoint, CGSize};
+use crate::frameworks::foundation::{ns_property_list_serialization, ns_string};
 use crate::libc::pthread::cond::{
     pthread_cond_broadcast, pthread_cond_destroy, pthread_cond_init, pthread_cond_t,
     pthread_cond_wait,
@@ -164,26 +166,466 @@ fn trace_zombie_farm_status_message(class_name: &str, selector_name: &str) -> bo
 }
 
 fn trace_zombie_farm_layout_message(class_name: &str, selector_name: &str) -> bool {
+    let table_delegate_selector = matches!(
+        selector_name,
+        "table:cellAtIndex:" | "numberOfCellsInTable:" | "cellClassForTable:"
+    );
+    let interesting_class = table_delegate_selector
+        || class_name.contains("TableView")
+        || class_name == "CCScrollView"
+        || class_name.ends_with("Cell");
     let interesting_selector = matches!(
         selector_name,
         "setContentSize:"
             | "setViewSize:"
-            | "setPosition:"
             | "setContentOffset:"
-            | "cellSize"
-            | "viewSize"
+            | "setDirection:"
+            | "direction"
             | "contentSize"
+            | "viewSize"
             | "contentOffset"
-            | "setCellLayer:"
-            | "setCellLayer2:"
-            | "setCellActor:"
-            | "setCellID:"
-            | "setCurrentCellIndex:"
+            | "cellSize"
+            | "_setIndex:forCell:"
+            | "_indexFromOffset:"
+            | "_offsetFromIndex:"
+            | "dequeueCell"
+            | "_addCellIfNecessary:"
+            | "_moveCellOutOfSight:"
+            | "_evictCell"
+            | "cellWithIndex:"
+            | "table:cellAtIndex:"
+            | "numberOfCellsInTable:"
+            | "cellClassForTable:"
+            | "scrollViewDidScroll:"
     );
-    interesting_selector
-        && (class_name.contains("TableView")
-            || class_name.ends_with("Cell")
-            || class_name == "CCScrollView")
+    interesting_class && interesting_selector
+}
+
+fn trace_zombie_farm_layout_to_console(selector_name: &str) -> bool {
+    !matches!(
+        selector_name,
+        "setContentSize:"
+            | "setViewSize:"
+            | "setContentOffset:"
+            | "direction"
+            | "contentSize"
+            | "viewSize"
+            | "contentOffset"
+            | "cellSize"
+            | "_setIndex:forCell:"
+            | "_indexFromOffset:"
+            | "_offsetFromIndex:"
+            | "dequeueCell"
+            | "_addCellIfNecessary:"
+            | "_moveCellOutOfSight:"
+            | "_evictCell"
+            | "cellWithIndex:"
+            | "table:cellAtIndex:"
+            | "numberOfCellsInTable:"
+            | "cellClassForTable:"
+            | "scrollViewDidScroll:"
+    )
+}
+
+fn point_arg_from_regs(regs: &[u32], start: usize) -> CGPoint {
+    CGPoint {
+        x: f32::from_bits(regs[start]),
+        y: f32::from_bits(regs[start + 1]),
+    }
+}
+
+fn size_arg_from_regs(regs: &[u32], start: usize) -> CGSize {
+    CGSize {
+        width: f32::from_bits(regs[start]),
+        height: f32::from_bits(regs[start + 1]),
+    }
+}
+
+fn zombie_farm_layout_arg_details(selector_name: &str, regs: &[u32]) -> Option<String> {
+    match selector_name {
+        "setContentSize:" | "setViewSize:" => {
+            Some(format!("arg size={}", size_arg_from_regs(regs, 2)))
+        }
+        "setPosition:" | "setContentOffset:" => {
+            Some(format!("arg point={}", point_arg_from_regs(regs, 2)))
+        }
+        "setDirection:" => Some(format!("arg value={}", regs[2])),
+        "_offsetFromIndex:" => Some(format!("arg index={}", regs[3])),
+        "cellWithIndex:" => Some(format!("arg index={}", regs[2])),
+        "_addCellIfNecessary:" | "_moveCellOutOfSight:" => {
+            Some(format!("arg cell={:?}", id::from_bits(regs[2])))
+        }
+        "table:cellAtIndex:" => Some(format!(
+            "arg table={:?} index={}",
+            id::from_bits(regs[2]),
+            regs[3]
+        )),
+        "numberOfCellsInTable:" | "cellClassForTable:" => {
+            Some(format!("arg table={:?}", id::from_bits(regs[2])))
+        }
+        "_indexFromOffset:" => Some(format!("arg point={}", point_arg_from_regs(regs, 2))),
+        "scrollViewDidScroll:" => Some(format!("arg object={:?}", id::from_bits(regs[2]))),
+        "setCellLayer:" | "setCellLayer2:" | "setCellActor:" => {
+            Some(format!("arg object={:?}", id::from_bits(regs[2])))
+        }
+        "setCellID:" | "setCurrentCellIndex:" => Some(format!("arg value={}", regs[2])),
+        _ => None,
+    }
+}
+
+fn zombie_farm_md5sum_override(env: &mut Environment, selector_name: &str) -> Option<id> {
+    if selector_name != "md5sum:"
+        || !(env
+            .bundle
+            .bundle_identifier()
+            .starts_with("com.playforge.ZombieFarm")
+            || env
+                .bundle
+                .bundle_identifier()
+                .starts_with("com.playforge.ZFR"))
+    {
+        return None;
+    }
+
+    let path = id::from_bits(env.cpu.regs()[2]);
+    if path == nil {
+        return None;
+    }
+
+    let class = ObjC::read_isa(path, &env.mem);
+    if class == nil {
+        return None;
+    }
+    let string_class = env.objc.get_known_class("NSString", &mut env.mem);
+    if !env.objc.class_is_subclass_of(class, string_class) {
+        return None;
+    }
+
+    let path = ns_string::to_rust_string(env, path).to_string();
+    let digest = ns_property_list_serialization::zombie_farm_expected_plist_md5_hex(env, &path)?;
+    log_dbg!(
+        "ZombieFarm: using digest.plist MD5 for {}: {}",
+        path,
+        digest
+    );
+    let digest = ns_string::from_rust_string(env, digest);
+    Some(autorelease(env, digest))
+}
+
+fn trace_zombie_farm_layout_stret_return(
+    env: &mut Environment,
+    receiver: id,
+    selector: SEL,
+    stret: MutVoidPtr,
+) {
+    if !env
+        .bundle
+        .bundle_identifier()
+        .starts_with("com.playforge.Z")
+        || stret.is_null()
+    {
+        return;
+    }
+    if receiver == nil {
+        return;
+    }
+    let selector_name = selector.as_str(&env.mem);
+    let class = ObjC::read_isa(receiver, &env.mem);
+    if class == nil {
+        return;
+    }
+    let Some(class_name) = env.objc.try_get_class_name(class) else {
+        return;
+    };
+    if !trace_zombie_farm_layout_message(class_name, selector_name) {
+        return;
+    }
+    match selector_name {
+        "cellSize" | "viewSize" | "contentSize" => {
+            let size: CGSize = env.mem.read(stret.cast());
+            crate::zombie_farm_debug::record_table_size_return(
+                receiver,
+                class_name,
+                selector_name,
+                size,
+            );
+            if trace_zombie_farm_layout_to_console(selector_name) {
+                log_dbg!(
+                    "ZombieFarm trace: [{} {}] receiver {:?} return size={}",
+                    class_name,
+                    selector_name,
+                    receiver,
+                    size
+                );
+            }
+        }
+        "position" | "contentOffset" => {
+            let point: CGPoint = env.mem.read(stret.cast());
+            crate::zombie_farm_debug::record_table_point_return(
+                receiver,
+                class_name,
+                selector_name,
+                point,
+            );
+            if trace_zombie_farm_layout_to_console(selector_name) {
+                log_dbg!(
+                    "ZombieFarm trace: [{} {}] receiver {:?} return point={}",
+                    class_name,
+                    selector_name,
+                    receiver,
+                    point
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn trace_zombie_farm_layout_normal_return(env: &mut Environment, receiver: id, selector: SEL) {
+    if !env
+        .bundle
+        .bundle_identifier()
+        .starts_with("com.playforge.Z")
+        || receiver == nil
+    {
+        return;
+    }
+    let selector_name = selector.as_str(&env.mem);
+    let class = ObjC::read_isa(receiver, &env.mem);
+    if class == nil {
+        return;
+    }
+    let Some(class_name) = env.objc.try_get_class_name(class) else {
+        return;
+    };
+    if !trace_zombie_farm_layout_message(class_name, selector_name) {
+        return;
+    }
+    match selector_name {
+        "direction" | "_indexFromOffset:" => {
+            crate::zombie_farm_debug::record_table_value_return(
+                receiver,
+                class_name,
+                selector_name,
+                env.cpu.regs()[0],
+            );
+            log_dbg!(
+                "ZombieFarm trace: [{} {}] receiver {:?} return value={}",
+                class_name,
+                selector_name,
+                receiver,
+                env.cpu.regs()[0]
+            );
+        }
+        "cellWithIndex:" | "table:cellAtIndex:" | "cellClassForTable:" | "dequeueCell" => {
+            let object = id::from_bits(env.cpu.regs()[0]);
+            let object_class_name = if object == nil {
+                None
+            } else {
+                let object_class = ObjC::read_isa(object, &env.mem);
+                if object_class == nil {
+                    None
+                } else {
+                    env.objc.try_get_class_name(object_class)
+                }
+            };
+            crate::zombie_farm_debug::record_table_object_return(
+                receiver,
+                class_name,
+                selector_name,
+                object,
+                object_class_name,
+            );
+            if trace_zombie_farm_layout_to_console(selector_name) {
+                log_dbg!(
+                    "ZombieFarm trace: [{} {}] receiver {:?} return object {:?} ({:?})",
+                    class_name,
+                    selector_name,
+                    receiver,
+                    object,
+                    object_class_name
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn zombie_farm_disable_cctable_cell_reuse(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if selector_name != "dequeueCell"
+        || receiver == nil
+        || !env
+            .bundle
+            .bundle_identifier()
+            .starts_with("com.playforge.Z")
+    {
+        return false;
+    }
+
+    let class = ObjC::read_isa(receiver, &env.mem);
+    let Some(class_name) = env.objc.try_get_class_name(class) else {
+        return false;
+    };
+    if !class_name.contains("TableView") {
+        return false;
+    }
+
+    crate::zombie_farm_debug::record_table_object_return(
+        receiver,
+        class_name,
+        selector_name,
+        nil,
+        None,
+    );
+    crate::zombie_farm_debug::record_layout_event(format!(
+        "[0x{:x} {} dequeueCell] forced nil; Zombie Farm table reuse disabled",
+        receiver.to_bits(),
+        class_name
+    ));
+    env.cpu.regs_mut()[0] = nil.to_bits();
+    true
+}
+
+fn zombie_farm_cell_content_size_override(
+    env: &mut Environment,
+    receiver: id,
+    selector: SEL,
+    stret: MutVoidPtr,
+) -> bool {
+    if !env
+        .bundle
+        .bundle_identifier()
+        .starts_with("com.playforge.Z")
+        || receiver == nil
+        || stret.is_null()
+        || selector.as_str(&env.mem) != "contentSize"
+    {
+        return false;
+    }
+
+    let class = ObjC::read_isa(receiver, &env.mem);
+    if class == nil {
+        return false;
+    }
+
+    let Some(class_name) = env.objc.try_get_class_name(class) else {
+        return false;
+    };
+    if !(class_name.starts_with("ZF") && class_name.ends_with("Cell")) {
+        return false;
+    }
+    let class_name = class_name.to_string();
+
+    let Some(cell_size_selector) = env.objc.lookup_selector("cellSize") else {
+        return false;
+    };
+    if !env
+        .objc
+        .object_has_method(&env.mem, class, cell_size_selector)
+    {
+        return false;
+    }
+
+    let cell_size: CGSize = msg_send_no_type_checking(env, (class, cell_size_selector));
+    env.mem.write(stret.cast(), cell_size);
+    log_dbg!(
+        "ZombieFarm workaround: [{} contentSize] -> class cellSize {}",
+        class_name,
+        cell_size
+    );
+    true
+}
+
+fn zombie_farm_prepare_cctable_cell(env: &mut Environment, receiver: id, selector: SEL) {
+    let is_set_index = selector.as_str(&env.mem) == "_setIndex:forCell:";
+    if !env
+        .bundle
+        .bundle_identifier()
+        .starts_with("com.playforge.Z")
+        || !is_set_index
+    {
+        return;
+    }
+
+    let table_class = ObjC::read_isa(receiver, &env.mem);
+    let Some(table_class_name) = env.objc.try_get_class_name(table_class) else {
+        return;
+    };
+    if !table_class_name.contains("TableView") {
+        return;
+    }
+
+    let regs = env.cpu.regs();
+    let index = regs[2];
+    let cell = id::from_bits(regs[3]);
+    if cell == nil {
+        return;
+    }
+
+    let cell_class = ObjC::read_isa(cell, &env.mem);
+    if cell_class == nil {
+        return;
+    }
+    let Some(cell_class_name) = env.objc.try_get_class_name(cell_class) else {
+        return;
+    };
+    let cell_class_name = cell_class_name.to_string();
+
+    let Some(cell_size_selector) = env.objc.lookup_selector("cellSize") else {
+        return;
+    };
+    if !env
+        .objc
+        .object_has_method(&env.mem, cell_class, cell_size_selector)
+    {
+        return;
+    }
+    let Some(set_content_size_selector) = env.objc.lookup_selector("setContentSize:") else {
+        return;
+    };
+
+    let cell_size: CGSize = msg_send_no_type_checking(env, (cell_class, cell_size_selector));
+
+    if env
+        .objc
+        .object_has_method(&env.mem, cell_class, set_content_size_selector)
+    {
+        let _: () = msg_send_no_type_checking(env, (cell, set_content_size_selector, cell_size));
+    }
+
+    let node = if let Some(node_selector) = env.objc.lookup_selector("node") {
+        if env.objc.object_has_method(&env.mem, cell, node_selector) {
+            msg_send_no_type_checking(env, (cell, node_selector))
+        } else {
+            nil
+        }
+    } else {
+        nil
+    };
+    if node != nil {
+        let node_class = ObjC::read_isa(node, &env.mem);
+        if node_class != nil
+            && env
+                .objc
+                .object_has_method(&env.mem, node_class, set_content_size_selector)
+        {
+            let _: () =
+                msg_send_no_type_checking(env, (node, set_content_size_selector, cell_size));
+        }
+    }
+
+    log_dbg!(
+        "ZombieFarm workaround: prepared {} index {} cell {:?} node {:?} contentSize={}",
+        cell_class_name,
+        index,
+        cell,
+        node,
+        cell_size
+    );
 }
 
 /// The core implementation of `objc_msgSend`, the main function of Objective-C.
@@ -237,6 +679,20 @@ fn objc_msgSend_inner(
         );
     }
     maybe_initialize_class(env, receiver);
+
+    let selector_name = selector.as_str(&env.mem).to_string();
+    if let Some(result) = zombie_farm_md5sum_override(env, &selector_name) {
+        env.cpu.regs_mut()[0] = result.to_bits();
+        return;
+    }
+    if zombie_farm_disable_cctable_cell_reuse(env, receiver, &selector_name) {
+        return;
+    }
+    let regs_before_zombie_farm_prepare = *env.cpu.regs();
+    zombie_farm_prepare_cctable_cell(env, receiver, selector);
+    env.cpu
+        .regs_mut()
+        .copy_from_slice(&regs_before_zombie_farm_prepare);
 
     // Traverse the chain of superclasses to find the method implementation.
 
@@ -306,23 +762,45 @@ fn objc_msgSend_inner(
                 log_dbg!("Found method on: {}", name);
                 let selector_name = selector.as_str(&env.mem);
                 let receiver_class_name = env.objc.try_get_class_name(orig_class).unwrap_or(name);
+                let trace_zombie_farm_layout =
+                    trace_zombie_farm_layout_message(receiver_class_name, selector_name)
+                        || trace_zombie_farm_layout_message(name, selector_name);
                 if trace_zombie_farm_status_message(receiver_class_name, selector_name)
                     || trace_zombie_farm_status_message(name, selector_name)
-                    || trace_zombie_farm_layout_message(receiver_class_name, selector_name)
-                    || trace_zombie_farm_layout_message(name, selector_name)
+                    || trace_zombie_farm_layout
                 {
                     let imp_description = match imp {
                         IMP::Host(_) => "host".to_string(),
                         IMP::Guest(guest_imp) => format!("{:?}", guest_imp),
                     };
-                    log!(
-                        "ZombieFarm trace: [{} {}] receiver {:?}, implementation class {}, imp {}",
+                    let arg_description =
+                        zombie_farm_layout_arg_details(selector_name, env.cpu.regs())
+                            .map(|arg| format!(" {}", arg))
+                            .unwrap_or_default();
+                    crate::zombie_farm_debug::record_table_args(
+                        receiver,
                         receiver_class_name,
                         selector_name,
-                        receiver,
-                        name,
-                        imp_description,
+                        env.cpu.regs(),
                     );
+                    crate::zombie_farm_debug::record_layout_event(format!(
+                        "[0x{:x} {} {}]{}",
+                        receiver.to_bits(),
+                        receiver_class_name,
+                        selector_name,
+                        arg_description
+                    ));
+                    if trace_zombie_farm_layout_to_console(selector_name) {
+                        log_dbg!(
+                            "ZombieFarm trace: [{} {}] receiver {:?}, implementation class {}, imp {}{}",
+                            receiver_class_name,
+                            selector_name,
+                            receiver,
+                            name,
+                            imp_description,
+                            arg_description,
+                        );
+                    }
                 }
                 match imp {
                     IMP::Host(host_imp) => {
@@ -358,6 +836,9 @@ Type mismatch when sending message {} to {:?}!
                     // We can't create a new stack frame, because that would
                     // interfere with pass-through of stack arguments.
                     IMP::Guest(guest_imp) => guest_imp.call_without_pushing_stack_frame(env),
+                }
+                if trace_zombie_farm_layout {
+                    trace_zombie_farm_layout_normal_return(env, receiver, selector);
                 }
                 return;
             } else {
@@ -423,25 +904,33 @@ pub(crate) fn _touchHLE_objc_msgSend_tolerant(env: &mut Environment, receiver: i
 /// appropriate `objc_msgSend` variant depending on the method it wants to call.
 pub(super) fn objc_msgSend_stret(
     env: &mut Environment,
-    _stret: MutVoidPtr,
+    stret: MutVoidPtr,
     receiver: id,
     selector: SEL,
 ) {
+    if zombie_farm_cell_content_size_override(env, receiver, selector, stret) {
+        return;
+    }
     objc_msgSend_inner(
         env, receiver, selector, /* super2: */ None, /* tolerate_type_mismatch: */ false,
-    )
+    );
+    trace_zombie_farm_layout_stret_return(env, receiver, selector, stret);
 }
 
 #[allow(non_snake_case)]
 pub(crate) fn _touchHLE_objc_msgSend_stret_tolerant(
     env: &mut Environment,
-    _stret: MutVoidPtr,
+    stret: MutVoidPtr,
     receiver: id,
     selector: SEL,
 ) {
+    if zombie_farm_cell_content_size_override(env, receiver, selector, stret) {
+        return;
+    }
     objc_msgSend_inner(
         env, receiver, selector, /* super2: */ None, /* tolerate_type_mismatch: */ true,
-    )
+    );
+    trace_zombie_farm_layout_stret_return(env, receiver, selector, stret);
 }
 
 #[repr(C, packed)]

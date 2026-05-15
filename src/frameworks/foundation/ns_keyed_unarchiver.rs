@@ -479,8 +479,12 @@ pub fn decode_current_number(env: &mut Environment, unarchiver: id) -> id {
     let dbl_key = get_static_str(env, "NS.dblval");
     if let Some(value) = get_value_to_decode_for_key(env, unarchiver, int_key) {
         // TODO: deal with type coercion
-        let longlong = value.as_signed_integer().unwrap();
-        msg![env; num initWithLongLong:longlong]
+        if let Some(longlong) = value.as_signed_integer() {
+            msg![env; num initWithLongLong:longlong]
+        } else {
+            let ulonglong = value.as_unsigned_integer().unwrap();
+            msg![env; num initWithUnsignedLongLong:ulonglong]
+        }
     } else if let Some(value) = get_value_to_decode_for_key(env, unarchiver, dbl_key) {
         // TODO: deal with type coercion
         let double = value.as_real().unwrap();

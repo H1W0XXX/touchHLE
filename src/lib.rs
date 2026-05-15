@@ -50,6 +50,7 @@ mod options;
 mod paths;
 mod stack;
 mod window;
+mod zombie_farm_debug;
 
 // Environment is used very frequently used and used to be in this module, so
 // it is re-exported to avoid having to update lots of imports. The other things

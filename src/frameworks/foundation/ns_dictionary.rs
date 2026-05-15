@@ -344,8 +344,15 @@ fn init_with_dictionary_common_inner(
     copy_items: bool,
 ) -> id {
     let mut host_object = <DictionaryHostObject as Default>::default();
+    let mut plist_source_path = None;
+    let mut plist_key_order = None;
 
     if other_dict != nil {
+        {
+            let other_host_obj = env.objc.borrow::<DictionaryHostObject>(other_dict);
+            plist_source_path = other_host_obj.plist_source_path.clone();
+            plist_key_order = other_host_obj.plist_key_order.clone();
+        }
         let keys: id = msg![env; other_dict allKeys];
         let count: NSUInteger = msg![env; keys count];
         for i in 0..count {
@@ -360,6 +367,8 @@ fn init_with_dictionary_common_inner(
             }
         }
     }
+    host_object.plist_source_path = plist_source_path;
+    host_object.plist_key_order = plist_key_order;
 
     *env.objc.borrow_mut(this) = host_object;
     this
@@ -732,6 +741,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     for (k, v) in host_obj.map.values().flatten() {
         () = msg![env; mut_dict setObject:(*v) forKey:(*k)];
     }
+    {
+        let mut_dict_host_obj = env.objc.borrow_mut::<DictionaryHostObject>(mut_dict);
+        mut_dict_host_obj.plist_source_path = host_obj.plist_source_path.clone();
+        mut_dict_host_obj.plist_key_order = host_obj.plist_key_order.clone();
+    }
     *env.objc.borrow_mut(this) = host_obj;
     mut_dict
 }
@@ -835,7 +849,16 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)copyWithZone:(NSZonePtr)_zone {
     let entries: Vec<_> =
         env.objc.borrow_mut::<DictionaryHostObject>(this).map.values().flatten().copied().collect();
-    dict_from_keys_and_objects(env, &entries)
+    let dict = dict_from_keys_and_objects(env, &entries);
+    {
+        let source_host_obj = env.objc.borrow::<DictionaryHostObject>(this);
+        let plist_source_path = source_host_obj.plist_source_path.clone();
+        let plist_key_order = source_host_obj.plist_key_order.clone();
+        let dict_host_obj = env.objc.borrow_mut::<DictionaryHostObject>(dict);
+        dict_host_obj.plist_source_path = plist_source_path;
+        dict_host_obj.plist_key_order = plist_key_order;
+    }
+    dict
 }
 
 // NSMutableCopying implementation
@@ -844,6 +867,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     let host_obj: DictionaryHostObject = std::mem::take(env.objc.borrow_mut(this));
     for (k, v) in host_obj.map.values().flatten() {
         () = msg![env; mut_dict setObject:(*v) forKey:(*k)];
+    }
+    {
+        let mut_dict_host_obj = env.objc.borrow_mut::<DictionaryHostObject>(mut_dict);
+        mut_dict_host_obj.plist_source_path = host_obj.plist_source_path.clone();
+        mut_dict_host_obj.plist_key_order = host_obj.plist_key_order.clone();
     }
     *env.objc.borrow_mut(this) = host_obj;
     mut_dict

@@ -19,6 +19,10 @@ use crate::objc::{objc_classes, ClassExports, HostObject};
 use crate::Environment;
 
 type CGInterpolationQuality = i32;
+pub(super) type CGBlendMode = i32;
+pub(super) const K_CG_BLEND_MODE_NORMAL: CGBlendMode = 0;
+pub(super) const K_CG_BLEND_MODE_CLEAR: CGBlendMode = 16;
+pub(super) const K_CG_BLEND_MODE_COPY: CGBlendMode = 17;
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -60,6 +64,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 pub(super) struct CGContextHostObject {
     pub(super) subclass: CGContextSubclass,
     pub(super) rgb_fill_color: (CGFloat, CGFloat, CGFloat, CGFloat),
+    pub(super) blend_mode: CGBlendMode,
     /// Current transform.
     pub(super) transform: CGAffineTransform,
     pub(super) clip_mask: Option<(CGRect, CGImageRef)>,
@@ -74,6 +79,7 @@ pub(super) enum CGContextSubclass {
 
 pub(super) struct CGContextState {
     rgb_fill_color: (CGFloat, CGFloat, CGFloat, CGFloat),
+    blend_mode: CGBlendMode,
     transform: CGAffineTransform,
     clip_mask: Option<(CGRect, CGImageRef)>,
 }
@@ -124,6 +130,15 @@ fn CGContextSetGrayFillColor(
         .rgb_fill_color = color;
 }
 
+fn CGContextSetBlendMode(env: &mut Environment, context: CGContextRef, mode: CGBlendMode) {
+    // Keep unsupported blend modes non-fatal. The bitmap drawer currently
+    // handles Normal, Clear and Copy explicitly; other modes fall back to
+    // normal alpha blending.
+    env.objc
+        .borrow_mut::<CGContextHostObject>(context)
+        .blend_mode = mode;
+}
+
 pub fn CGContextFillRect(env: &mut Environment, context: CGContextRef, rect: CGRect) {
     cg_bitmap_context::fill_rect(env, context, rect, /* clear: */ false);
 }
@@ -148,7 +163,12 @@ fn CGContextClipToRect(env: &mut Environment, context: CGContextRef, rect: CGRec
     todo!();
 }
 
-fn CGContextClipToMask(env: &mut Environment, context: CGContextRef, rect: CGRect, mask: CGImageRef) {
+fn CGContextClipToMask(
+    env: &mut Environment,
+    context: CGContextRef,
+    rect: CGRect,
+    mask: CGImageRef,
+) {
     if mask.is_null() || rect.size.width <= 0.0 || rect.size.height <= 0.0 {
         return;
     }
@@ -211,6 +231,7 @@ pub fn CGContextSaveGState(env: &mut Environment, context: CGContextRef) {
         let host_obj = env.objc.borrow::<CGContextHostObject>(context);
         CGContextState {
             rgb_fill_color: host_obj.rgb_fill_color,
+            blend_mode: host_obj.blend_mode,
             transform: host_obj.transform,
             clip_mask: host_obj.clip_mask,
         }
@@ -234,6 +255,7 @@ pub fn CGContextRestoreGState(env: &mut Environment, context: CGContextRef) {
     }
     let host_obj = env.objc.borrow_mut::<CGContextHostObject>(context);
     host_obj.rgb_fill_color = state.rgb_fill_color;
+    host_obj.blend_mode = state.blend_mode;
     host_obj.transform = state.transform;
     host_obj.clip_mask = state.clip_mask;
 }
@@ -256,6 +278,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGContextSetFillColorWithColor(_, _)),
     export_c_func!(CGContextSetRGBFillColor(_, _, _, _, _)),
     export_c_func!(CGContextSetGrayFillColor(_, _, _)),
+    export_c_func!(CGContextSetBlendMode(_, _)),
     export_c_func!(CGContextFillRect(_, _)),
     export_c_func!(CGContextClearRect(_, _)),
     export_c_func!(CGContextClipToRect(_, _)),

@@ -18,8 +18,8 @@ use super::NSUInteger;
 use crate::environment::Environment;
 use crate::mem::ConstVoidPtr;
 use crate::objc::{
-    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports,
-    HostObject, NSZonePtr, SEL,
+    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
+    NSZonePtr, SEL,
 };
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;

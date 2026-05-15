@@ -250,9 +250,7 @@ impl AudioFile {
                             // must be converted to that from signed with 0 as
                             // output level 0.
                             1 => buffer[byte_offset] = (sample + 128) as u8,
-                            2 => {
-                                buffer[byte_offset..][..2].copy_from_slice(&sample.to_le_bytes())
-                            }
+                            2 => buffer[byte_offset..][..2].copy_from_slice(&sample.to_le_bytes()),
                             _ => unreachable!(),
                         }
                         byte_offset += bytes_per_sample as usize;

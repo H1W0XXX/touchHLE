@@ -5,6 +5,7 @@
  */
 //! `NSData` and `NSMutableData`.
 
+use super::ns_property_list_serialization;
 use super::ns_string::{from_rust_string, to_rust_string};
 use super::{NSRange, NSUInteger};
 use crate::frameworks::foundation::ns_keyed_unarchiver::decode_current_data;
@@ -165,7 +166,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         log!("ZombieFarm save: NSData read '{}'", path);
     }
     log_dbg!("[(NSData*){:?} initWithContentsOfFile:{:?}]", this, path);
-    let Ok(bytes) = env.fs.read(GuestPath::new(&path)) else {
+    let read_path = ns_property_list_serialization::zombie_farm_plist_fallback_path(env, &path)
+        .unwrap_or_else(|| GuestPath::new(&path).to_owned());
+    let Ok(bytes) = env.fs.read(read_path.as_ref()) else {
         if is_zombie_farm_save_path(&path) {
             log!("ZombieFarm save: NSData read missing '{}'", path);
         }
@@ -176,6 +179,15 @@ pub const CLASSES: ClassExports = objc_classes! {
     let alloc = env.mem.alloc(size);
     let slice = env.mem.bytes_at_mut(alloc.cast(), size);
     slice.copy_from_slice(&bytes);
+    if let Some(digest) = ns_property_list_serialization::zombie_farm_expected_plist_md5(env, &path)
+    {
+        crate::libc::crypto::register_cc_md5_override_for_bytes(
+            env,
+            alloc.cast_const(),
+            size,
+            digest,
+        );
+    }
 
     let host_object = env.objc.borrow_mut::<NSDataHostObject>(this);
     host_object.bytes = alloc;

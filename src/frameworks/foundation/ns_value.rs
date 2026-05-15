@@ -295,9 +295,16 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())encodeWithCoder:(id)coder {
     let host_object = env.objc.borrow::<NSNumberHostObject>(this);
     let (key, val) = match host_object {
+        NSNumberHostObject::Bool(value) => ("NS.intval", plist::Value::Integer((*value as i64).into())),
+        NSNumberHostObject::Char(value) => ("NS.intval", plist::Value::Integer((*value as i64).into())),
+        NSNumberHostObject::Short(value) => ("NS.intval", plist::Value::Integer((*value as i64).into())),
+        NSNumberHostObject::UnsignedShort(value) => ("NS.intval", plist::Value::Integer((*value as u64).into())),
+        NSNumberHostObject::UnsignedInt(value) => ("NS.intval", plist::Value::Integer((*value as u64).into())),
+        NSNumberHostObject::UnsignedLongLong(value) => ("NS.intval", plist::Value::Integer((*value).into())),
         NSNumberHostObject::Int(i) => ("NS.intval", plist::Value::Integer((*i).into())),
+        NSNumberHostObject::LongLong(value) => ("NS.intval", plist::Value::Integer((*value).into())),
+        NSNumberHostObject::Float(value) => ("NS.dblval", plist::Value::Real((*value).into())),
         NSNumberHostObject::Double(d) => ("NS.dblval", plist::Value::Real(*d)),
-        _ => unimplemented!("{:?}", host_object)
     };
 
     let scope = get_value_to_encode_for_current_key(env, coder);

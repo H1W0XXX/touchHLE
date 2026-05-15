@@ -260,9 +260,14 @@ fn CFStringGetCharactersPtr(env: &mut Environment, the_string: CFStringRef) -> C
     let bytes = (len as usize)
         .checked_mul(std::mem::size_of::<unichar>())
         .unwrap();
-    let buffer = env.mem.alloc((bytes.max(std::mem::size_of::<unichar>())) as u32);
+    let buffer = env
+        .mem
+        .alloc((bytes.max(std::mem::size_of::<unichar>())) as u32);
     if len != 0 {
-        let range = CFRange { location: 0, length: len };
+        let range = CFRange {
+            location: 0,
+            length: len,
+        };
         CFStringGetCharacters(env, the_string, range, buffer.cast());
     }
     buffer.cast_const().cast()

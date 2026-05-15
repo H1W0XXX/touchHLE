@@ -12,7 +12,7 @@ use super::{
 };
 use crate::frameworks::core_foundation::time::apple_epoch;
 use crate::frameworks::foundation::ns_date::NSDateHostObject;
-use crate::fs::GuestPath;
+use crate::fs::{GuestPath, GuestPathBuf};
 use crate::mem::{MutPtr, MutVoidPtr};
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, Class, ClassExports,
@@ -54,7 +54,12 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.mem.bytes_at_mut(ptr.cast(), len).copy_from_slice(&buf[..]);
     if let Some(source_path) = plist_source_path(env, plist) {
         if let Some(digest) = zombie_farm_expected_plist_md5(env, &source_path) {
-            crate::libc::crypto::register_cc_md5_override(ptr.cast_const(), len, digest);
+            crate::libc::crypto::register_cc_md5_override_for_bytes(
+                env,
+                ptr.cast_const(),
+                len,
+                digest,
+            );
         }
     }
     msg_class![env; NSData dataWithBytesNoCopy:ptr length:len]
@@ -105,18 +110,34 @@ pub(super) fn deserialize_plist_from_file(
     array_expected: bool,
 ) -> id {
     log_dbg!("Reading plist from {:?}.", path);
-    let Ok(bytes) = env.fs.read(path) else {
-        log_dbg!("Couldn't read file, returning nil.");
-        return nil;
+    let bytes = match env.fs.read(path) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            let Some(fallback_path) = zombie_farm_plist_fallback_path(env, path.as_str()) else {
+                log_dbg!("Couldn't read file, returning nil.");
+                return nil;
+            };
+            match env.fs.read(fallback_path.as_ref()) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    log_dbg!(
+                        "Couldn't read file fallback {:?}, returning nil.",
+                        fallback_path
+                    );
+                    return nil;
+                }
+            }
+        }
     };
 
-    let root = match Value::from_reader(Cursor::new(bytes)) {
+    let mut root = match Value::from_reader(Cursor::new(bytes)) {
         Ok(root) => root,
         Err(err) => {
             log_dbg!("Couldn't parse plist, returning nil: {}", err);
             return nil;
         }
     };
+    zombie_farm_patch_digest_plist(env, path, &mut root);
 
     if array_expected && root.as_array().is_none() {
         log_dbg!("Plist root is not array, returning nil.");
@@ -179,8 +200,9 @@ fn deserialize_plist(
                 release(env, key);
                 release(env, value);
             }
-            env.objc.borrow_mut::<DictionaryHostObject>(ns_dict).plist_key_order =
-                Some(plist_key_order);
+            env.objc
+                .borrow_mut::<DictionaryHostObject>(ns_dict)
+                .plist_key_order = Some(plist_key_order);
             ns_dict
         }
         Value::Boolean(b) => {
@@ -352,9 +374,13 @@ fn set_plist_source_path(env: &mut Environment, plist: id, path: String) {
     let arr_class = env.objc.get_known_class("NSArray", &mut env.mem);
 
     if env.objc.class_is_subclass_of(class, dict_class) {
-        env.objc.borrow_mut::<DictionaryHostObject>(plist).plist_source_path = Some(path);
+        env.objc
+            .borrow_mut::<DictionaryHostObject>(plist)
+            .plist_source_path = Some(path);
     } else if env.objc.class_is_subclass_of(class, arr_class) {
-        env.objc.borrow_mut::<ArrayHostObject>(plist).plist_source_path = Some(path);
+        env.objc
+            .borrow_mut::<ArrayHostObject>(plist)
+            .plist_source_path = Some(path);
     }
 }
 
@@ -369,13 +395,76 @@ fn plist_source_path(env: &mut Environment, plist: id) -> Option<String> {
             .plist_source_path
             .clone()
     } else if env.objc.class_is_subclass_of(class, arr_class) {
-        env.objc.borrow::<ArrayHostObject>(plist).plist_source_path.clone()
+        env.objc
+            .borrow::<ArrayHostObject>(plist)
+            .plist_source_path
+            .clone()
     } else {
         None
     }
 }
 
-fn zombie_farm_expected_plist_md5(env: &mut Environment, source_path: &str) -> Option<[u8; 16]> {
+pub(crate) fn zombie_farm_expected_plist_md5_hex(
+    env: &mut Environment,
+    source_path: &str,
+) -> Option<String> {
+    let digest = zombie_farm_expected_plist_md5(env, source_path)?;
+    Some(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+pub(crate) fn zombie_farm_plist_fallback_path(
+    env: &mut Environment,
+    source_path: &str,
+) -> Option<GuestPathBuf> {
+    if !(env
+        .bundle
+        .bundle_identifier()
+        .starts_with("com.playforge.ZombieFarm")
+        || env
+            .bundle
+            .bundle_identifier()
+            .starts_with("com.playforge.ZFR"))
+        || !source_path.ends_with("/XmasFarmStage.plist")
+    {
+        return None;
+    }
+
+    let source_path = GuestPath::new(source_path);
+    let fallback_path = source_path.parent()?.join("FarmStage.plist");
+    env.fs
+        .exists(fallback_path.as_ref())
+        .then_some(fallback_path)
+}
+
+fn zombie_farm_patch_digest_plist(env: &mut Environment, path: &GuestPath, root: &mut Value) {
+    if !(env
+        .bundle
+        .bundle_identifier()
+        .starts_with("com.playforge.ZombieFarm")
+        || env
+            .bundle
+            .bundle_identifier()
+            .starts_with("com.playforge.ZFR"))
+        || path.file_name() != Some("digest.plist")
+    {
+        return;
+    }
+
+    let Value::Dictionary(dict) = root else {
+        return;
+    };
+    if dict.contains_key("XmasFarmStage.plist") {
+        return;
+    }
+    if let Some(farm_stage_digest) = dict.get("FarmStage.plist").cloned() {
+        dict.insert("XmasFarmStage.plist".to_string(), farm_stage_digest);
+    }
+}
+
+pub(crate) fn zombie_farm_expected_plist_md5(
+    env: &mut Environment,
+    source_path: &str,
+) -> Option<[u8; 16]> {
     let bundle_id = env.bundle.bundle_identifier().to_string();
     if !(bundle_id.starts_with("com.playforge.ZombieFarm")
         || bundle_id.starts_with("com.playforge.ZFR"))
@@ -383,12 +472,22 @@ fn zombie_farm_expected_plist_md5(env: &mut Environment, source_path: &str) -> O
         return None;
     }
 
-    let source_path = GuestPath::new(source_path);
+    let source_path = if source_path.starts_with('/') {
+        GuestPath::new(source_path).to_owned()
+    } else {
+        env.bundle.bundle_path().join(source_path)
+    };
     let file_name = source_path.file_name()?;
     let digest_path = source_path.parent()?.join("digest.plist");
     let digest_bytes = env.fs.read(digest_path.as_ref()).ok()?;
     let root = Value::from_reader(Cursor::new(digest_bytes)).ok()?;
-    let digest_str = root.as_dictionary()?.get(file_name)?.as_string()?;
+    let dict = root.as_dictionary()?;
+    let digest_value = dict.get(file_name).or_else(|| {
+        (file_name == "XmasFarmStage.plist")
+            .then(|| dict.get("FarmStage.plist"))
+            .flatten()
+    })?;
+    let digest_str = digest_value.as_string()?;
     parse_hex_md5(digest_str)
 }
 

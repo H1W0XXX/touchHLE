@@ -8,7 +8,9 @@
 
 use super::ns_string::{self, to_rust_string};
 use super::NSInteger;
-use crate::objc::{autorelease, id, msg, nil, objc_classes, ClassExports, HostObject, NSZonePtr, SEL};
+use crate::objc::{
+    autorelease, id, msg, nil, objc_classes, ClassExports, HostObject, NSZonePtr, SEL,
+};
 use crate::Environment;
 
 struct NSAssertionHandlerHostObject {}
