@@ -43,7 +43,7 @@ pub use objects::{
 pub use properties::todo_objc_setter;
 pub use selectors::{selector, SEL};
 
-use crate::mem::ConstVoidPtr;
+use crate::mem::{ConstVoidPtr, MutPtr, MutVoidPtr};
 use crate::Environment;
 use classes::{
     class_getInstanceSize, class_getSuperclass, objc_getClass, ClassHostObject, FakeClass,
@@ -134,6 +134,77 @@ fn _Block_object_dispose(_env: &mut Environment, object: ConstVoidPtr, flags: i3
     );
 }
 
+fn objc_retain(env: &mut Environment, object: id) -> id {
+    if object != nil {
+        let _ = env.objc.try_increment_refcount(object);
+    }
+    object
+}
+
+fn objc_release(env: &mut Environment, object: id) {
+    if object == nil {
+        return;
+    }
+
+    if env.objc.try_decrement_refcount(object) == Some(true) {
+        msg![env; object dealloc]
+    }
+}
+
+fn objc_autorelease(env: &mut Environment, object: id) -> id {
+    if object != nil && env.objc.try_get_refcount(object).is_some() {
+        return autorelease(env, object);
+    }
+    object
+}
+
+fn objc_retainAutorelease(env: &mut Environment, object: id) -> id {
+    let object = objc_retain(env, object);
+    objc_autorelease(env, object)
+}
+
+fn objc_retainAutoreleasedReturnValue(env: &mut Environment, object: id) -> id {
+    objc_retain(env, object)
+}
+
+fn objc_retainAutoreleaseReturnValue(env: &mut Environment, object: id) -> id {
+    let object = objc_retain(env, object);
+    objc_autorelease(env, object)
+}
+
+fn objc_autoreleaseReturnValue(env: &mut Environment, object: id) -> id {
+    objc_autorelease(env, object)
+}
+
+fn objc_unsafeClaimAutoreleasedReturnValue(_env: &mut Environment, object: id) -> id {
+    object
+}
+
+fn objc_storeStrong(env: &mut Environment, location: MutPtr<id>, object: id) {
+    if location.is_null() {
+        return;
+    }
+
+    let old_object: id = env.mem.read(location);
+    if old_object == object {
+        return;
+    }
+
+    let retained_object = objc_retain(env, object);
+    env.mem.write(location, retained_object);
+    objc_release(env, old_object);
+}
+
+fn objc_retainBlock(_env: &mut Environment, block: MutVoidPtr) -> MutVoidPtr {
+    block
+}
+
+fn _Block_copy(_env: &mut Environment, block: MutVoidPtr) -> MutVoidPtr {
+    block
+}
+
+fn _Block_release(_env: &mut Environment, _block: MutVoidPtr) {}
+
 const FUNCTIONS: FunctionExports = &[
     export_c_func!(class_getInstanceSize(_)),
     export_c_func!(class_getSuperclass(_)),
@@ -149,4 +220,16 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(object_getClass(_)),
     export_c_func!(sel_registerName(_)),
     export_c_func!(_Block_object_dispose(_, _)),
+    export_c_func!(objc_retain(_)),
+    export_c_func!(objc_release(_)),
+    export_c_func!(objc_autorelease(_)),
+    export_c_func!(objc_retainAutorelease(_)),
+    export_c_func!(objc_retainAutoreleasedReturnValue(_)),
+    export_c_func!(objc_retainAutoreleaseReturnValue(_)),
+    export_c_func!(objc_autoreleaseReturnValue(_)),
+    export_c_func!(objc_unsafeClaimAutoreleasedReturnValue(_)),
+    export_c_func!(objc_storeStrong(_, _)),
+    export_c_func!(objc_retainBlock(_)),
+    export_c_func!(_Block_copy(_)),
+    export_c_func!(_Block_release(_)),
 ];

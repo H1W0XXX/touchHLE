@@ -1456,6 +1456,15 @@ impl Environment {
         }
 
         if self.gdb_server.is_none() {
+            if self
+                .bundle
+                .bundle_identifier()
+                .starts_with("com.playforge.ZombieFarm")
+            {
+                if let Ok(mut file) = std::fs::File::create("zombie_farm_crash_snapshot.txt") {
+                    let _ = crate::zombie_farm_debug::write_snapshot(&mut file);
+                }
+            }
             self.dump_all_regs();
             self.stack_trace_current();
             panic!("Error during CPU execution: {error:?}");

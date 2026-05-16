@@ -681,6 +681,32 @@ fn __sprintf_chk(
     sprintf(env, dest, format, args)
 }
 
+fn __snprintf_chk(
+    env: &mut Environment,
+    dest: MutPtr<u8>,
+    max_len: GuestUSize,
+    _flags: i32,
+    strlen: GuestUSize,
+    format: ConstPtr<u8>,
+    args: DotDotDot,
+) -> i32 {
+    let n = std::cmp::min(max_len, strlen);
+    snprintf(env, dest, n, format, args)
+}
+
+fn __vsnprintf_chk(
+    env: &mut Environment,
+    dest: MutPtr<u8>,
+    max_len: GuestUSize,
+    _flags: i32,
+    strlen: GuestUSize,
+    format: ConstPtr<u8>,
+    arg: VaList,
+) -> i32 {
+    let n = std::cmp::min(max_len, strlen);
+    vsnprintf(env, dest, n, format, arg)
+}
+
 fn sprintf(env: &mut Environment, dest: MutPtr<u8>, format: ConstPtr<u8>, args: DotDotDot) -> i32 {
     // TODO: handle errno properly
     set_errno(env, 0);
@@ -1295,7 +1321,9 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(vprintf(_, _)),
     export_c_func!(vsnprintf(_, _, _, _)),
     export_c_func!(vsprintf(_, _, _)),
+    export_c_func!(__snprintf_chk(_, _, _, _, _, _)),
     export_c_func!(__sprintf_chk(_, _, _, _, _)),
+    export_c_func!(__vsnprintf_chk(_, _, _, _, _, _)),
     export_c_func!(sprintf(_, _, _)),
     export_c_func!(swprintf(_, _, _, _)),
     export_c_func!(vswprintf(_, _, _, _)),

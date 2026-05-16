@@ -5,6 +5,7 @@
  */
 //! `UIImage`.
 
+use crate::dyld::{export_c_func, FunctionExports};
 use crate::frameworks::core_graphics::cg_context::{
     CGContextDrawImage, CGContextRestoreGState, CGContextSaveGState, CGContextScaleCTM,
     CGContextTranslateCTM,
@@ -15,7 +16,7 @@ use crate::frameworks::core_graphics::cg_image::{
 };
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::get_static_str;
-use crate::frameworks::foundation::{ns_data, ns_string, NSInteger};
+use crate::frameworks::foundation::{ns_data, ns_string, NSInteger, NSUInteger};
 use crate::frameworks::uikit::ui_graphics::UIGraphicsGetCurrentContext;
 use crate::fs::GuestPath;
 use crate::image::Image;
@@ -41,6 +42,48 @@ impl State {
     fn get_mut(env: &mut Environment) -> &mut Self {
         &mut env.framework_state.uikit.ui_image
     }
+}
+
+fn data_from_static_bytes(env: &mut Environment, bytes: &[u8]) -> id {
+    let length: NSUInteger = bytes.len().try_into().unwrap();
+    let guest_bytes = env.mem.alloc(length);
+    env.mem
+        .bytes_at_mut(guest_bytes.cast(), length)
+        .copy_from_slice(bytes);
+    msg_class![env; NSData dataWithBytesNoCopy:guest_bytes length:length freeWhenDone:true]
+}
+
+fn UIImageJPEGRepresentation(env: &mut Environment, image: id, compression_quality: CGFloat) -> id {
+    log_dbg!(
+        "UIImageJPEGRepresentation({:?}, quality {})",
+        image,
+        compression_quality
+    );
+    if image == nil {
+        return nil;
+    }
+
+    // Zombie Farm only needs non-empty attachment data for the email-sharing
+    // path. A SOI+EOI marker pair is enough for MessageUI callers here because
+    // the image is never decoded again inside touchHLE.
+    data_from_static_bytes(env, &[0xff, 0xd8, 0xff, 0xd9])
+}
+
+fn UIImagePNGRepresentation(env: &mut Environment, image: id) -> id {
+    log_dbg!("UIImagePNGRepresentation({:?})", image);
+    if image == nil {
+        return nil;
+    }
+
+    // 1x1 transparent PNG.
+    const PNG_1X1_TRANSPARENT: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+    data_from_static_bytes(env, PNG_1X1_TRANSPARENT)
 }
 
 struct UIImageHostObject {
@@ -384,3 +427,8 @@ fn draw_image_in_rect(env: &mut Environment, image_obj: id, rect: CGRect, contex
     }
     CGContextRestoreGState(env, context);
 }
+
+pub const FUNCTIONS: FunctionExports = &[
+    export_c_func!(UIImageJPEGRepresentation(_, _)),
+    export_c_func!(UIImagePNGRepresentation(_)),
+];

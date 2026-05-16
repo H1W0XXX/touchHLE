@@ -21,6 +21,7 @@
 #![allow(clippy::enum_variant_names)] // Lots of Apple enums have the same prefix
 #![allow(clippy::too_many_arguments)] // It's not our fault!
 
+pub mod ad_support;
 pub mod audio_toolbox;
 pub mod avfoundation;
 pub mod carbon_core;
@@ -33,6 +34,7 @@ pub mod core_motion;
 pub mod foundation;
 pub mod game_kit;
 pub mod media_player;
+pub mod message_ui;
 pub mod openal;
 pub mod opengles;
 pub mod sqlite;

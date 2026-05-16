@@ -6,7 +6,8 @@
 //! `CGImage.h`
 
 use super::cg_color_space::{
-    kCGColorSpaceGenericRGB, CGColorSpaceCreateWithName, CGColorSpaceGetModel, CGColorSpaceRef,
+    kCGColorSpaceGenericRGB, kCGColorSpaceModelMonochrome, kCGColorSpaceModelRGB,
+    CGColorSpaceCreateWithName, CGColorSpaceGetModel, CGColorSpaceRef,
 };
 use super::cg_data_provider::{self, CGDataProviderRef};
 use super::{CGFloat, CGRect};
@@ -159,6 +160,156 @@ pub fn CGImageCreateWithImageInRect(
     from_image(env, Image::from_pixel_vec(pixels, dimensions))
 }
 
+fn transparent_image(env: &mut Environment, width: GuestUSize, height: GuestUSize) -> CGImageRef {
+    let width = width.max(1);
+    let height = height.max(1);
+    from_image(
+        env,
+        Image::from_pixel_vec(
+            vec![0; width as usize * height as usize * 4],
+            (width, height),
+        ),
+    )
+}
+
+fn CGImageCreate(
+    env: &mut Environment,
+    width: GuestUSize,
+    height: GuestUSize,
+    bits_per_component: GuestUSize,
+    bits_per_pixel: GuestUSize,
+    bytes_per_row: GuestUSize,
+    color_space: CGColorSpaceRef,
+    bitmap_info: CGBitmapInfo,
+    provider: CGDataProviderRef,
+    _decode: ConstPtr<CGFloat>,
+    _should_interpolate: bool,
+    _intent: i32,
+) -> CGImageRef {
+    if width == 0 || height == 0 {
+        return nil;
+    }
+
+    if bits_per_component != 8 || bytes_per_row == 0 || provider == nil {
+        return transparent_image(env, width, height);
+    }
+
+    let color_model = if color_space == nil {
+        kCGColorSpaceModelRGB
+    } else {
+        CGColorSpaceGetModel(env, color_space)
+    };
+    let alpha_info = bitmap_info & kCGBitmapAlphaInfoMask;
+    let byte_order = bitmap_info & kCGBitmapByteOrderMask;
+    if byte_order != kCGImageByteOrderDefault && byte_order != kCGImageByteOrder32Big {
+        return transparent_image(env, width, height);
+    }
+
+    let source = cg_data_provider::borrow_bytes(env, provider);
+    let required_len = bytes_per_row as usize * height as usize;
+    if source.len() < required_len {
+        return transparent_image(env, width, height);
+    }
+
+    let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
+    for y in 0..height as usize {
+        let row = &source[y * bytes_per_row as usize..][..bytes_per_row as usize];
+        for x in 0..width as usize {
+            let (r, g, b, a) = match (color_model, bits_per_pixel, alpha_info) {
+                (kCGColorSpaceModelRGB, 24, kCGImageAlphaNone) => {
+                    let offset = x * 3;
+                    if offset + 2 >= row.len() {
+                        return transparent_image(env, width, height);
+                    }
+                    (row[offset], row[offset + 1], row[offset + 2], 255)
+                }
+                (
+                    kCGColorSpaceModelRGB,
+                    32,
+                    kCGImageAlphaNone
+                    | kCGImageAlphaPremultipliedLast
+                    | kCGImageAlphaLast
+                    | kCGImageAlphaNoneSkipLast,
+                ) => {
+                    let offset = x * 4;
+                    if offset + 3 >= row.len() {
+                        return transparent_image(env, width, height);
+                    }
+                    let alpha =
+                        if matches!(alpha_info, kCGImageAlphaNone | kCGImageAlphaNoneSkipLast) {
+                            255
+                        } else {
+                            row[offset + 3]
+                        };
+                    (row[offset], row[offset + 1], row[offset + 2], alpha)
+                }
+                (
+                    kCGColorSpaceModelRGB,
+                    32,
+                    kCGImageAlphaPremultipliedFirst
+                    | kCGImageAlphaFirst
+                    | kCGImageAlphaNoneSkipFirst,
+                ) => {
+                    let offset = x * 4;
+                    if offset + 3 >= row.len() {
+                        return transparent_image(env, width, height);
+                    }
+                    let alpha = if alpha_info == kCGImageAlphaNoneSkipFirst {
+                        255
+                    } else {
+                        row[offset]
+                    };
+                    (row[offset + 1], row[offset + 2], row[offset + 3], alpha)
+                }
+                (kCGColorSpaceModelMonochrome, 8, kCGImageAlphaNone | kCGImageAlphaOnly) => {
+                    if x >= row.len() {
+                        return transparent_image(env, width, height);
+                    }
+                    let value = row[x];
+                    if alpha_info == kCGImageAlphaOnly {
+                        (255, 255, 255, value)
+                    } else {
+                        (value, value, value, 255)
+                    }
+                }
+                (
+                    kCGColorSpaceModelMonochrome,
+                    16,
+                    kCGImageAlphaLast | kCGImageAlphaPremultipliedLast | kCGImageAlphaNoneSkipLast,
+                ) => {
+                    let offset = x * 2;
+                    if offset + 1 >= row.len() {
+                        return transparent_image(env, width, height);
+                    }
+                    let value = row[offset];
+                    let alpha = if alpha_info == kCGImageAlphaNoneSkipLast {
+                        255
+                    } else {
+                        row[offset + 1]
+                    };
+                    (value, value, value, alpha)
+                }
+                _ => {
+                    log!(
+                        "CGImageCreate unsupported format: {}x{}, bpc {}, bpp {}, bpr {}, color model {}, bitmap info {:#x}",
+                        width,
+                        height,
+                        bits_per_component,
+                        bits_per_pixel,
+                        bytes_per_row,
+                        color_model,
+                        bitmap_info
+                    );
+                    return transparent_image(env, width, height);
+                }
+            };
+            pixels.extend_from_slice(&[r, g, b, a]);
+        }
+    }
+
+    from_image(env, Image::from_pixel_vec(pixels, (width, height)))
+}
+
 fn CGImageCreateWithPNGDataProvider(
     env: &mut Environment,
     source: CGDataProviderRef,
@@ -257,6 +408,7 @@ fn CGImageGetBitsPerComponent(_: &mut Environment, _: CGImageRef) -> GuestUSize 
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGImageRelease(_)),
     export_c_func!(CGImageRetain(_)),
+    export_c_func!(CGImageCreate(_, _, _, _, _, _, _, _, _, _, _)),
     export_c_func!(CGImageCreateCopyWithColorSpace(_, _)),
     export_c_func!(CGImageCreateWithImageInRect(_, _)),
     export_c_func!(CGImageCreateWithPNGDataProvider(_, _, _, _)),

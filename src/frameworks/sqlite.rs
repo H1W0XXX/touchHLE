@@ -239,6 +239,16 @@ fn sqlite3_open(env: &mut Environment, filename: ConstPtr<u8>, db_out: MutPtr<Mu
     SQLITE_OK
 }
 
+fn sqlite3_open_v2(
+    env: &mut Environment,
+    filename: ConstPtr<u8>,
+    db_out: MutPtr<MutVoidPtr>,
+    _flags: i32,
+    _vfs: ConstPtr<u8>,
+) -> i32 {
+    sqlite3_open(env, filename, db_out)
+}
+
 fn sqlite3_close(env: &mut Environment, db: MutVoidPtr) -> i32 {
     let statements: Vec<MutVoidPtr> = env
         .framework_state
@@ -838,8 +848,13 @@ fn sqlite3_last_insert_rowid(env: &mut Environment, db: MutVoidPtr) -> i64 {
         .unwrap_or_default()
 }
 
+fn sqlite3_threadsafe(_env: &mut Environment) -> i32 {
+    1
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(sqlite3_open(_, _)),
+    export_c_func!(sqlite3_open_v2(_, _, _, _)),
     export_c_func!(sqlite3_close(_)),
     export_c_func!(sqlite3_prepare_v2(_, _, _, _, _)),
     export_c_func!(sqlite3_step(_)),
@@ -873,4 +888,5 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(sqlite3_clear_bindings(_)),
     export_c_func!(sqlite3_changes(_)),
     export_c_func!(sqlite3_last_insert_rowid(_)),
+    export_c_func!(sqlite3_threadsafe()),
 ];

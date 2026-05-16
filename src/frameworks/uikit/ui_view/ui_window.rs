@@ -20,7 +20,10 @@ use crate::frameworks::uikit::ui_application::{
 use crate::frameworks::uikit::ui_device::{
     UIDeviceOrientationLandscapeLeft, UIDeviceOrientationLandscapeRight,
 };
-use crate::objc::{id, msg, msg_class, msg_super, nil, objc_classes, ClassExports};
+use crate::objc::{
+    id, msg, msg_class, msg_super, nil, objc_classes, release, retain, ClassExports,
+};
+use std::collections::HashMap;
 
 #[derive(Default)]
 pub struct State {
@@ -31,6 +34,8 @@ pub struct State {
     /// The most recent window which received `makeKeyAndVisible` message.
     /// Non-retaining!
     pub key_window: Option<id>,
+    /// Root view controllers associated with windows.
+    pub root_view_controllers: HashMap<id, id>,
 }
 
 pub const CLASSES: ClassExports = objc_classes! {
@@ -84,14 +89,26 @@ pub const CLASSES: ClassExports = objc_classes! {
             env.framework_state.uikit.ui_view.ui_window.key_window = None;
         }
     }
-    let list = &mut env.framework_state.uikit.ui_view.ui_window.windows;
-    let idx = list.iter().position(|&w| w == this).unwrap();
-    list.remove(idx);
-    log_dbg!(
-        "Deallocating window {:?}. New list of all windows: {:?}",
-        this,
-        list,
-    );
+    {
+        let list = &mut env.framework_state.uikit.ui_view.ui_window.windows;
+        let idx = list.iter().position(|&w| w == this).unwrap();
+        list.remove(idx);
+        log_dbg!(
+            "Deallocating window {:?}. New list of all windows: {:?}",
+            this,
+            list,
+        );
+    }
+    if let Some(root_view_controller) = env
+        .framework_state
+        .uikit
+        .ui_view
+        .ui_window
+        .root_view_controllers
+        .remove(&this)
+    {
+        release(env, root_view_controller);
+    }
     msg_super![env; this dealloc]
 }
 
@@ -114,6 +131,37 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (bool)isKeyWindow {
     env.framework_state.uikit.ui_view.ui_window.key_window == Some(this)
+}
+
+- (())setRootViewController:(id)view_controller {
+    let state = &mut env.framework_state.uikit.ui_view.ui_window;
+    let old_view_controller = if view_controller == nil {
+        state.root_view_controllers.remove(&this)
+    } else {
+        state.root_view_controllers.insert(this, view_controller)
+    };
+    retain(env, view_controller);
+    if let Some(old_view_controller) = old_view_controller {
+        release(env, old_view_controller);
+    }
+
+    if view_controller != nil {
+        let view: id = msg![env; view_controller view];
+        let bounds: CGRect = msg![env; this bounds];
+        () = msg![env; view setFrame:bounds];
+        () = msg![env; this addSubview:view];
+    }
+}
+
+- (id)rootViewController {
+    env.framework_state
+        .uikit
+        .ui_view
+        .ui_window
+        .root_view_controllers
+        .get(&this)
+        .copied()
+        .unwrap_or(nil)
 }
 
 - (())makeKeyAndVisible {

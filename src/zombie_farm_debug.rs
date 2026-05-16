@@ -193,6 +193,20 @@ pub fn record_layout_event(line: String) {
     push_recent(&mut state.recent, line);
 }
 
+pub fn record_objc_message(receiver: id, class_name: &str, selector_name: &str, regs: &[u32; 16]) {
+    let line = format!(
+        "[objc call] [0x{:x} {} {}] r2=0x{:x} r3=0x{:x}",
+        receiver.to_bits(),
+        class_name,
+        selector_name,
+        regs[2],
+        regs[3],
+    );
+
+    let mut state = state().lock().unwrap();
+    push_recent(&mut state.recent, line);
+}
+
 pub fn should_record_hunger_message(class_name: &str, selector_name: &str) -> bool {
     let is_zombie_actor = class_name.starts_with("ZombieActor");
     let is_zombie_menu = class_name == "ZFZombieMenu";

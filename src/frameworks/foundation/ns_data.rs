@@ -220,6 +220,15 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.fs.write(GuestPath::new(&file), slice).is_ok()
 }
 
+- (bool)writeToFile:(id)path // NSString*
+            options:(NSUInteger)_write_options
+              error:(MutPtr<id>)error {
+    if !error.is_null() {
+        env.mem.write(error, nil);
+    }
+    msg![env; this writeToFile:path atomically:false]
+}
+
 - (())dealloc {
     let &NSDataHostObject { bytes, free_when_done, .. } = env.objc.borrow(this);
     if !bytes.is_null() && free_when_done {

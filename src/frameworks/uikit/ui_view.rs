@@ -18,6 +18,7 @@ pub mod ui_web_view;
 pub mod ui_window;
 
 use super::ui_graphics::{UIGraphicsPopContext, UIGraphicsPushContext};
+use crate::abi::CallFromHost;
 use crate::frameworks::core_animation::ca_layer;
 use crate::frameworks::core_graphics::cg_affine_transform::{
     CGAffineTransform, CGAffineTransformIdentity,
@@ -28,7 +29,7 @@ use crate::frameworks::core_graphics::cg_geometry::CGRectZero;
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::frameworks::foundation::{ns_array, NSInteger, NSTimeInterval, NSUInteger};
-use crate::mem::MutVoidPtr;
+use crate::mem::{ConstPtr, ConstVoidPtr, MutVoidPtr, SafeRead};
 use crate::objc::{
     autorelease, id, msg, msg_class, msg_send, nil, objc_classes, release, retain,
     todo_objc_setter, Class, ClassExports, HostObject, NSZonePtr, ObjC, SEL,
@@ -63,6 +64,15 @@ struct UIViewAnimationState {
     will_start_selector: Option<SEL>,
     did_stop_selector: Option<SEL>,
 }
+
+#[repr(C, packed)]
+struct BlockLiteral {
+    _isa: u32,
+    _flags: i32,
+    _reserved: i32,
+    invoke: crate::abi::GuestFunction,
+}
+unsafe impl SafeRead for BlockLiteral {}
 
 pub(super) struct UIViewHostObject {
     /// CALayer or subclass.
@@ -274,6 +284,32 @@ fn call_animation_selector(
     }
 }
 
+fn call_animation_block(env: &mut Environment, block: ConstPtr<BlockLiteral>) {
+    if block.is_null() {
+        return;
+    }
+
+    let block_literal: BlockLiteral = env.mem.read(block);
+    let invoke = block_literal.invoke;
+    if invoke.addr_with_thumb_bit() != 0 {
+        let block_ptr: ConstVoidPtr = block.cast();
+        () = invoke.call_from_host(env, (block_ptr,));
+    }
+}
+
+fn call_animation_completion_block(env: &mut Environment, block: ConstPtr<BlockLiteral>) {
+    if block.is_null() {
+        return;
+    }
+
+    let block_literal: BlockLiteral = env.mem.read(block);
+    let invoke = block_literal.invoke;
+    if invoke.addr_with_thumb_bit() != 0 {
+        let block_ptr: ConstVoidPtr = block.cast();
+        () = invoke.call_from_host(env, (block_ptr, true));
+    }
+}
+
 pub fn set_view_controller(env: &mut Environment, view: id, controller: id) {
     let host_obj = env.objc.borrow_mut::<UIViewHostObject>(view);
     host_obj.view_controller = controller;
@@ -396,6 +432,36 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 + (bool)areAnimationsEnabled {
     env.framework_state.uikit.ui_view.animations_enabled
+}
+
++ (())animateWithDuration:(NSTimeInterval)_duration
+               animations:(ConstPtr<BlockLiteral>)animations {
+    call_animation_block(env, animations);
+}
+
++ (())animateWithDuration:(NSTimeInterval)_duration
+               animations:(ConstPtr<BlockLiteral>)animations
+               completion:(ConstPtr<BlockLiteral>)completion {
+    call_animation_block(env, animations);
+    call_animation_completion_block(env, completion);
+}
+
++ (())animateWithDuration:(NSTimeInterval)_duration
+                    delay:(NSTimeInterval)_delay
+                  options:(NSUInteger)_options
+               animations:(ConstPtr<BlockLiteral>)animations
+               completion:(ConstPtr<BlockLiteral>)completion {
+    call_animation_block(env, animations);
+    call_animation_completion_block(env, completion);
+}
+
++ (())transitionWithView:(id)_view
+                duration:(NSTimeInterval)_duration
+                 options:(NSUInteger)_options
+              animations:(ConstPtr<BlockLiteral>)animations
+              completion:(ConstPtr<BlockLiteral>)completion {
+    call_animation_block(env, animations);
+    call_animation_completion_block(env, completion);
 }
 
 // TODO: accessors etc

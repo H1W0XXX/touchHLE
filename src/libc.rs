@@ -13,10 +13,12 @@ mod generic_char;
 
 pub mod arpa;
 pub mod clocale;
+pub mod compiler_rt;
 pub mod crypto;
 pub mod ctype;
 pub mod cxxabi;
 pub mod dirent;
+pub mod dispatch;
 pub mod dlfcn;
 pub mod dns_sd;
 pub mod errno;
@@ -42,6 +44,7 @@ pub mod sys;
 pub mod sysctl;
 pub mod time;
 pub mod unistd;
+pub mod unwind;
 pub mod wchar;
 
 pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
@@ -52,8 +55,10 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
     function_exports: &[
         arpa::inet::FUNCTIONS,
         clocale::FUNCTIONS,
+        compiler_rt::FUNCTIONS,
         ctype::FUNCTIONS,
         cxxabi::FUNCTIONS,
+        dispatch::FUNCTIONS,
         crypto::FUNCTIONS,
         dirent::FUNCTIONS,
         dlfcn::FUNCTIONS,
@@ -105,6 +110,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         sysctl::FUNCTIONS,
         time::FUNCTIONS,
         unistd::FUNCTIONS,
+        unwind::FUNCTIONS,
         wchar::FUNCTIONS,
     ],
 };

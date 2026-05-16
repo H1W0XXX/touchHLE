@@ -25,7 +25,7 @@ pub mod ui_navigation_controller;
 pub mod ui_table_view_controller;
 
 #[derive(Default)]
-struct UIViewControllerHostObject {
+pub(crate) struct UIViewControllerHostObject {
     /// The root view.
     /// `UIView*`
     view: id,
@@ -200,6 +200,21 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())dismissModalViewControllerAnimated:(bool)animated {
     log!("TODO: [(UIViewController*){:?} dismissModalViewControllerAnimated:{}]", this, animated); // TODO
+}
+- (())presentModalViewController:(id)view_controller animated:(bool)animated {
+    log_dbg!(
+        "[(UIViewController*){:?} presentModalViewController:{:?} animated:{}]",
+        this,
+        view_controller,
+        animated
+    );
+    if view_controller != nil
+        && env
+            .objc
+            .object_has_method_named(&env.mem, view_controller, "_touchHLE_simulateMailComposeSuccess")
+    {
+        let _: () = msg![env; view_controller _touchHLE_simulateMailComposeSuccess];
+    }
 }
 - (())dismissMoviePlayerViewControllerAnimated {
     log!("TODO: [(UIViewController*){:?} dismissMoviePlayerViewControllerAnimated]", this); // TODO

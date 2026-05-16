@@ -675,6 +675,496 @@ fn zombie_farm_override_game_state_save_date_setter(
     true
 }
 
+fn zombie_farm_skip_epic_event_with_missing_remote_data(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2"
+        || selector_name != "validBossID:"
+        || zombie_farm_object_class_name(env, receiver) != Some("EpicEventManager")
+    {
+        return false;
+    }
+
+    env.cpu.regs_mut()[0] = 0;
+    log!(
+        "ZombieFarm2 workaround: treating EpicEventManager validBossID:{} as false",
+        env.cpu.regs()[2]
+    );
+    true
+}
+
+fn zombie_farm_override_cocos2d_get_zeye(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2" || selector_name != "getZEye" {
+        return false;
+    }
+
+    let class = ObjC::read_isa(receiver, &env.mem);
+    let Some(class_name) = env.objc.try_get_class_name(class) else {
+        return false;
+    };
+    if !matches!(
+        class_name,
+        "CCDirector" | "CCFastDirector" | "CCThreadedFastDirector"
+    ) {
+        return false;
+    }
+
+    let (_, height) = env.window().device_family().portrait_size();
+    let z_eye = height as f32 / 1.1566;
+    env.cpu.regs_mut()[0] = z_eye.to_bits();
+    log!(
+        "ZombieFarm2 workaround: [{} getZEye] -> {:.3}",
+        class_name,
+        z_eye
+    );
+    true
+}
+
+fn zombie_farm_skip_cocos2d_projection_setup(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2"
+        || selector_name != "setProjection:"
+    {
+        return false;
+    }
+
+    let class = ObjC::read_isa(receiver, &env.mem);
+    let Some(class_name) = env.objc.try_get_class_name(class) else {
+        return false;
+    };
+    if !matches!(
+        class_name,
+        "CCDirector" | "CCFastDirector" | "CCThreadedFastDirector"
+    ) {
+        return false;
+    }
+
+    log!(
+        "ZombieFarm2 workaround: ignoring [{} setProjection:{}]",
+        class_name,
+        env.cpu.regs()[2]
+    );
+    true
+}
+
+fn zombie_farm_skip_remote_asset_requests(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2"
+        || !matches!(
+            selector_name,
+            "startRemote"
+                | "requestManifest"
+                | "downloadRemote"
+                | "requestAssets"
+                | "rerunFailedRequests"
+        )
+        || zombie_farm_object_class_name(env, receiver) != Some("RemoteManager")
+    {
+        return false;
+    }
+
+    log!(
+        "ZombieFarm2 workaround: skipping RemoteManager {}",
+        selector_name
+    );
+    true
+}
+
+fn zombie_farm_skip_event_tracker_nil_last_event(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2"
+        || selector_name != "setLastEvent:"
+        || env.cpu.regs()[2] != nil.to_bits()
+    {
+        return false;
+    }
+
+    let Some(class_name) = zombie_farm_object_class_name(env, receiver) else {
+        return false;
+    };
+    if !matches!(class_name, "EventTracker" | "ZF2EventTracker") {
+        return false;
+    }
+
+    log!(
+        "ZombieFarm2 workaround: ignoring [{} setLastEvent:nil]",
+        class_name
+    );
+    true
+}
+
+fn zombie_farm_skip_event_tracker_init(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2" || selector_name != "init" {
+        return false;
+    }
+
+    let Some(class_name) = zombie_farm_object_class_name(env, receiver).map(str::to_string) else {
+        return false;
+    };
+    if !matches!(class_name.as_str(), "EventTracker" | "ZF2EventTracker") {
+        return false;
+    }
+
+    env.cpu.regs_mut()[0] = receiver.to_bits();
+    log!("ZombieFarm2 workaround: host-handled [{} init]", class_name);
+    true
+}
+
+fn zombie_farm_return_open_udid(env: &mut Environment, receiver: id, selector_name: &str) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2"
+        || !matches!(
+            selector_name,
+            "value" | "valueWithError:" | "_getOpenUDID" | "_generateFreshOpenUDID"
+        )
+    {
+        return false;
+    }
+
+    let Some(class_name) = zombie_farm_object_class_name(env, receiver).map(str::to_string) else {
+        return false;
+    };
+    if !matches!(
+        class_name.as_str(),
+        "VungleOpenUDID" | "OpenUDID" | "AP_OpenUDID"
+    ) {
+        return false;
+    }
+
+    let udid =
+        ns_string::from_rust_string(env, "0000000000000000000000000000000000000000".to_string());
+    env.cpu.regs_mut()[0] = udid.to_bits();
+    log!(
+        "ZombieFarm2 workaround: [{} {}] -> fixed OpenUDID",
+        class_name,
+        selector_name
+    );
+    true
+}
+
+fn zombie_farm_skip_vungle_ad_sdk(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2" {
+        return false;
+    }
+
+    let Some(class_name) = zombie_farm_object_class_name(env, receiver).map(str::to_string) else {
+        return false;
+    };
+
+    let should_skip = if class_name == "VungleSDK" {
+        matches!(
+            selector_name,
+            "startWithAppId:"
+                | "startWithAppId:delegate:"
+                | "loadDatabase"
+                | "updateUserAgent"
+                | "setSafariUserAgent:"
+                | "setDelegate:"
+                | "setLoggingEnabled:"
+                | "setUserData:"
+                | "setIncentivizedDelegate:"
+                | "cacheAd"
+                | "playAd"
+                | "getPreferenceValueForKey:"
+                | "setPreferenceValue:forKey:"
+        )
+    } else if class_name == "VungleCacheManager" {
+        matches!(selector_name, "createDirectory:")
+    } else if class_name.starts_with("VungleFMDatabaseQueue") {
+        matches!(
+            selector_name,
+            "inDatabase:"
+                | "inTransaction:"
+                | "inDeferredTransaction:"
+                | "database"
+                | "close"
+                | "checkpoint:error:"
+        )
+    } else if class_name.starts_with("VungleFMDatabase") {
+        matches!(
+            selector_name,
+            "open"
+                | "openWithFlags:"
+                | "close"
+                | "executeQuery:"
+                | "executeQuery:withArgumentsInArray:orDictionary:orVAList:"
+                | "executeUpdate:"
+                | "executeUpdate:withArgumentsInArray:orDictionary:orVAList:"
+                | "executeStatements:"
+                | "lastErrorCode"
+                | "lastErrorMessage"
+        )
+    } else {
+        false
+    };
+
+    if !should_skip {
+        return false;
+    }
+
+    env.cpu.regs_mut()[0] = 0;
+    log!(
+        "ZombieFarm2 workaround: skipping Vungle ad SDK [{} {}]",
+        class_name,
+        selector_name
+    );
+    true
+}
+
+fn zombie_farm_skip_broken_font_preload(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2"
+        || !matches!(
+            selector_name,
+            "loadFonts" | "loadFont:" | "loadFont:withName:"
+        )
+        || zombie_farm_object_class_name(env, receiver) != Some("ZombieFarmAppDelegate")
+    {
+        return false;
+    }
+
+    env.cpu.regs_mut()[0] = 0;
+    log!(
+        "ZombieFarm2 workaround: skipping ZombieFarmAppDelegate {}",
+        selector_name
+    );
+    true
+}
+
+fn zombie_farm_skip_brain_client_network(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2" {
+        return false;
+    }
+
+    let Some(class_name) = zombie_farm_object_class_name(env, receiver).map(str::to_string) else {
+        return false;
+    };
+
+    let should_skip = if class_name == "BrainClient" {
+        selector_name.starts_with("sendRequestTo:")
+            || matches!(
+                selector_name,
+                "cancelRequestsForDelegate:"
+                    | "setAsynchronousOperations:"
+                    | "setSynchronousOperations:"
+            )
+    } else if class_name == "BrainClientOperation" {
+        matches!(
+            selector_name,
+            "start"
+                | "main"
+                | "createPostRequest"
+                | "sendRequest"
+                | "connection:didReceiveResponse:"
+                | "connection:didReceiveData:"
+                | "connectionDidFinishLoading:"
+                | "connection:didFailWithError:"
+        )
+    } else if class_name == "NSOperationQueue" && selector_name == "addOperation:" {
+        let operation = id::from_bits(env.cpu.regs()[2]);
+        zombie_farm_object_class_name(env, operation) == Some("BrainClientOperation")
+    } else {
+        false
+    };
+
+    if !should_skip {
+        return false;
+    }
+
+    env.cpu.regs_mut()[0] = 0;
+    log!(
+        "ZombieFarm2 workaround: skipping BrainClient network [{} {}]",
+        class_name,
+        selector_name
+    );
+    true
+}
+
+fn zombie_farm_skip_event_ad_networks(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2" {
+        return false;
+    }
+
+    let Some(class_name) = zombie_farm_object_class_name(env, receiver).map(str::to_string) else {
+        return false;
+    };
+
+    let should_skip = if matches!(class_name.as_str(), "EventTracker" | "ZF2EventTracker") {
+        matches!(
+            selector_name,
+            "setupAdNetworks"
+                | "setupFlurryAds"
+                | "fetchFlurryAds"
+                | "fetchFlurryAdForSpace:"
+                | "isFlurryAdAvailableForSpace:"
+                | "setupKiipAds"
+                | "showFlurryAdForSpace:"
+                | "showKiipAd:"
+        )
+    } else {
+        class_name == "Kiip"
+            || class_name.starts_with("Kiip")
+            || class_name == "Flurry"
+            || class_name.starts_with("Flurry")
+    };
+
+    if !should_skip {
+        return false;
+    }
+
+    env.cpu.regs_mut()[0] = 0;
+    log!(
+        "ZombieFarm2 workaround: skipping ad network [{} {}]",
+        class_name,
+        selector_name
+    );
+    true
+}
+
+fn zombie_farm_skip_startup_profile_detection(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2"
+        || zombie_farm_object_class_name(env, receiver) != Some("PlayerProfileManager")
+        || !matches!(
+            selector_name,
+            "determineStartupPlayer"
+                | "determineStartupPlayer:"
+                | "showStartupPlayerSelection"
+                | "showStartupPlayerSelection:"
+        )
+    {
+        return false;
+    }
+
+    env.cpu.regs_mut()[0] = 0;
+    log!(
+        "ZombieFarm2 workaround: skipping PlayerProfileManager {}",
+        selector_name
+    );
+    true
+}
+
+fn zombie_farm_skip_startup_internet_loading(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2" {
+        return false;
+    }
+
+    let Some(class_name) = zombie_farm_object_class_name(env, receiver).map(str::to_string) else {
+        return false;
+    };
+    let should_skip = (class_name == "MainMenu" && selector_name == "startupInternet")
+        || (class_name == "LoadingScreen"
+            && matches!(
+                selector_name,
+                "updateLoadingScreens" | "show" | "hide" | "show:" | "hide:"
+            ));
+
+    if !should_skip {
+        return false;
+    }
+
+    env.cpu.regs_mut()[0] = 0;
+    log!(
+        "ZombieFarm2 workaround: skipping startup loading [{} {}]",
+        class_name,
+        selector_name
+    );
+    true
+}
+
+fn zombie_farm_skip_cocos_denshion_effects(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2" {
+        return false;
+    }
+
+    let Some(class_name) = zombie_farm_object_class_name(env, receiver).map(str::to_string) else {
+        return false;
+    };
+
+    let should_skip = if class_name == "SimpleAudioEngine" {
+        matches!(
+            selector_name,
+            "playEffect:"
+                | "playEffect:pitch:pan:gain:"
+                | "preloadEffect:"
+                | "unloadEffect:"
+                | "stopEffect:"
+        )
+    } else if class_name == "CDBufferManager" {
+        matches!(
+            selector_name,
+            "bufferForFile:create:" | "releaseBufferForFile:"
+        )
+    } else if class_name == "CDSoundEngine" {
+        matches!(
+            selector_name,
+            "loadBuffer:filePath:"
+                | "loadBufferFromData:soundData:format:size:freq:"
+                | "playSound:sourceGroupId:pitch:pan:gain:loop:"
+                | "stopSound:"
+                | "stopAllSounds"
+        )
+    } else {
+        false
+    };
+
+    if !should_skip {
+        return false;
+    }
+
+    env.cpu.regs_mut()[0] = 0;
+    log!(
+        "ZombieFarm2 workaround: skipping CocosDenshion effect [{} {}]",
+        class_name,
+        selector_name
+    );
+    true
+}
+
 fn zombie_farm_actor_hunger(env: &mut Environment, actor: id) -> Option<f32> {
     if actor == nil {
         return None;
@@ -1516,6 +2006,48 @@ fn objc_msgSend_inner(
     if zombie_farm_override_game_state_save_date_setter(env, receiver, &selector_name) {
         return;
     }
+    if zombie_farm_skip_epic_event_with_missing_remote_data(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_override_cocos2d_get_zeye(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_skip_cocos2d_projection_setup(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_skip_remote_asset_requests(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_skip_event_tracker_nil_last_event(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_skip_event_tracker_init(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_return_open_udid(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_skip_vungle_ad_sdk(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_skip_broken_font_preload(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_skip_brain_client_network(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_skip_event_ad_networks(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_skip_startup_profile_detection(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_skip_startup_internet_loading(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_skip_cocos_denshion_effects(env, receiver, &selector_name) {
+        return;
+    }
     zombie_farm_prepare_local_server_date(env, receiver, &selector_name);
     zombie_farm_prepare_local_hunger_update(env, &selector_name);
     let regs_before_zombie_farm_prepare = *env.cpu.regs();
@@ -1598,6 +2130,14 @@ fn objc_msgSend_inner(
                     .unwrap_or(name)
                     .to_string();
                 let receiver_class_name = receiver_class_name_owned.as_str();
+                if zombie_farm_uses_playforge_bundle(env) {
+                    crate::zombie_farm_debug::record_objc_message(
+                        receiver,
+                        receiver_class_name,
+                        selector_name,
+                        env.cpu.regs(),
+                    );
+                }
                 let trace_zombie_farm_layout =
                     trace_zombie_farm_layout_message(receiver_class_name, selector_name)
                         || trace_zombie_farm_layout_message(name, selector_name);

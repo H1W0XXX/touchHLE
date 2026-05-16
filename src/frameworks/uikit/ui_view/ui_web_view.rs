@@ -5,7 +5,7 @@
  */
 //! `UIWebView`.
 
-use crate::frameworks::foundation::ns_string::to_rust_string;
+use crate::frameworks::foundation::ns_string::{get_static_str, to_rust_string};
 use crate::msg;
 use crate::objc::{id, nil, objc_classes, ClassExports};
 use std::borrow::Cow;
@@ -61,6 +61,20 @@ pub const CLASSES: ClassExports = objc_classes! {
         base_url,
         base_url_desc
     );
+}
+
+- (id)stringByEvaluatingJavaScriptFromString:(id)script {
+    let script_len = if script != nil {
+        to_rust_string(env, script).len()
+    } else {
+        0
+    };
+    log_dbg!(
+        "[(UIWebView*) {:?} stringByEvaluatingJavaScriptFromString:<{} bytes>] -> empty string",
+        this,
+        script_len
+    );
+    get_static_str(env, "")
 }
 
 @end

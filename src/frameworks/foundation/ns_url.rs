@@ -199,6 +199,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     // TODO
     nil
 }
++ (())setSharedURLCache:(id)_cache {
+    // Networking/cache behavior is not emulated; callers use this as setup.
+}
+- (id)initWithMemoryCapacity:(NSUInteger)_memory_capacity
+                diskCapacity:(NSUInteger)_disk_capacity
+                    diskPath:(id)_path {
+    this
+}
 @end
 
 };

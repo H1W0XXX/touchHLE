@@ -771,20 +771,28 @@ fn alSpeedOfSound(env: &mut Environment, value: ALfloat) {
 // uses only few ones. To workaround this, we just provide stubs.
 
 fn alcGetEnumValue(
-    _env: &mut Environment,
+    env: &mut Environment,
     _device: MutPtr<GuestALCdevice>,
-    _enumName: ConstPtr<u8>,
+    enum_name: ConstPtr<u8>,
 ) -> ALenum {
-    todo!();
+    if enum_name.is_null() {
+        return 0;
+    }
+
+    let s = env.mem.cstr_at_utf8(enum_name).unwrap();
+    log_dbg!("alcGetEnumValue({:?}) => 0", s);
+    0
 }
 fn alcGetIntegerv(
-    _env: &mut Environment,
+    env: &mut Environment,
     _device: MutPtr<GuestALCdevice>,
     _param: ALenum,
     _size: ALCsizei,
-    _values: MutPtr<ALCint>,
+    values: MutPtr<ALCint>,
 ) {
-    todo!();
+    if !values.is_null() {
+        env.mem.write(values, 0);
+    }
 }
 fn alcIsExtensionPresent(
     _env: &mut Environment,
@@ -793,41 +801,52 @@ fn alcIsExtensionPresent(
 ) -> ALCboolean {
     0
 }
-fn alGetBufferf(_env: &mut Environment, _buffer: ALuint, _param: ALenum, _value: MutPtr<ALfloat>) {
-    todo!();
+fn alGetBufferf(env: &mut Environment, _buffer: ALuint, _param: ALenum, value: MutPtr<ALfloat>) {
+    if !value.is_null() {
+        env.mem.write(value, 0.0);
+    }
 }
 fn alDisable(_env: &mut Environment, _capability: ALenum) {
-    todo!();
+    // OpenAL capabilities are optional for the games seen so far. Treat
+    // disabling an unknown capability as a no-op, matching Apple's tolerance.
 }
 fn alGetBoolean(_env: &mut Environment, _param: ALenum) -> ALboolean {
-    todo!();
+    0
 }
-fn alGetBooleanv(_env: &mut Environment, _param: ALenum, _values: MutPtr<ALboolean>) {
-    todo!();
+fn alGetBooleanv(env: &mut Environment, _param: ALenum, values: MutPtr<ALboolean>) {
+    if !values.is_null() {
+        env.mem.write(values, 0);
+    }
 }
 fn alGetDouble(_env: &mut Environment, _param: ALenum) -> ALdouble {
-    todo!();
+    0.0
 }
-fn alGetDoublev(_env: &mut Environment, _param: ALenum, _values: MutPtr<ALdouble>) {
-    todo!();
+fn alGetDoublev(env: &mut Environment, _param: ALenum, values: MutPtr<ALdouble>) {
+    if !values.is_null() {
+        env.mem.write(values, 0.0);
+    }
 }
 fn alGetFloat(_env: &mut Environment, _param: ALenum) -> ALfloat {
-    todo!();
+    0.0
 }
-fn alGetFloatv(_env: &mut Environment, _param: ALenum, _values: MutPtr<ALfloat>) {
-    todo!();
+fn alGetFloatv(env: &mut Environment, _param: ALenum, values: MutPtr<ALfloat>) {
+    if !values.is_null() {
+        env.mem.write(values, 0.0);
+    }
 }
 fn alGetInteger(_env: &mut Environment, _param: ALenum) -> ALint {
-    todo!();
+    0
 }
-fn alGetIntegerv(_env: &mut Environment, _param: ALenum, _values: MutPtr<ALint>) {
-    todo!();
+fn alGetIntegerv(env: &mut Environment, _param: ALenum, values: MutPtr<ALint>) {
+    if !values.is_null() {
+        env.mem.write(values, 0);
+    }
 }
 fn alGetProcAddress(env: &mut Environment, funcName: ConstPtr<u8>) -> MutVoidPtr {
     alcGetProcAddress(env, Ptr::null(), funcName)
 }
 fn alIsEnabled(_env: &mut Environment, _capability: ALenum) -> ALboolean {
-    todo!();
+    0
 }
 fn alSourcePlayv(_env: &mut Environment, _nsources: ALsizei, _sources: ConstPtr<ALuint>) {
     todo!();
