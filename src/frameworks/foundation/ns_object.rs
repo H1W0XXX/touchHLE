@@ -240,10 +240,20 @@ pub const CLASSES: ClassExports = objc_classes! {
     this == other
 }
 
-// TODO: Instance description and debugDescription.
-// This is not hard to add, but before adding a fallback implementation of it,
-// we should make sure all the Foundation classes' overrides of it are there,
-// to prevent weird behavior.
+- (id)description {
+    let class = ObjC::read_isa(this, &env.mem);
+    let class_name = env
+        .objc
+        .try_get_class_name(class)
+        .unwrap_or("<unknown class>");
+    let str = from_rust_string(env, format!("<{class_name}: 0x{:x}>", this.to_bits()));
+    autorelease(env, str)
+}
+
+- (id)debugDescription {
+    msg![env; this description]
+}
+
 // TODO: localized description methods also? (not sure if NSObject has them)
 
 // Helper for NSCopying

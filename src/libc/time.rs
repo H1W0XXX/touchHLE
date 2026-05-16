@@ -13,6 +13,7 @@ use crate::mem::{guest_size_of, ConstPtr, GuestUSize, MutPtr, Ptr, SafeRead};
 use crate::Environment;
 use chrono::{Datelike, Local, Offset, TimeZone, Timelike};
 use std::ops::Range;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Default)]
@@ -33,6 +34,58 @@ type clock_t = u64;
 
 const CLOCKS_PER_SEC: clock_t = 1000000;
 
+#[derive(Copy, Clone, Debug, Default)]
+struct EmulatedTimeConfig {
+    fake_unix_time: Option<i64>,
+    offset_seconds: i64,
+}
+
+static EMULATED_TIME_CONFIG: OnceLock<EmulatedTimeConfig> = OnceLock::new();
+
+fn parse_env_i64(name: &str) -> Option<i64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+}
+
+fn emulated_time_config() -> EmulatedTimeConfig {
+    *EMULATED_TIME_CONFIG.get_or_init(|| EmulatedTimeConfig {
+        fake_unix_time: parse_env_i64("TOUCHHLE_FAKE_UNIX_TIME"),
+        offset_seconds: parse_env_i64("TOUCHHLE_TIME_OFFSET_SECONDS").unwrap_or(0),
+    })
+}
+
+fn system_time_from_unix_seconds(seconds: i64) -> SystemTime {
+    if seconds >= 0 {
+        SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_secs(seconds as u64))
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+    } else {
+        SystemTime::UNIX_EPOCH
+            .checked_sub(Duration::from_secs(seconds.unsigned_abs()))
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+    }
+}
+
+fn add_signed_seconds(time: SystemTime, seconds: i64) -> SystemTime {
+    if seconds >= 0 {
+        time.checked_add(Duration::from_secs(seconds as u64))
+            .unwrap_or(time)
+    } else {
+        time.checked_sub(Duration::from_secs(seconds.unsigned_abs()))
+            .unwrap_or(time)
+    }
+}
+
+pub fn emulated_system_time() -> SystemTime {
+    let config = emulated_time_config();
+    let base = config
+        .fake_unix_time
+        .map(system_time_from_unix_seconds)
+        .unwrap_or_else(SystemTime::now);
+    add_signed_seconds(base, config.offset_seconds)
+}
+
 fn clock(env: &mut Environment) -> clock_t {
     Instant::now()
         .duration_since(env.startup_time)
@@ -44,7 +97,7 @@ fn time(env: &mut Environment, out: MutPtr<time_t>) -> time_t {
     // TODO: handle errno properly
     set_errno(env, 0);
 
-    let time64 = SystemTime::now()
+    let time64 = emulated_system_time()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_secs();
@@ -538,7 +591,7 @@ fn gettimeofday(
         return 0; // success
     }
 
-    let time = SystemTime::now()
+    let time = emulated_system_time()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap();
 

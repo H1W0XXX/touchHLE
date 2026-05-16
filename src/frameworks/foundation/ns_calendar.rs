@@ -7,7 +7,10 @@
 
 use super::{ns_string, NSInteger, NSTimeInterval, NSUInteger};
 use crate::dyld::{ConstantExports, HostConstant};
-use crate::libc::time::{calendar_date_to_timestamp, timestamp_to_calendar_date, tm};
+use crate::libc::time::{
+    calendar_date_to_timestamp, current_local_timezone_offset_seconds, timestamp_to_calendar_date,
+    tm,
+};
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
     NSZonePtr,
@@ -63,8 +66,18 @@ impl Default for NSDateComponentsHostObject {
 }
 impl HostObject for NSDateComponentsHostObject {}
 
-fn components_from_timestamp(env: &mut crate::Environment, timestamp: i32) -> id {
-    let date = timestamp_to_calendar_date(timestamp);
+fn calendar_time_zone_offset_seconds(env: &mut crate::Environment, calendar: id) -> i32 {
+    let time_zone = env.objc.borrow::<NSCalendarHostObject>(calendar).time_zone;
+    if time_zone == nil {
+        current_local_timezone_offset_seconds()
+    } else {
+        msg![env; time_zone secondsFromGMT]
+    }
+}
+
+fn components_from_timestamp(env: &mut crate::Environment, timestamp: i32, offset: i32) -> id {
+    let local_timestamp = timestamp.saturating_add(offset);
+    let date = timestamp_to_calendar_date(local_timestamp);
     let components: id = msg_class![env; NSDateComponents new];
     {
         let host_obj = env
@@ -78,7 +91,7 @@ fn components_from_timestamp(env: &mut crate::Environment, timestamp: i32) -> id
         host_obj.minute = date.tm_min;
         host_obj.second = date.tm_sec;
         // 1 = Sunday in NSCalendar.
-        host_obj.weekday = 1 + (timestamp.div_euclid(86_400) + 4).rem_euclid(7);
+        host_obj.weekday = 1 + (local_timestamp.div_euclid(86_400) + 4).rem_euclid(7);
     }
     autorelease(env, components)
 }
@@ -150,7 +163,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)components:(NSUInteger)_unit_flags
         fromDate:(id)date {
     let timestamp: NSTimeInterval = msg![env; date timeIntervalSince1970];
-    components_from_timestamp(env, timestamp as i32)
+    let offset = calendar_time_zone_offset_seconds(env, this);
+    components_from_timestamp(env, timestamp as i32, offset)
 }
 
 - (NSInteger)component:(NSUInteger)unit
@@ -184,7 +198,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         if minute == NSUndefinedDateComponent { 0 } else { minute as u8 },
         if second == NSUndefinedDateComponent { 0 } else { second as u8 },
     );
-    let timestamp = calendar_date_to_timestamp(tm);
+    let offset = calendar_time_zone_offset_seconds(env, this);
+    let timestamp = calendar_date_to_timestamp(tm).saturating_sub(offset);
     let seconds = timestamp as NSTimeInterval;
     msg_class![env; NSDate dateWithTimeIntervalSince1970:seconds]
 }

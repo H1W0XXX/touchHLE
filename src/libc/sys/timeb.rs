@@ -6,7 +6,7 @@
 //! `sys/timeb.h`
 
 use crate::dyld::FunctionExports;
-use crate::libc::time::time_t;
+use crate::libc::time::{emulated_system_time, time_t};
 use crate::mem::{MutPtr, SafeRead};
 use crate::{export_c_func, Environment};
 use std::time::SystemTime;
@@ -27,7 +27,7 @@ struct timeb {
 unsafe impl SafeRead for timeb {}
 
 fn ftime(env: &mut Environment, tb: MutPtr<timeb>) -> i32 {
-    let epoch_duration = SystemTime::now()
+    let epoch_duration = emulated_system_time()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap();
     let time64 = epoch_duration.as_secs();

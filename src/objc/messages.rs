@@ -15,7 +15,9 @@ use super::{id, nil, Class, ObjC, IMP, SEL};
 use crate::abi::{CallFromHost, GuestRet};
 use crate::environment::ThreadId;
 use crate::frameworks::core_graphics::{CGPoint, CGSize};
-use crate::frameworks::foundation::{ns_property_list_serialization, ns_string};
+use crate::frameworks::foundation::{
+    ns_date, ns_property_list_serialization, ns_string, NSUInteger,
+};
 use crate::libc::pthread::cond::{
     pthread_cond_broadcast, pthread_cond_destroy, pthread_cond_init, pthread_cond_t,
     pthread_cond_wait,
@@ -28,6 +30,10 @@ use crate::mem::{guest_size_of, ConstPtr, MutPtr, MutVoidPtr, SafeRead};
 use crate::objc::classes::InitializationStatus;
 use crate::Environment;
 use std::any::TypeId;
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    OnceLock,
+};
 
 pub(super) struct ThreadInitializer {
     mutex: MutPtr<pthread_mutex_t>,
@@ -161,8 +167,28 @@ fn maybe_initialize_class(env: &mut Environment, receiver: id) {
 }
 
 fn trace_zombie_farm_status_message(class_name: &str, selector_name: &str) -> bool {
-    let _ = (class_name, selector_name);
-    false
+    let interesting_class = matches!(
+        class_name,
+        "ZFGuiLayer" | "ZFActorManager" | "GameState" | "GameData"
+    );
+    let interesting_selector = matches!(
+        selector_name,
+        "checkDailyEvent"
+            | "getServerTime"
+            | "handleTimeResponse:"
+            | "handleResponse:forAction:"
+            | "applyZombieHunger"
+            | "statusCheckDone"
+            | "startUpChecksComplete"
+            | "fixZombieHunger"
+            | "makeAllZombiesHungry"
+            | "makeAllZombiesFull"
+            | "saveGame"
+            | "setSaveDate:"
+            | "saveDate"
+            | "getBeginningOfTheDayFromDate:"
+    );
+    interesting_class && interesting_selector
 }
 
 fn trace_zombie_farm_layout_message(class_name: &str, selector_name: &str) -> bool {
@@ -271,6 +297,745 @@ fn zombie_farm_layout_arg_details(selector_name: &str, regs: &[u32]) -> Option<S
         "setCellID:" | "setCurrentCellIndex:" => Some(format!("arg value={}", regs[2])),
         _ => None,
     }
+}
+
+fn zombie_farm_status_arg_details(selector_name: &str, regs: &[u32]) -> Option<String> {
+    match selector_name {
+        "setHunger:" => Some(format!("arg hunger={:.3}", f32::from_bits(regs[2]))),
+        "setEatDate:" | "setSaveDate:" | "handleTimeResponse:" => {
+            Some(format!("arg object={:?}", id::from_bits(regs[2])))
+        }
+        "timeIntervalSinceDate:" | "getBeginningOfTheDayFromDate:" => {
+            Some(format!("arg date={:?}", id::from_bits(regs[2])))
+        }
+        "addTimeInterval:" => {
+            let mut bytes = [0u8; 8];
+            bytes[0..4].copy_from_slice(&regs[2].to_le_bytes());
+            bytes[4..8].copy_from_slice(&regs[3].to_le_bytes());
+            Some(format!(
+                "arg seconds={:.3}",
+                f64::from_bits(u64::from_le_bytes(bytes))
+            ))
+        }
+        "handleResponse:forAction:" => Some(format!(
+            "arg response={:?} action={:?}",
+            id::from_bits(regs[2]),
+            id::from_bits(regs[3])
+        )),
+        _ => None,
+    }
+}
+
+fn zombie_farm_uses_playforge_bundle(env: &Environment) -> bool {
+    env.bundle
+        .bundle_identifier()
+        .starts_with("com.playforge.Z")
+}
+
+fn zombie_farm_object_class_name<'a>(env: &'a Environment, object: id) -> Option<&'a str> {
+    if !zombie_farm_object_pointer_looks_valid(env, object) {
+        return None;
+    }
+    let class = ObjC::read_isa(object, &env.mem);
+    if class == nil {
+        return None;
+    }
+    env.objc.try_get_class_name(class)
+}
+
+fn zombie_farm_object_pointer_looks_valid(env: &Environment, object: id) -> bool {
+    object != nil && object.to_bits() >= env.mem.null_segment_size() && object.to_bits() % 4 == 0
+}
+
+fn zombie_farm_set_gui_layer_server_date_to_now(env: &mut Environment, receiver: id) -> bool {
+    if !zombie_farm_uses_playforge_bundle(env)
+        || zombie_farm_object_class_name(env, receiver) != Some("ZFGuiLayer")
+    {
+        return false;
+    }
+
+    let ivar_name = "serverDate".to_string();
+    let Some(server_date_ivar) = env.objc.object_lookup_ivar(&env.mem, receiver, &ivar_name) else {
+        return false;
+    };
+
+    let old_server_date: id = env.mem.read(server_date_ivar.cast());
+    let now: id = msg_class![env; NSDate date];
+    let now = retain(env, now);
+    env.mem.write(server_date_ivar.cast(), now);
+    if old_server_date != nil && old_server_date != now {
+        release(env, old_server_date);
+    }
+    log!(
+        "ZombieFarm status: using local NSDate {:?} as ZFGuiLayer.serverDate",
+        now
+    );
+    true
+}
+
+static ZOMBIE_FARM_APPLIED_LOCAL_HUNGER: AtomicBool = AtomicBool::new(false);
+static ZOMBIE_FARM_APPLY_TRACE_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+fn zombie_farm_get_gui_layer(env: &mut Environment) -> Option<id> {
+    let gui_layer_class = env.objc.get_known_class("ZFGuiLayer", &mut env.mem);
+    let gui_selector = env.objc.lookup_selector("gui")?;
+    if !env
+        .objc
+        .object_has_method(&env.mem, gui_layer_class, gui_selector)
+    {
+        return None;
+    }
+    let gui_layer: id = msg_send_no_type_checking(env, (gui_layer_class, gui_selector));
+    (gui_layer != nil).then_some(gui_layer)
+}
+
+fn zombie_farm_get_game_state(env: &mut Environment) -> Option<id> {
+    let game_state_class = env.objc.get_known_class("GameState", &mut env.mem);
+    let game_state_selector = env.objc.lookup_selector("gameState")?;
+    if !env
+        .objc
+        .object_has_method(&env.mem, game_state_class, game_state_selector)
+    {
+        return None;
+    }
+    let game_state: id = msg_send_no_type_checking(env, (game_state_class, game_state_selector));
+    (game_state != nil).then_some(game_state)
+}
+
+fn zombie_farm_get_actor_list(env: &mut Environment) -> Option<id> {
+    let game_state = zombie_farm_get_game_state(env)?;
+    let zf_game_data_selector = env.objc.lookup_selector("zfGameData")?;
+    if !env
+        .objc
+        .object_has_method(&env.mem, game_state, zf_game_data_selector)
+    {
+        return None;
+    }
+    let game_data: id = msg_send_no_type_checking(env, (game_state, zf_game_data_selector));
+    if game_data == nil {
+        return None;
+    }
+
+    let actor_list_selector = env.objc.lookup_selector("actorList")?;
+    if !env
+        .objc
+        .object_has_method(&env.mem, game_data, actor_list_selector)
+    {
+        return None;
+    }
+    let actor_list: id = msg_send_no_type_checking(env, (game_data, actor_list_selector));
+    (actor_list != nil).then_some(actor_list)
+}
+
+fn zombie_farm_get_live_actor_list(env: &mut Environment) -> Option<id> {
+    let actor_manager_class = env.objc.get_known_class("ZFActorManager", &mut env.mem);
+    let actor_manager_selector = env.objc.lookup_selector("actorManager")?;
+    if !env
+        .objc
+        .object_has_method(&env.mem, actor_manager_class, actor_manager_selector)
+    {
+        return None;
+    }
+    let actor_manager: id =
+        msg_send_no_type_checking(env, (actor_manager_class, actor_manager_selector));
+    if actor_manager == nil {
+        return None;
+    }
+
+    let actor_list_selector = env.objc.lookup_selector("actorList")?;
+    if !env
+        .objc
+        .object_has_method(&env.mem, actor_manager, actor_list_selector)
+    {
+        return None;
+    }
+    let actor_list: id = msg_send_no_type_checking(env, (actor_manager, actor_list_selector));
+    (actor_list != nil).then_some(actor_list)
+}
+
+fn zombie_farm_actor_is_zombie(env: &Environment, actor: id) -> bool {
+    zombie_farm_object_class_name(env, actor)
+        .is_some_and(|class_name| class_name.starts_with("ZombieActor"))
+}
+
+fn zombie_farm_read_object_ivar(env: &Environment, object: id, ivar_name: &str) -> Option<id> {
+    if !zombie_farm_object_pointer_looks_valid(env, object) {
+        return None;
+    }
+    let ivar_name = ivar_name.to_string();
+    let ivar = env.objc.object_lookup_ivar(&env.mem, object, &ivar_name)?;
+    Some(env.mem.read(ivar.cast()))
+}
+
+fn zombie_farm_date_interval(env: &Environment, date: id) -> Option<f64> {
+    if !zombie_farm_object_pointer_looks_valid(env, date) {
+        return None;
+    }
+    ns_date::debug_time_interval(env, date)
+}
+
+fn zombie_farm_actor_eat_date(env: &mut Environment, actor: id) -> Option<id> {
+    let Some(eat_date_selector) = env.objc.lookup_selector("eatDate") else {
+        return zombie_farm_read_object_ivar(env, actor, "eatDate")
+            .filter(|date| zombie_farm_date_interval(env, *date).is_some());
+    };
+    if !env
+        .objc
+        .object_has_method(&env.mem, actor, eat_date_selector)
+    {
+        return zombie_farm_read_object_ivar(env, actor, "eatDate")
+            .filter(|date| zombie_farm_date_interval(env, *date).is_some());
+    }
+
+    let eat_date: id = msg_send_no_type_checking(env, (actor, eat_date_selector));
+    if zombie_farm_date_interval(env, eat_date).is_some() {
+        Some(eat_date)
+    } else {
+        zombie_farm_read_object_ivar(env, actor, "eatDate")
+            .filter(|date| zombie_farm_date_interval(env, *date).is_some())
+    }
+}
+
+fn zombie_farm_oldest_zombie_eat_date_in_list(
+    env: &mut Environment,
+    actor_list: id,
+) -> Option<(id, f64)> {
+    let count_selector = env.objc.lookup_selector("count")?;
+    let object_at_index_selector = env.objc.lookup_selector("objectAtIndex:")?;
+    if !env
+        .objc
+        .object_has_method(&env.mem, actor_list, count_selector)
+        || !env
+            .objc
+            .object_has_method(&env.mem, actor_list, object_at_index_selector)
+    {
+        return None;
+    }
+
+    let count: NSUInteger = msg_send_no_type_checking(env, (actor_list, count_selector));
+    let mut oldest: Option<(id, f64)> = None;
+    for idx in 0..count {
+        let actor: id = msg_send_no_type_checking(env, (actor_list, object_at_index_selector, idx));
+        if actor == nil || !zombie_farm_actor_is_zombie(env, actor) {
+            continue;
+        }
+
+        let Some(eat_date) = zombie_farm_actor_eat_date(env, actor) else {
+            continue;
+        };
+        let Some(interval) = zombie_farm_date_interval(env, eat_date) else {
+            continue;
+        };
+
+        if oldest
+            .as_ref()
+            .is_none_or(|(_, oldest_interval)| interval < *oldest_interval)
+        {
+            oldest = Some((eat_date, interval));
+        }
+    }
+
+    oldest
+}
+
+fn zombie_farm_oldest_zombie_eat_date(env: &mut Environment) -> Option<(id, f64)> {
+    let mut oldest: Option<(id, f64)> = None;
+    for actor_list in [
+        zombie_farm_get_actor_list(env),
+        zombie_farm_get_live_actor_list(env),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let Some((eat_date, interval)) =
+            zombie_farm_oldest_zombie_eat_date_in_list(env, actor_list)
+        else {
+            continue;
+        };
+        if oldest
+            .as_ref()
+            .is_none_or(|(_, oldest_interval)| interval < *oldest_interval)
+        {
+            oldest = Some((eat_date, interval));
+        }
+    }
+    oldest
+}
+
+fn zombie_farm_game_state_save_date(env: &mut Environment, game_state: id) -> Option<id> {
+    if let Some(save_date) = zombie_farm_read_object_ivar(env, game_state, "saveDate")
+        .filter(|date| zombie_farm_date_interval(env, *date).is_some())
+    {
+        return Some(save_date);
+    }
+
+    let save_date_selector = env.objc.lookup_selector("saveDate")?;
+    if !env
+        .objc
+        .object_has_method(&env.mem, game_state, save_date_selector)
+    {
+        return None;
+    }
+    let save_date: id = msg_send_no_type_checking(env, (game_state, save_date_selector));
+    (zombie_farm_date_interval(env, save_date).is_some()).then_some(save_date)
+}
+
+fn zombie_farm_set_game_state_save_date(env: &mut Environment, game_state: id, save_date: id) {
+    if !zombie_farm_object_pointer_looks_valid(env, save_date) {
+        return;
+    }
+
+    let Some(save_date_ivar) =
+        env.objc
+            .object_lookup_ivar(&env.mem, game_state, &"saveDate".to_string())
+    else {
+        return;
+    };
+    let old_save_date: id = env.mem.read(save_date_ivar.cast());
+    let retained_save_date = retain(env, save_date);
+    env.mem.write(save_date_ivar.cast(), retained_save_date);
+    if old_save_date != nil && old_save_date != retained_save_date {
+        release(env, old_save_date);
+    }
+}
+
+fn zombie_farm_ensure_game_state_save_date(env: &mut Environment) -> bool {
+    if !zombie_farm_uses_playforge_bundle(env) {
+        return false;
+    }
+
+    let Some(game_state) = zombie_farm_get_game_state(env) else {
+        return false;
+    };
+    if zombie_farm_game_state_save_date(env, game_state).is_some() {
+        return true;
+    }
+
+    let Some((save_date, interval)) = zombie_farm_oldest_zombie_eat_date(env) else {
+        return false;
+    };
+    zombie_farm_set_game_state_save_date(env, game_state, save_date);
+    log!(
+        "ZombieFarm status: restored nil GameState.saveDate from oldest zombie eatDate {:?} ({:.3}s since Apple epoch)",
+        save_date,
+        interval
+    );
+    true
+}
+
+fn zombie_farm_prepare_game_state_save_date(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) {
+    if !zombie_farm_uses_playforge_bundle(env)
+        || selector_name != "setSaveDate:"
+        || zombie_farm_object_class_name(env, receiver) != Some("GameState")
+        || id::from_bits(env.cpu.regs()[2]) != nil
+    {
+        return;
+    }
+
+    let regs = *env.cpu.regs();
+    let save_date: id = msg_class![env; NSDate date];
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    env.cpu.regs_mut()[2] = save_date.to_bits();
+    log!(
+        "ZombieFarm status: replacing GameState setSaveDate:nil with local NSDate {:?}",
+        save_date
+    );
+}
+
+fn zombie_farm_override_game_state_save_date_setter(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if !zombie_farm_uses_playforge_bundle(env)
+        || selector_name != "setSaveDate:"
+        || zombie_farm_object_class_name(env, receiver) != Some("GameState")
+    {
+        return false;
+    }
+
+    let save_date = id::from_bits(env.cpu.regs()[2]);
+    if !zombie_farm_object_pointer_looks_valid(env, save_date) {
+        log!(
+            "ZombieFarm status: ignoring GameState setSaveDate: invalid object {:?}",
+            save_date
+        );
+        return true;
+    }
+
+    zombie_farm_set_game_state_save_date(env, receiver, save_date);
+    log!(
+        "ZombieFarm status: host-handled GameState setSaveDate:{:?}",
+        save_date
+    );
+    true
+}
+
+fn zombie_farm_actor_hunger(env: &mut Environment, actor: id) -> Option<f32> {
+    if actor == nil {
+        return None;
+    }
+
+    if let Some(hunger_selector) = env.objc.lookup_selector("hunger") {
+        if env.objc.object_has_method(&env.mem, actor, hunger_selector) {
+            return Some(msg_send_no_type_checking(env, (actor, hunger_selector)));
+        }
+    }
+
+    let ivar_name = "hunger".to_string();
+    let ivar = env.objc.object_lookup_ivar(&env.mem, actor, &ivar_name)?;
+    Some(env.mem.read(ivar.cast()))
+}
+
+fn zombie_farm_set_actor_hunger(env: &mut Environment, actor: id, hunger: f32) -> bool {
+    if actor == nil {
+        return false;
+    }
+
+    if let Some(set_hunger_selector) = env.objc.lookup_selector("setHunger:") {
+        if env
+            .objc
+            .object_has_method(&env.mem, actor, set_hunger_selector)
+        {
+            let _: () = msg_send_no_type_checking(env, (actor, set_hunger_selector, hunger));
+            return true;
+        }
+    }
+
+    let ivar_name = "hunger".to_string();
+    let Some(ivar) = env.objc.object_lookup_ivar(&env.mem, actor, &ivar_name) else {
+        return false;
+    };
+    env.mem.write(ivar.cast(), hunger);
+    true
+}
+
+fn zombie_farm_zombie_hungers_in_list(env: &mut Environment, actor_list: id) -> Vec<f32> {
+    let Some(count_selector) = env.objc.lookup_selector("count") else {
+        return Vec::new();
+    };
+    let Some(object_at_index_selector) = env.objc.lookup_selector("objectAtIndex:") else {
+        return Vec::new();
+    };
+    if !env
+        .objc
+        .object_has_method(&env.mem, actor_list, count_selector)
+        || !env
+            .objc
+            .object_has_method(&env.mem, actor_list, object_at_index_selector)
+    {
+        return Vec::new();
+    }
+
+    let count: NSUInteger = msg_send_no_type_checking(env, (actor_list, count_selector));
+    let mut hungers = Vec::new();
+    for idx in 0..count {
+        let actor: id = msg_send_no_type_checking(env, (actor_list, object_at_index_selector, idx));
+        if actor == nil || !zombie_farm_actor_is_zombie(env, actor) {
+            continue;
+        }
+        hungers.push(zombie_farm_actor_hunger(env, actor).unwrap_or(0.0));
+    }
+    hungers
+}
+
+fn zombie_farm_zombie_eat_dates_near(
+    env: &mut Environment,
+    actor_list: id,
+    date_interval: f64,
+    tolerance: f64,
+) -> (u32, u32) {
+    let Some(count_selector) = env.objc.lookup_selector("count") else {
+        return (0, 0);
+    };
+    let Some(object_at_index_selector) = env.objc.lookup_selector("objectAtIndex:") else {
+        return (0, 0);
+    };
+    if !env
+        .objc
+        .object_has_method(&env.mem, actor_list, count_selector)
+        || !env
+            .objc
+            .object_has_method(&env.mem, actor_list, object_at_index_selector)
+    {
+        return (0, 0);
+    }
+
+    let count: NSUInteger = msg_send_no_type_checking(env, (actor_list, count_selector));
+    let mut zombies = 0u32;
+    let mut near = 0u32;
+    for idx in 0..count {
+        let actor: id = msg_send_no_type_checking(env, (actor_list, object_at_index_selector, idx));
+        if actor == nil || !zombie_farm_actor_is_zombie(env, actor) {
+            continue;
+        }
+        zombies += 1;
+        if let Some(eat_date) = zombie_farm_actor_eat_date(env, actor) {
+            if let Some(eat_interval) = zombie_farm_date_interval(env, eat_date) {
+                if (eat_interval - date_interval).abs() <= tolerance {
+                    near += 1;
+                }
+            }
+        }
+    }
+    (zombies, near)
+}
+
+fn zombie_farm_apply_offline_actor_hunger_to_list(
+    env: &mut Environment,
+    actor_list: id,
+    hunger_delta: f32,
+    now: id,
+    time_interval_since_date_selector: SEL,
+    source_hungers: Option<&[f32]>,
+) -> (u32, u32, f32) {
+    let Some(count_selector) = env.objc.lookup_selector("count") else {
+        return (0, 0, 0.0);
+    };
+    let Some(object_at_index_selector) = env.objc.lookup_selector("objectAtIndex:") else {
+        return (0, 0, 0.0);
+    };
+
+    if !env
+        .objc
+        .object_has_method(&env.mem, actor_list, count_selector)
+        || !env
+            .objc
+            .object_has_method(&env.mem, actor_list, object_at_index_selector)
+    {
+        return (0, 0, 0.0);
+    }
+
+    let count: NSUInteger = msg_send_no_type_checking(env, (actor_list, count_selector));
+    let mut zombies = 0u32;
+    let mut changed = 0u32;
+    let mut max_hunger = 0.0f32;
+
+    for idx in 0..count {
+        let actor: id = msg_send_no_type_checking(env, (actor_list, object_at_index_selector, idx));
+        if actor == nil || !zombie_farm_actor_is_zombie(env, actor) {
+            continue;
+        }
+        let zombie_idx = zombies as usize;
+        zombies += 1;
+
+        let old_hunger = source_hungers
+            .and_then(|hungers| hungers.get(zombie_idx).copied())
+            .or_else(|| zombie_farm_actor_hunger(env, actor))
+            .unwrap_or(0.0);
+        let eat_date_hunger = if old_hunger <= 0.001 {
+            zombie_farm_actor_eat_date(env, actor).and_then(|eat_date| {
+                if eat_date == nil
+                    || !env
+                        .objc
+                        .object_has_method(&env.mem, now, time_interval_since_date_selector)
+                {
+                    return None;
+                }
+                let elapsed_since_eat: f64 = msg_send_no_type_checking(
+                    env,
+                    (now, time_interval_since_date_selector, eat_date),
+                );
+                (elapsed_since_eat > 1.0 && elapsed_since_eat.is_finite())
+                    .then(|| (elapsed_since_eat / 86_400.0).clamp(0.0, 1.0) as f32)
+            })
+        } else {
+            None
+        };
+        let new_hunger = (old_hunger + hunger_delta)
+            .max(eat_date_hunger.unwrap_or(0.0))
+            .clamp(0.0, 1.0);
+        if new_hunger > old_hunger + 0.001 {
+            if !zombie_farm_set_actor_hunger(env, actor, new_hunger) {
+                continue;
+            }
+            changed += 1;
+        }
+        max_hunger = max_hunger.max(new_hunger);
+    }
+
+    (zombies, changed, max_hunger)
+}
+
+fn zombie_farm_apply_offline_actor_hunger(env: &mut Environment) {
+    static DISABLE_LOCAL_HUNGER: OnceLock<bool> = OnceLock::new();
+    let disable_local_hunger = *DISABLE_LOCAL_HUNGER.get_or_init(|| {
+        std::env::var("TOUCHHLE_ZF_DISABLE_LOCAL_HUNGER")
+            .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
+    });
+
+    if !zombie_farm_uses_playforge_bundle(env) || disable_local_hunger {
+        return;
+    }
+
+    let mut zombies = 0u32;
+    let mut changed = 0u32;
+    let mut max_elapsed = 0.0f64;
+    let mut max_hunger = 0.0f32;
+
+    let Some(game_state) = zombie_farm_get_game_state(env) else {
+        return;
+    };
+    let Some(save_date) = zombie_farm_game_state_save_date(env, game_state) else {
+        return;
+    };
+    let now: id = msg_class![env; NSDate date];
+    let Some(time_interval_since_date_selector) =
+        env.objc.lookup_selector("timeIntervalSinceDate:")
+    else {
+        return;
+    };
+    if !env
+        .objc
+        .object_has_method(&env.mem, now, time_interval_since_date_selector)
+    {
+        return;
+    }
+    let elapsed_since_save: f64 =
+        msg_send_no_type_checking(env, (now, time_interval_since_date_selector, save_date));
+    if !elapsed_since_save.is_finite() {
+        return;
+    }
+
+    let save_date_interval = zombie_farm_date_interval(env, save_date).unwrap_or(f64::NAN);
+    let saved_actor_list = zombie_farm_get_actor_list(env);
+    let saved_hungers = saved_actor_list
+        .map(|actor_list| zombie_farm_zombie_hungers_in_list(env, actor_list))
+        .unwrap_or_default();
+    let max_saved_hunger = saved_hungers.iter().copied().fold(0.0f32, f32::max);
+    let (save_date_zombies, eat_dates_near_save_date) = saved_actor_list
+        .map(|actor_list| {
+            zombie_farm_zombie_eat_dates_near(env, actor_list, save_date_interval, 2.0)
+        })
+        .unwrap_or((0, 0));
+    let save_date_looks_like_old_eat_date_workaround =
+        save_date_zombies > 0 && eat_dates_near_save_date * 2 >= save_date_zombies;
+    let already_applied_seconds = if save_date_looks_like_old_eat_date_workaround {
+        f64::from(max_saved_hunger) * 86_400.0
+    } else {
+        0.0
+    };
+    let hunger_delta =
+        ((elapsed_since_save - already_applied_seconds).max(0.0) / 86_400.0).clamp(0.0, 1.0) as f32;
+    if let Some(actor_list) = zombie_farm_get_actor_list(env) {
+        let (list_zombies, list_changed, list_max_hunger) =
+            zombie_farm_apply_offline_actor_hunger_to_list(
+                env,
+                actor_list,
+                hunger_delta,
+                now,
+                time_interval_since_date_selector,
+                None,
+            );
+        zombies += list_zombies;
+        changed += list_changed;
+        max_elapsed = max_elapsed.max(elapsed_since_save);
+        max_hunger = max_hunger.max(list_max_hunger);
+    }
+
+    if let Some(actor_list) = zombie_farm_get_live_actor_list(env) {
+        let (list_zombies, list_changed, list_max_hunger) =
+            zombie_farm_apply_offline_actor_hunger_to_list(
+                env,
+                actor_list,
+                hunger_delta,
+                now,
+                time_interval_since_date_selector,
+                (!saved_hungers.is_empty()).then_some(saved_hungers.as_slice()),
+            );
+        zombies += list_zombies;
+        changed += list_changed;
+        max_elapsed = max_elapsed.max(elapsed_since_save);
+        max_hunger = max_hunger.max(list_max_hunger);
+    }
+
+    zombie_farm_set_game_state_save_date(env, game_state, now);
+    log!(
+        "ZombieFarm status: local hunger advanced {}/{} zombie actor entries by {:.0}s since saveDate ({:.3} hunger), max hunger {:.3}",
+        changed,
+        zombies,
+        max_elapsed,
+        hunger_delta,
+        max_hunger
+    );
+}
+
+fn zombie_farm_prepare_local_server_date(env: &mut Environment, receiver: id, selector_name: &str) {
+    if !matches!(selector_name, "getServerTime" | "handleResponse:forAction:") {
+        return;
+    }
+
+    let regs = *env.cpu.regs();
+    let gui_layer = if zombie_farm_object_class_name(env, receiver) == Some("ZFGuiLayer") {
+        Some(receiver)
+    } else {
+        zombie_farm_get_gui_layer(env)
+    };
+    if let Some(gui_layer) = gui_layer {
+        zombie_farm_set_gui_layer_server_date_to_now(env, gui_layer);
+    }
+    env.cpu.regs_mut().copy_from_slice(&regs);
+}
+
+fn zombie_farm_apply_local_hunger_update(env: &mut Environment, receiver: id, selector_name: &str) {
+    if !matches!(
+        selector_name,
+        "startUpChecksComplete" | "handleTimeResponse:"
+    ) {
+        return;
+    }
+    let regs = *env.cpu.regs();
+    let gui_layer = if zombie_farm_object_class_name(env, receiver) == Some("ZFGuiLayer") {
+        Some(receiver)
+    } else {
+        zombie_farm_get_gui_layer(env)
+    };
+    let is_gui_layer = gui_layer
+        .map(|gui_layer| zombie_farm_set_gui_layer_server_date_to_now(env, gui_layer))
+        .unwrap_or(false);
+    let Some(apply_hunger_selector) = env.objc.lookup_selector("applyZombieHunger") else {
+        zombie_farm_apply_offline_actor_hunger(env);
+        env.cpu.regs_mut().copy_from_slice(&regs);
+        return;
+    };
+    if let Some(gui_layer) = gui_layer {
+        if is_gui_layer
+            && zombie_farm_ensure_game_state_save_date(env)
+            && !ZOMBIE_FARM_APPLIED_LOCAL_HUNGER.swap(true, Ordering::Relaxed)
+            && env
+                .objc
+                .object_has_method(&env.mem, gui_layer, apply_hunger_selector)
+        {
+            log!("ZombieFarm status: applying offline zombie hunger update");
+            let _: () = msg_send_no_type_checking(env, (gui_layer, apply_hunger_selector));
+        }
+    }
+    zombie_farm_apply_offline_actor_hunger(env);
+    env.cpu.regs_mut().copy_from_slice(&regs);
+}
+
+fn zombie_farm_prepare_local_hunger_update(env: &mut Environment, selector_name: &str) {
+    if !matches!(
+        selector_name,
+        "openMenu"
+            | "openMenuThroughMausoleum"
+            | "displayCurrentZombie"
+            | "updateSelectedZombieInfo"
+            | "displayHunger"
+            | "table:cellTouched:"
+    ) {
+        return;
+    }
+
+    let regs = *env.cpu.regs();
+    zombie_farm_ensure_game_state_save_date(env);
+    zombie_farm_apply_offline_actor_hunger(env);
+    env.cpu.regs_mut().copy_from_slice(&regs);
 }
 
 fn zombie_farm_md5sum_override(env: &mut Environment, selector_name: &str) -> Option<id> {
@@ -446,6 +1211,56 @@ fn trace_zombie_farm_layout_normal_return(env: &mut Environment, receiver: id, s
                     object_class_name
                 );
             }
+        }
+        _ => {}
+    }
+}
+
+fn trace_zombie_farm_status_normal_return(env: &mut Environment, receiver: id, selector: SEL) {
+    if !env
+        .bundle
+        .bundle_identifier()
+        .starts_with("com.playforge.Z")
+        || receiver == nil
+    {
+        return;
+    }
+    let selector_name = selector.as_str(&env.mem);
+    let class = ObjC::read_isa(receiver, &env.mem);
+    if class == nil {
+        return;
+    }
+    let Some(class_name) = env.objc.try_get_class_name(class) else {
+        return;
+    };
+    if !trace_zombie_farm_status_message(class_name, selector_name) {
+        return;
+    }
+    match selector_name {
+        "timeIntervalSinceDate:"
+        | "timeIntervalSinceNow"
+        | "timeIntervalSince1970"
+        | "timeIntervalSinceReferenceDate" => {
+            let mut bytes = [0u8; 8];
+            bytes[0..4].copy_from_slice(&env.cpu.regs()[0].to_le_bytes());
+            bytes[4..8].copy_from_slice(&env.cpu.regs()[1].to_le_bytes());
+            let value = f64::from_bits(u64::from_le_bytes(bytes));
+            log!(
+                "ZombieFarm status: [{} {}] receiver {:?} return {:.3}",
+                class_name,
+                selector_name,
+                receiver,
+                value
+            );
+        }
+        "saveDate" | "addTimeInterval:" | "getBeginningOfTheDayFromDate:" => {
+            log!(
+                "ZombieFarm status: [{} {}] receiver {:?} return object {:?}",
+                class_name,
+                selector_name,
+                receiver,
+                id::from_bits(env.cpu.regs()[0])
+            );
         }
         _ => {}
     }
@@ -661,6 +1476,15 @@ fn objc_msgSend_inner(
         env.cpu.regs_mut()[0..2].fill(0);
         return;
     }
+    if receiver.to_bits() < env.mem.null_segment_size() || receiver.to_bits() % 4 != 0 {
+        log!(
+            "Warning: ignoring {} sent to invalid low ObjC pointer {:?}",
+            selector.as_str(&env.mem),
+            receiver
+        );
+        env.cpu.regs_mut()[0..2].fill(0);
+        return;
+    }
 
     let orig_class = super2.unwrap_or_else(|| ObjC::read_isa(receiver, &env.mem));
     if orig_class == nil {
@@ -688,6 +1512,12 @@ fn objc_msgSend_inner(
     if zombie_farm_disable_cctable_cell_reuse(env, receiver, &selector_name) {
         return;
     }
+    zombie_farm_prepare_game_state_save_date(env, receiver, &selector_name);
+    if zombie_farm_override_game_state_save_date_setter(env, receiver, &selector_name) {
+        return;
+    }
+    zombie_farm_prepare_local_server_date(env, receiver, &selector_name);
+    zombie_farm_prepare_local_hunger_update(env, &selector_name);
     let regs_before_zombie_farm_prepare = *env.cpu.regs();
     zombie_farm_prepare_cctable_cell(env, receiver, selector);
     env.cpu
@@ -760,39 +1590,55 @@ fn objc_msgSend_inner(
 
             if let Some(imp) = methods.get(&selector) {
                 log_dbg!("Found method on: {}", name);
-                let selector_name = selector.as_str(&env.mem);
-                let receiver_class_name = env.objc.try_get_class_name(orig_class).unwrap_or(name);
+                let selector_name_owned = selector.as_str(&env.mem).to_string();
+                let selector_name = selector_name_owned.as_str();
+                let receiver_class_name_owned = env
+                    .objc
+                    .try_get_class_name(orig_class)
+                    .unwrap_or(name)
+                    .to_string();
+                let receiver_class_name = receiver_class_name_owned.as_str();
                 let trace_zombie_farm_layout =
                     trace_zombie_farm_layout_message(receiver_class_name, selector_name)
                         || trace_zombie_farm_layout_message(name, selector_name);
-                if trace_zombie_farm_status_message(receiver_class_name, selector_name)
-                    || trace_zombie_farm_status_message(name, selector_name)
-                    || trace_zombie_farm_layout
-                {
+                let trace_zombie_farm_status =
+                    trace_zombie_farm_status_message(receiver_class_name, selector_name)
+                        || trace_zombie_farm_status_message(name, selector_name);
+                let record_zombie_farm_hunger =
+                    crate::zombie_farm_debug::should_record_hunger_message(
+                        receiver_class_name,
+                        selector_name,
+                    ) || crate::zombie_farm_debug::should_record_hunger_message(
+                        name,
+                        selector_name,
+                    );
+                let trace_zombie_farm_apply_scope = zombie_farm_uses_playforge_bundle(env)
+                    && selector_name == "applyZombieHunger"
+                    && (receiver_class_name == "ZFGuiLayer" || name == "ZFGuiLayer");
+                let record_zombie_farm_apply_trace =
+                    ZOMBIE_FARM_APPLY_TRACE_DEPTH.load(Ordering::Relaxed) > 0
+                        && (crate::zombie_farm_debug::should_record_apply_trace_message(
+                            receiver_class_name,
+                            selector_name,
+                        ) || crate::zombie_farm_debug::should_record_apply_trace_message(
+                            name,
+                            selector_name,
+                        ));
+                if trace_zombie_farm_status || trace_zombie_farm_layout {
                     let imp_description = match imp {
                         IMP::Host(_) => "host".to_string(),
                         IMP::Guest(guest_imp) => format!("{:?}", guest_imp),
                     };
-                    let arg_description =
+                    let arg_description = if trace_zombie_farm_status {
+                        zombie_farm_status_arg_details(selector_name, env.cpu.regs())
+                    } else {
                         zombie_farm_layout_arg_details(selector_name, env.cpu.regs())
-                            .map(|arg| format!(" {}", arg))
-                            .unwrap_or_default();
-                    crate::zombie_farm_debug::record_table_args(
-                        receiver,
-                        receiver_class_name,
-                        selector_name,
-                        env.cpu.regs(),
-                    );
-                    crate::zombie_farm_debug::record_layout_event(format!(
-                        "[0x{:x} {} {}]{}",
-                        receiver.to_bits(),
-                        receiver_class_name,
-                        selector_name,
-                        arg_description
-                    ));
-                    if trace_zombie_farm_layout_to_console(selector_name) {
-                        log_dbg!(
-                            "ZombieFarm trace: [{} {}] receiver {:?}, implementation class {}, imp {}{}",
+                    }
+                    .map(|arg| format!(" {}", arg))
+                    .unwrap_or_default();
+                    if trace_zombie_farm_status {
+                        log!(
+                            "ZombieFarm status: [{} {}] receiver {:?}, implementation class {}, imp {}{}",
                             receiver_class_name,
                             selector_name,
                             receiver,
@@ -801,6 +1647,57 @@ fn objc_msgSend_inner(
                             arg_description,
                         );
                     }
+                    if trace_zombie_farm_layout {
+                        crate::zombie_farm_debug::record_table_args(
+                            receiver,
+                            receiver_class_name,
+                            selector_name,
+                            env.cpu.regs(),
+                        );
+                        crate::zombie_farm_debug::record_layout_event(format!(
+                            "[0x{:x} {} {}]{}",
+                            receiver.to_bits(),
+                            receiver_class_name,
+                            selector_name,
+                            arg_description
+                        ));
+                        if trace_zombie_farm_layout_to_console(selector_name) {
+                            log_dbg!(
+                                "ZombieFarm trace: [{} {}] receiver {:?}, implementation class {}, imp {}{}",
+                                receiver_class_name,
+                                selector_name,
+                                receiver,
+                                name,
+                                imp_description,
+                                arg_description,
+                            );
+                        }
+                    }
+                }
+                if record_zombie_farm_hunger || record_zombie_farm_apply_trace {
+                    let regs_before = *env.cpu.regs();
+                    if record_zombie_farm_hunger {
+                        crate::zombie_farm_debug::record_hunger_message(
+                            env,
+                            receiver,
+                            receiver_class_name,
+                            selector_name,
+                            &regs_before,
+                        );
+                    }
+                    if record_zombie_farm_apply_trace {
+                        crate::zombie_farm_debug::record_apply_trace_message(
+                            env,
+                            receiver,
+                            receiver_class_name,
+                            selector_name,
+                            &regs_before,
+                        );
+                    }
+                }
+                let selector_name_for_after = selector_name.to_string();
+                if trace_zombie_farm_apply_scope {
+                    ZOMBIE_FARM_APPLY_TRACE_DEPTH.fetch_add(1, Ordering::Relaxed);
                 }
                 match imp {
                     IMP::Host(host_imp) => {
@@ -837,9 +1734,32 @@ Type mismatch when sending message {} to {:?}!
                     // interfere with pass-through of stack arguments.
                     IMP::Guest(guest_imp) => guest_imp.call_without_pushing_stack_frame(env),
                 }
+                if trace_zombie_farm_apply_scope {
+                    ZOMBIE_FARM_APPLY_TRACE_DEPTH.fetch_sub(1, Ordering::Relaxed);
+                }
                 if trace_zombie_farm_layout {
                     trace_zombie_farm_layout_normal_return(env, receiver, selector);
                 }
+                if trace_zombie_farm_status {
+                    trace_zombie_farm_status_normal_return(env, receiver, selector);
+                }
+                if record_zombie_farm_hunger {
+                    crate::zombie_farm_debug::record_hunger_return(
+                        env,
+                        receiver,
+                        receiver_class_name,
+                        selector_name,
+                    );
+                }
+                if record_zombie_farm_apply_trace {
+                    crate::zombie_farm_debug::record_apply_trace_return(
+                        env,
+                        receiver,
+                        receiver_class_name,
+                        selector_name,
+                    );
+                }
+                zombie_farm_apply_local_hunger_update(env, receiver, &selector_name_for_after);
                 return;
             } else {
                 class = superclass;

@@ -10,6 +10,7 @@ use super::{NSComparisonResult, NSTimeInterval};
 use crate::frameworks::core_foundation::time::{
     apple_epoch, CFAbsoluteTimeGetGregorianDate, SECS_FROM_UNIX_TO_APPLE_EPOCHS,
 };
+use crate::libc::time::emulated_system_time;
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
     NSZonePtr,
@@ -25,6 +26,16 @@ pub(super) struct NSDateHostObject {
 }
 impl HostObject for NSDateHostObject {}
 
+pub(crate) fn debug_time_interval(env: &crate::Environment, date: id) -> Option<NSTimeInterval> {
+    let mut host_object = env.objc.get_host_object(date)?;
+    loop {
+        if let Some(date) = host_object.as_any().downcast_ref::<NSDateHostObject>() {
+            return Some(date.time_interval);
+        }
+        host_object = host_object.as_superclass()?;
+    }
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -37,7 +48,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (NSTimeInterval)timeIntervalSinceReferenceDate {
-    SystemTime::now()
+    emulated_system_time()
         .duration_since(apple_epoch())
         .unwrap()
         .as_secs_f64()
@@ -46,7 +57,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)date {
     let new: id = msg![env; this alloc];
     let new: id = msg![env; new init];
-    log_dbg!("[NSDate date] => {:?} ({:?}s)", new, env.objc.borrow::<NSDateHostObject>(this).time_interval);
+    log_dbg!("[NSDate date] => {:?} ({:?}s)", new, env.objc.borrow::<NSDateHostObject>(new).time_interval);
     autorelease(env, new)
 }
 
@@ -54,7 +65,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // As of 2024, this approximately corresponds to 20 years into the future.
     // While `distantFuture` docs are talking in terms of centuries,
     // this should be OK to use for our purposes.
-    let time_interval = SystemTime::now()
+    let time_interval = emulated_system_time()
         .duration_since(apple_epoch())
         .unwrap()
         .as_secs_f64() * 2.0;
@@ -110,7 +121,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)init {
     // "Date objects are immutable, representing an invariant time interval
     // relative to an absolute reference date (00:00:00 UTC on 1 January 2001)."
-    let time_interval = SystemTime::now()
+    let time_interval = emulated_system_time()
         .duration_since(apple_epoch())
         .unwrap()
         .as_secs_f64();
@@ -126,7 +137,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)initWithTimeIntervalSinceNow:(NSTimeInterval)secs {
-    let time_interval = SystemTime::now()
+    let time_interval = emulated_system_time()
         .duration_since(apple_epoch())
         .unwrap()
         .as_secs_f64();
@@ -165,7 +176,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (NSTimeInterval)timeIntervalSinceDate:(id)anotherDate {
-    assert!(!anotherDate.is_null());
+    if anotherDate.is_null() {
+        log!(
+            "Warning: NSDate timeIntervalSinceDate:nil, returning 0.0"
+        );
+        return 0.0;
+    }
     let host_object = env.objc.borrow::<NSDateHostObject>(this);
     let another_date_host_object = env.objc.borrow::<NSDateHostObject>(anotherDate);
     let result =  host_object.time_interval-another_date_host_object.time_interval;
@@ -179,11 +195,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (NSTimeInterval)timeIntervalSinceNow {
     let host_object = env.objc.borrow::<NSDateHostObject>(this);
-    let time_interval = SystemTime::now()
+    let time_interval = emulated_system_time()
         .duration_since(apple_epoch())
         .unwrap()
         .as_secs_f64();
-    time_interval - host_object.time_interval
+    host_object.time_interval - time_interval
 }
 
 - (NSTimeInterval)timeIntervalSince1970 {

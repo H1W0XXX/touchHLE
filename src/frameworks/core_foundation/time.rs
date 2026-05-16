@@ -8,7 +8,7 @@
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::frameworks::core_foundation::CFTypeRef;
 use crate::frameworks::foundation::NSTimeInterval;
-use crate::libc::time::{time_t, timestamp_to_calendar_date};
+use crate::libc::time::{emulated_system_time, time_t, timestamp_to_calendar_date};
 use crate::mem::SafeRead;
 use crate::objc::{id, msg, msg_class, nil};
 use crate::{impl_GuestRet_for_large_struct, Environment};
@@ -42,7 +42,7 @@ impl_GuestRet_for_large_struct!(CFGregorianDate);
 /// Absolute time is measured in seconds relative to the absolute reference date
 /// of Jan 1 2001 00:00:00 GMT.
 fn CFAbsoluteTimeGetCurrent(_env: &mut Environment) -> CFAbsoluteTime {
-    SystemTime::now()
+    emulated_system_time()
         .duration_since(apple_epoch())
         .unwrap()
         .as_secs_f64()
@@ -81,7 +81,14 @@ pub fn CFAbsoluteTimeGetGregorianDate(
 }
 
 fn CFAbsoluteTimeGetDayOfWeek(env: &mut Environment, at: CFAbsoluteTime, tz: CFTimeZoneRef) -> i32 {
-    CFAbsoluteTimeGetGregorianDate(env, at, tz).day.into()
+    let mut unix_timestamp = SECS_FROM_UNIX_TO_APPLE_EPOCHS as i64 + at.floor() as i64;
+    if tz != nil {
+        let offset: i32 = msg![env; (tz as id) secondsFromGMT];
+        unix_timestamp += i64::from(offset);
+    }
+    // 1 = Sunday. The Unix epoch, 1970-01-01, was a Thursday.
+    let days_since_unix_epoch = unix_timestamp.div_euclid(86_400);
+    1 + (days_since_unix_epoch + 4).rem_euclid(7) as i32
 }
 
 pub const FUNCTIONS: FunctionExports = &[

@@ -212,6 +212,8 @@ pub fn dump_debug_inspector(env: &mut Environment) {
 
         crate::zombie_farm_debug::write_snapshot(&mut file)?;
         writeln!(file)?;
+        crate::zombie_farm_debug::write_actor_snapshot(env, &mut file)?;
+        writeln!(file)?;
         writeln!(file, "== UIKit View Hierarchy ==")?;
         let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
         if windows.is_empty() {
