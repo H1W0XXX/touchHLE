@@ -177,7 +177,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     if bundle_id.starts_with("com.playforge.ZombieFarm")
         || bundle_id.starts_with("com.playforge.ZFR")
     {
-        log!(
+        log_dbg!(
             "ZombieFarm trace: UIControl {:?} setEnabled:{}",
             this,
             enabled,
@@ -241,7 +241,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     };
     if !msg![env; this isEnabled] && !is_zombie_farm_start_button_ready {
         if is_zombie_farm {
-            log!(
+            log_dbg!(
                 "ZombieFarm trace: UIControl {:?} ignored touchesBegan because it is disabled",
                 this,
             );
@@ -249,7 +249,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         return;
     }
     if is_zombie_farm_start_button_ready && !msg![env; this isEnabled] {
-        log!(
+        log_dbg!(
             "ZombieFarm trace: allowing Play touch on disabled control {:?} after startup player determination",
             this,
         );
@@ -260,7 +260,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let touch: id = msg![env; touches anyObject];
     if !msg![env; this beginTrackingWithTouch:touch withEvent:event] {
         if is_zombie_farm {
-            log!(
+            log_dbg!(
                 "ZombieFarm trace: UIControl {:?} beginTrackingWithTouch returned false",
                 this,
             );
@@ -362,7 +362,7 @@ forControlEvents:(UIControlEvents)events {
     if bundle_id.starts_with("com.playforge.ZombieFarm")
         || bundle_id.starts_with("com.playforge.ZFR")
     {
-        log!(
+        log_dbg!(
             "ZombieFarm trace: UIControl {:?} addTarget {:?} action {:?} events {:?}",
             this,
             target,

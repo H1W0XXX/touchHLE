@@ -5,8 +5,10 @@
  */
 
 use crate::dyld::{ConstantExports, HostConstant};
-use crate::frameworks::foundation::NSInteger;
-use crate::objc::{id, nil, release, retain, ClassExports, HostObject, NSZonePtr};
+use crate::frameworks::foundation::{ns_string, NSInteger};
+use crate::objc::{
+    autorelease, id, msg, nil, release, retain, ClassExports, HostObject, NSZonePtr,
+};
 use crate::objc_classes;
 
 /// `NSString*`
@@ -62,6 +64,43 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (NSInteger)code {
     env.objc.borrow::<ErrorHostObject>(this).code
+}
+
+- (NSErrorDomain)domain {
+    env.objc.borrow::<ErrorHostObject>(this).domain
+}
+
+- (id)userInfo {
+    env.objc.borrow::<ErrorHostObject>(this).user_info
+}
+
+- (id)localizedDescription {
+    let &ErrorHostObject {
+        domain,
+        code,
+        user_info,
+    } = env.objc.borrow(this);
+
+    if user_info != nil {
+        let key = ns_string::get_static_str(env, "NSLocalizedDescriptionKey");
+        let description: id = msg![env; user_info objectForKey:key];
+        if description != nil {
+            return description;
+        }
+    }
+
+    let domain = if domain == nil {
+        "(null)".to_string()
+    } else {
+        ns_string::to_rust_string(env, domain).into_owned()
+    };
+    let description = format!("The operation couldn't be completed. ({domain} error {code}.)");
+    let description = ns_string::from_rust_string(env, description);
+    autorelease(env, description)
+}
+
+- (id)description {
+    msg![env; this localizedDescription]
 }
 
 @end
