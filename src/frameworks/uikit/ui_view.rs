@@ -17,6 +17,7 @@ pub mod ui_scroll_view;
 pub mod ui_web_view;
 pub mod ui_window;
 
+use super::ui_gesture_recognizer;
 use super::ui_graphics::{UIGraphicsPopContext, UIGraphicsPushContext};
 use crate::abi::CallFromHost;
 use crate::frameworks::core_animation::ca_layer;
@@ -83,9 +84,11 @@ pub(super) struct UIViewHostObject {
     superview: id,
     /// The view controller that controls this view. This is a weak reference
     view_controller: id,
+    gesture_recognizers: Vec<id>,
     tag: NSInteger,
     clips_to_bounds: bool,
     clears_context_before_drawing: bool,
+    content_mode: NSInteger,
     user_interaction_enabled: bool,
     multiple_touch_enabled: bool,
 }
@@ -99,9 +102,11 @@ impl Default for UIViewHostObject {
             subviews: Vec::new(),
             superview: nil,
             view_controller: nil,
+            gesture_recognizers: Vec::new(),
             tag: 0,
             clips_to_bounds: false,
             clears_context_before_drawing: true,
+            content_mode: 0,
             user_interaction_enabled: true,
             multiple_touch_enabled: false,
         }
@@ -116,6 +121,115 @@ fn is_zombie_farm(env: &Environment) -> bool {
     env.bundle
         .bundle_identifier()
         .starts_with("com.playforge.Z")
+}
+
+fn is_zombie_farm_2(env: &Environment) -> bool {
+    env.bundle.bundle_identifier() == "com.playforge.ZombieFarm2"
+}
+
+fn zombie_farm_view_layer_bounds_position(
+    env: &Environment,
+    view: id,
+) -> Option<(CGRect, CGPoint)> {
+    if view == nil || env.objc.get_host_object(view).is_none() {
+        return None;
+    }
+    let layer = env.objc.borrow::<UIViewHostObject>(view).layer;
+    if layer == nil || env.objc.get_host_object(layer).is_none() {
+        return None;
+    }
+    let (_delegate, bounds, position, _anchor, _sublayers) =
+        ca_layer::diagnostic_snapshot(&env.objc, layer);
+    Some((bounds, position))
+}
+
+fn zombie_farm_is_hud_root(env: &Environment, view: id) -> bool {
+    if view == nil || env.objc.get_host_object(view).is_none() {
+        return false;
+    }
+    let host = env.objc.borrow::<UIViewHostObject>(view);
+    if host.user_interaction_enabled || host.subviews.len() < 20 {
+        return false;
+    }
+    let Some((bounds, position)) = zombie_farm_view_layer_bounds_position(env, view) else {
+        return false;
+    };
+    bounds.origin == (CGPoint { x: 0.0, y: 0.0 })
+        && bounds.size.width >= 1024.0
+        && bounds.size.height >= 768.0
+        && position.x == 512.0
+        && position.y == 384.0
+}
+
+fn zombie_farm_should_force_hud_visible(env: &Environment, view: id) -> bool {
+    if !is_zombie_farm_2(env) || view == nil || env.objc.get_host_object(view).is_none() {
+        return false;
+    }
+
+    let class_name = debug_class_name(env, view);
+    let superview = env.objc.borrow::<UIViewHostObject>(view).superview;
+    if !zombie_farm_is_hud_root(env, superview) {
+        return false;
+    }
+    let Some((_bounds, position)) = zombie_farm_view_layer_bounds_position(env, view) else {
+        return false;
+    };
+
+    let is_hud_widget = class_name.contains("Button")
+        || class_name == "UIImageView"
+        || class_name == "FarmHUDQuestIcon";
+    is_hud_widget && (position.x >= 940.0 || class_name == "FarmHUDQuestIcon")
+}
+
+fn zombie_farm_adjust_forced_hud_visible_view(env: &mut Environment, view: id) {
+    if debug_class_name(env, view) != "Toolbar" {
+        return;
+    }
+    let Some((_bounds, position)) = zombie_farm_view_layer_bounds_position(env, view) else {
+        return;
+    };
+    if position.x <= 1024.0 {
+        return;
+    }
+    let center = CGPoint {
+        x: 796.0,
+        y: position.y,
+    };
+    () = msg![env; view setCenter:center];
+}
+
+fn zombie_farm_force_hud_visible_if_needed(env: &mut Environment, view: id) -> bool {
+    if !zombie_farm_should_force_hud_visible(env, view) {
+        return false;
+    }
+    zombie_farm_adjust_forced_hud_visible_view(env, view);
+    let layer = env.objc.borrow::<UIViewHostObject>(view).layer;
+    if layer != nil && env.objc.get_host_object(layer).is_some() {
+        () = msg![env; layer setHidden:false];
+    }
+    true
+}
+
+fn zombie_farm_reveal_farm_hud_controls_inner(env: &mut Environment, view: id) -> u32 {
+    if view == nil || env.objc.get_host_object(view).is_none() {
+        return 0;
+    }
+
+    let subviews = env.objc.borrow::<UIViewHostObject>(view).subviews.clone();
+    let mut revealed = u32::from(zombie_farm_force_hud_visible_if_needed(env, view));
+    for subview in subviews {
+        revealed += zombie_farm_reveal_farm_hud_controls_inner(env, subview);
+    }
+    revealed
+}
+
+pub fn reveal_zombie_farm_hud_controls(env: &mut Environment) -> u32 {
+    let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
+    let mut revealed = 0;
+    for window in windows {
+        revealed += zombie_farm_reveal_farm_hud_controls_inner(env, window);
+    }
+    revealed
 }
 
 fn live_layer_or_nil(env: &mut Environment, view: id, selector_name: &str) -> id {
@@ -183,8 +297,33 @@ fn dump_view_tree_inner(
     let superview = host.superview;
 
     let layer_summary = if layer != nil && env.objc.get_host_object(layer).is_some() {
-        let (_delegate, bounds, _sublayers) = ca_layer::diagnostic_snapshot(&env.objc, layer);
-        format!("layer=0x{:x} bounds={:?}", layer.to_bits(), bounds)
+        let (_delegate, bounds, position, anchor, _sublayers) =
+            ca_layer::diagnostic_snapshot(&env.objc, layer);
+        let (
+            hidden,
+            opaque,
+            opacity,
+            has_background,
+            has_contents,
+            has_presented_pixels,
+            has_cg_context,
+            has_gl_texture,
+        ) = ca_layer::diagnostic_render_snapshot(&env.objc, layer);
+        format!(
+            "layer=0x{:x} bounds={:?} position={} anchor={} hidden={} opaque={} opacity={} bg={} contents={} presented_pixels={} cg_context={} gl_texture={}",
+            layer.to_bits(),
+            bounds,
+            position,
+            anchor,
+            hidden,
+            opaque,
+            opacity,
+            has_background,
+            has_contents,
+            has_presented_pixels,
+            has_cg_context,
+            has_gl_texture,
+        )
     } else {
         format!("layer=0x{:x} <missing host object>", layer.to_bits())
     };
@@ -244,6 +383,99 @@ pub fn dump_debug_inspector(env: &mut Environment) {
             log!("Failed to write inspector dump {}: {}", path.display(), err);
         }
     }
+}
+
+fn remove_subviews_by_class_inner(env: &mut Environment, view: id, class_name: &str) -> u32 {
+    if view == nil || env.objc.get_host_object(view).is_none() {
+        return 0;
+    }
+
+    let subviews = env.objc.borrow::<UIViewHostObject>(view).subviews.clone();
+    let mut removed = 0;
+    for subview in subviews {
+        if debug_class_name(env, subview) == class_name {
+            () = msg![env; subview removeFromSuperview];
+            removed += 1;
+        } else {
+            removed += remove_subviews_by_class_inner(env, subview, class_name);
+        }
+    }
+    removed
+}
+
+fn has_subviews(env: &Environment, view: id) -> bool {
+    env.objc.get_host_object(view).is_some_and(|_| {
+        !env.objc
+            .borrow::<UIViewHostObject>(view)
+            .subviews
+            .is_empty()
+    })
+}
+
+fn zombie_farm_touch_trace_enabled(env: &Environment) -> bool {
+    is_zombie_farm(env) && std::env::var("TOUCHHLE_ZF2_TOUCH_TRACE").ok().as_deref() == Some("1")
+}
+
+fn zombie_farm_direct_control_hit_test(env: &mut Environment, view: id, point: CGPoint) -> id {
+    let view_layer = env.objc.borrow::<UIViewHostObject>(view).layer;
+    let subviews = env.objc.borrow::<UIViewHostObject>(view).subviews.clone();
+    for subview in subviews.into_iter().rev() {
+        let hidden: bool = msg![env; subview isHidden];
+        let alpha: CGFloat = msg![env; subview alpha];
+        if hidden || alpha < 0.01 || env.objc.get_host_object(subview).is_none() {
+            continue;
+        }
+
+        let layer = env.objc.borrow::<UIViewHostObject>(subview).layer;
+        if layer == nil || env.objc.get_host_object(layer).is_none() {
+            continue;
+        }
+        let local: CGPoint = msg![env; layer convertPoint:point fromLayer:view_layer];
+        let contains: bool = msg![env; layer containsPoint:local];
+        if !contains {
+            continue;
+        }
+
+        let hit = zombie_farm_direct_control_hit_test(env, subview, local);
+        if hit != nil {
+            return hit;
+        }
+
+        let interactible: bool = msg![env; subview isUserInteractionEnabled];
+        if !interactible {
+            continue;
+        }
+        let ui_control_class = env.objc.get_known_class("UIControl", &mut env.mem);
+        let class: Class = msg![env; subview class];
+        let class_name = debug_class_name(env, subview);
+        if env.objc.class_is_subclass_of(class, ui_control_class)
+            || class_name.contains("Button")
+            || class_name == "FarmHUDQuestIcon"
+        {
+            if is_zombie_farm_2(env) || zombie_farm_touch_trace_enabled(env) {
+                log!(
+                    "ZombieFarm2 UI hit trace: direct hit {:?} ({}) parent {:?} ({}) point {} local {}",
+                    subview,
+                    class_name,
+                    view,
+                    debug_class_name(env, view),
+                    point,
+                    local,
+                );
+            }
+            return subview;
+        }
+    }
+    nil
+}
+
+pub fn remove_subviews_by_class(env: &mut Environment, class_name: &str) -> u32 {
+    let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
+    let mut removed = 0;
+    for window in windows {
+        removed += remove_subviews_by_class_inner(env, window, class_name);
+    }
+    removed
 }
 
 fn call_animation_selector(
@@ -559,17 +791,17 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)viewWithTag:(NSInteger)tag {
-    let &UIViewHostObject {
-        ref subviews,
-        tag: view_tag,
-        ..
-    } = env.objc.borrow(this);
+    let (view_tag, subviews) = {
+        let host = env.objc.borrow::<UIViewHostObject>(this);
+        (host.tag, host.subviews.clone())
+    };
     if view_tag == tag {
         return this;
     }
-    for view in subviews {
-        if env.objc.borrow::<UIViewHostObject>(*view).tag == tag {
-            return *view;
+    for subview in subviews {
+        let found: id = msg![env; subview viewWithTag:tag];
+        if found != nil {
+            return found;
         }
     }
     nil
@@ -633,6 +865,71 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     let subs = ns_array::from_vec(env, views);
     autorelease(env, subs)
+}
+
+- (id)gestureRecognizers {
+    let recognizers = env.objc.borrow::<UIViewHostObject>(this).gesture_recognizers.clone();
+    for recognizer in &recognizers {
+        retain(env, *recognizer);
+    }
+    let array = ns_array::from_vec(env, recognizers);
+    autorelease(env, array)
+}
+
+- (())setGestureRecognizers:(id)recognizers {
+    let old_recognizers = std::mem::take(
+        &mut env.objc.borrow_mut::<UIViewHostObject>(this).gesture_recognizers
+    );
+    for recognizer in old_recognizers {
+        ui_gesture_recognizer::set_view(env, recognizer, nil);
+        release(env, recognizer);
+    }
+
+    if recognizers == nil {
+        return;
+    }
+
+    let count: NSUInteger = msg![env; recognizers count];
+    for idx in 0..count {
+        let recognizer: id = msg![env; recognizers objectAtIndex:idx];
+        () = msg![env; this addGestureRecognizer:recognizer];
+    }
+}
+
+- (())addGestureRecognizer:(id)recognizer {
+    if recognizer == nil {
+        return;
+    }
+
+    {
+        let gesture_recognizers =
+            &mut env.objc.borrow_mut::<UIViewHostObject>(this).gesture_recognizers;
+        if gesture_recognizers.contains(&recognizer) {
+            return;
+        }
+    }
+
+    retain(env, recognizer);
+    env.objc
+        .borrow_mut::<UIViewHostObject>(this)
+        .gesture_recognizers
+        .push(recognizer);
+    ui_gesture_recognizer::set_view(env, recognizer, this);
+}
+
+- (())removeGestureRecognizer:(id)recognizer {
+    if recognizer == nil {
+        return;
+    }
+
+    let gesture_recognizers = &mut env.objc.borrow_mut::<UIViewHostObject>(this).gesture_recognizers;
+    let Some(idx) = gesture_recognizers.iter().position(|&item| item == recognizer) else {
+        return;
+    };
+
+    let recognizer = gesture_recognizers.remove(idx);
+    ui_gesture_recognizer::set_view(env, recognizer, nil);
+    release(env, recognizer);
 }
 
 - (())addSubview:(id)view {
@@ -802,9 +1099,11 @@ pub const CLASSES: ClassExports = objc_classes! {
         superview,
         subviews,
         view_controller,
+        gesture_recognizers,
         tag: _,
         clips_to_bounds: _,
         clears_context_before_drawing: _,
+        content_mode: _,
         user_interaction_enabled: _,
         multiple_touch_enabled: _,
     } = std::mem::take(env.objc.borrow_mut(this));
@@ -815,6 +1114,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     for subview in subviews {
         env.objc.borrow_mut::<UIViewHostObject>(subview).superview = nil;
         release(env, subview);
+    }
+    for recognizer in gesture_recognizers {
+        ui_gesture_recognizer::set_view(env, recognizer, nil);
+        release(env, recognizer);
     }
 
     let state = &mut env.framework_state.uikit.ui_view.views;
@@ -1046,7 +1349,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())setContentMode:(NSInteger)content_mode { // should be UIViewContentMode
-    todo_objc_setter!(this, content_mode);
+    env.objc.borrow_mut::<UIViewHostObject>(this).content_mode = content_mode;
+}
+- (NSInteger)contentMode {
+    env.objc.borrow::<UIViewHostObject>(this).content_mode
 }
 
 - (bool)clearsContextBeforeDrawing {
@@ -1087,13 +1393,43 @@ pub const CLASSES: ClassExports = objc_classes! {
     if !msg![env; this pointInside:point withEvent:event] {
         return nil;
     }
+    if is_zombie_farm(env) && debug_class_name(env, this) == "EAGLView" {
+        let trace_enabled = zombie_farm_touch_trace_enabled(env);
+        if trace_enabled {
+            log!("ZombieFarm2 UI hit trace: EAGLView hitTest point {}", point);
+        }
+        let mut hit = zombie_farm_direct_control_hit_test(env, this, point);
+        if hit == nil {
+            let window: id = msg![env; this window];
+            if window != nil {
+                let window_bounds: CGRect = msg![env; window bounds];
+                let landscape_point = CGPoint {
+                    x: point.x,
+                    y: window_bounds.size.height - point.y,
+                };
+                if trace_enabled {
+                    log!(
+                        "ZombieFarm2 UI hit trace: trying y-flipped point {} with window bounds {}",
+                        landscape_point,
+                        window_bounds,
+                    );
+                }
+                hit = zombie_farm_direct_control_hit_test(env, this, landscape_point);
+            }
+        }
+        if hit != nil {
+            return hit;
+        }
+    }
     // TODO: avoid copy somehow?
     let subviews = env.objc.borrow::<UIViewHostObject>(this).subviews.clone();
     for subview in subviews.into_iter().rev() { // later views are on top
         let hidden: bool = msg![env; subview isHidden];
         let alpha: CGFloat = msg![env; subview alpha];
         let interactible: bool = msg![env; subview isUserInteractionEnabled];
-        if hidden || alpha < 0.01 || !interactible {
+        let zombie_farm_disabled_container =
+            is_zombie_farm(env) && !interactible && has_subviews(env, subview);
+        if hidden || alpha < 0.01 || (!interactible && !zombie_farm_disabled_container) {
            continue;
         }
         let point: CGPoint = msg![env; subview convertPoint:point fromView:this];
@@ -1101,6 +1437,23 @@ pub const CLASSES: ClassExports = objc_classes! {
         if subview != nil {
             return subview;
         }
+    }
+    if is_zombie_farm(env) {
+        let interactible: bool = msg![env; this isUserInteractionEnabled];
+        if !interactible {
+            return nil;
+        }
+    }
+    if is_zombie_farm(env) && debug_class_name(env, this) == "WhiteDimLayer" {
+        log!("ZombieFarm workaround: ignoring stale WhiteDimLayer {:?} during hit testing", this);
+        return nil;
+    }
+    if is_zombie_farm(env) && debug_class_name(env, this) == "PermeableView" {
+        log_dbg!(
+            "ZombieFarm workaround: letting PermeableView {:?} pass through hit testing",
+            this,
+        );
+        return nil;
     }
     this
 }

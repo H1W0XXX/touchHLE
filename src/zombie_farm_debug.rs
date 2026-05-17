@@ -1,7 +1,8 @@
 use crate::frameworks::core_foundation::time::SECS_FROM_UNIX_TO_APPLE_EPOCHS;
-use crate::frameworks::core_graphics::{CGPoint, CGSize};
+use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::{ns_date, ns_string, NSUInteger};
 use crate::fs::GuestPath;
+use crate::mem::ConstVoidPtr;
 use crate::objc::{id, msg_send_no_type_checking, nil, ObjC};
 use crate::Environment;
 use std::collections::{BTreeMap, VecDeque};
@@ -36,6 +37,12 @@ static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 
 fn state() -> &'static Mutex<State> {
     STATE.get_or_init(|| Mutex::new(State::default()))
+}
+
+pub fn enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("TOUCHHLE_ZOMBIE_FARM_DEBUG").ok().as_deref() == Some("1"))
 }
 
 fn push_recent(recent: &mut VecDeque<String>, line: String) {
@@ -242,10 +249,9 @@ fn string_object_to_debug(env: &mut Environment, string: id) -> String {
         return "nil".to_string();
     }
 
-    let class = ObjC::read_isa(string, &env.mem);
-    if class == nil {
-        return format!("0x{:x} <nil isa>", string.to_bits());
-    }
+    let Some(class) = debug_object_class(env, string) else {
+        return format!("0x{:x} <invalid object>", string.to_bits());
+    };
 
     let class_name = env
         .objc
@@ -264,6 +270,10 @@ fn string_object_to_debug(env: &mut Environment, string: id) -> String {
 fn object_to_debug(env: &Environment, object: id) -> String {
     if object == nil {
         return "nil".to_string();
+    }
+
+    if debug_object_class(env, object).is_none() {
+        return format!("0x{:x} <invalid object>", object.to_bits());
     }
 
     format!("0x{:x} {}", object.to_bits(), debug_class_name(env, object))
@@ -593,17 +603,43 @@ fn debug_class_name(env: &Environment, object: id) -> String {
     if object == nil {
         return "nil".to_string();
     }
-    let class = ObjC::read_isa(object, &env.mem);
-    if class == nil {
-        return "<nil isa>".to_string();
-    }
+    let Some(class) = debug_object_class(env, object) else {
+        return "<invalid object>".to_string();
+    };
     env.objc
         .try_get_class_name(class)
         .unwrap_or("<unknown class>")
         .to_string()
 }
 
+fn debug_object_class(env: &Environment, object: id) -> Option<id> {
+    let bits = object.to_bits();
+    if object == nil || bits < env.mem.null_segment_size() || bits % 4 != 0 {
+        return None;
+    }
+    if env
+        .mem
+        .get_bytes_fallible(ConstVoidPtr::from_bits(bits), 4)
+        .is_none()
+    {
+        return None;
+    }
+
+    let class = ObjC::read_isa(object, &env.mem);
+    if class == nil || class.to_bits() % 4 != 0 {
+        return None;
+    }
+    env.objc.get_host_object(class)?;
+    Some(class)
+}
+
+fn debug_object_has_method(env: &Environment, object: id, selector: crate::objc::SEL) -> bool {
+    debug_object_class(env, object).is_some()
+        && env.objc.object_has_method(&env.mem, object, selector)
+}
+
 fn read_object_ivar(env: &Environment, object: id, name: &str) -> Option<id> {
+    debug_object_class(env, object)?;
     let ivar = env
         .objc
         .object_lookup_ivar(&env.mem, object, &name.to_string())?;
@@ -611,6 +647,7 @@ fn read_object_ivar(env: &Environment, object: id, name: &str) -> Option<id> {
 }
 
 fn read_f32_ivar(env: &Environment, object: id, name: &str) -> Option<f32> {
+    debug_object_class(env, object)?;
     let ivar = env
         .objc
         .object_lookup_ivar(&env.mem, object, &name.to_string())?;
@@ -663,6 +700,31 @@ fn get_gui_layer(env: &mut Environment) -> Option<id> {
     (gui_layer != nil).then_some(gui_layer)
 }
 
+fn get_running_scene(env: &mut Environment) -> Option<id> {
+    let director_class = env.objc.get_known_class("CCDirector", &mut env.mem);
+    let shared_director_selector = env.objc.lookup_selector("sharedDirector")?;
+    if !env
+        .objc
+        .object_has_method(&env.mem, director_class, shared_director_selector)
+    {
+        return None;
+    }
+    let director: id = msg_send_no_type_checking(env, (director_class, shared_director_selector));
+    if director == nil {
+        return None;
+    }
+
+    let running_scene_selector = env.objc.lookup_selector("runningScene")?;
+    if !env
+        .objc
+        .object_has_method(&env.mem, director, running_scene_selector)
+    {
+        return None;
+    }
+    let running_scene: id = msg_send_no_type_checking(env, (director, running_scene_selector));
+    (running_scene != nil).then_some(running_scene)
+}
+
 fn get_actor_list_from_game_state(env: &mut Environment) -> Option<id> {
     let game_data = get_game_data(env)?;
     let actor_list_selector = env.objc.lookup_selector("actorList")?;
@@ -674,6 +736,451 @@ fn get_actor_list_from_game_state(env: &mut Environment) -> Option<id> {
     }
     let actor_list: id = msg_send_no_type_checking(env, (game_data, actor_list_selector));
     (actor_list != nil).then_some(actor_list)
+}
+
+fn count_if_collection(env: &mut Environment, object: id) -> Option<NSUInteger> {
+    let count_selector = env.objc.lookup_selector("count")?;
+    if !debug_object_has_method(env, object, count_selector) {
+        return None;
+    }
+    Some(msg_send_no_type_checking(env, (object, count_selector)))
+}
+
+fn object_at_index_if_collection(
+    env: &mut Environment,
+    object: id,
+    index: NSUInteger,
+) -> Option<id> {
+    let object_at_index_selector = env.objc.lookup_selector("objectAtIndex:")?;
+    if !debug_object_has_method(env, object, object_at_index_selector) {
+        return None;
+    }
+    Some(msg_send_no_type_checking(
+        env,
+        (object, object_at_index_selector, index),
+    ))
+}
+
+fn object_to_debug_with_count(env: &mut Environment, object: id) -> String {
+    let mut description = object_to_debug(env, object);
+    if let Some(count) = count_if_collection(env, object) {
+        description.push_str(&format!(" count={count}"));
+    }
+    description
+}
+
+fn node_point_by_getter(env: &mut Environment, object: id, selector_name: &str) -> Option<CGPoint> {
+    let selector = env.objc.lookup_selector(selector_name)?;
+    debug_object_has_method(env, object, selector)
+        .then(|| msg_send_no_type_checking(env, (object, selector)))
+}
+
+fn node_size_by_getter(env: &mut Environment, object: id, selector_name: &str) -> Option<CGSize> {
+    let selector = env.objc.lookup_selector(selector_name)?;
+    debug_object_has_method(env, object, selector)
+        .then(|| msg_send_no_type_checking(env, (object, selector)))
+}
+
+fn node_f32_by_getter(env: &mut Environment, object: id, selector_name: &str) -> Option<f32> {
+    let selector = env.objc.lookup_selector(selector_name)?;
+    debug_object_has_method(env, object, selector)
+        .then(|| msg_send_no_type_checking(env, (object, selector)))
+}
+
+fn node_bool_by_getter(env: &mut Environment, object: id, selector_name: &str) -> Option<bool> {
+    let selector = env.objc.lookup_selector(selector_name)?;
+    debug_object_has_method(env, object, selector)
+        .then(|| msg_send_no_type_checking(env, (object, selector)))
+}
+
+fn node_world_origin(env: &mut Environment, object: id) -> Option<CGPoint> {
+    let selector = env.objc.lookup_selector("convertToWorldSpace:")?;
+    if !debug_object_has_method(env, object, selector) {
+        return None;
+    }
+    let origin = CGPoint { x: 0.0, y: 0.0 };
+    Some(msg_send_no_type_checking(env, (object, selector, origin)))
+}
+
+fn cocos_node_summary(env: &mut Environment, node: id) -> String {
+    let position = node_point_by_getter(env, node, "position")
+        .map(|point| point.to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+    let world = node_world_origin(env, node)
+        .map(|point| point.to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+    let anchor = node_point_by_getter(env, node, "anchorPoint")
+        .map(|point| point.to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+    let size = node_size_by_getter(env, node, "contentSize")
+        .map(|size| size.to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+    let scale_x = node_f32_by_getter(env, node, "scaleX")
+        .map(|scale| format!("{scale:.3}"))
+        .unwrap_or_else(|| "n/a".to_string());
+    let scale_y = node_f32_by_getter(env, node, "scaleY")
+        .map(|scale| format!("{scale:.3}"))
+        .unwrap_or_else(|| "n/a".to_string());
+    let rotation = node_f32_by_getter(env, node, "rotation")
+        .map(|rotation| format!("{rotation:.3}"))
+        .unwrap_or_else(|| "n/a".to_string());
+    let visible = node_bool_by_getter(env, node, "isVisible")
+        .or_else(|| node_bool_by_getter(env, node, "visible"))
+        .map(|visible| visible.to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+
+    format!(
+        "pos={position} world0={world} anchor={anchor} size={size} scale=({scale_x},{scale_y}) rot={rotation} visible={visible}"
+    )
+}
+
+fn dump_optional_ivar(
+    env: &mut Environment,
+    writer: &mut dyn Write,
+    object: id,
+    ivar_name: &str,
+    depth: usize,
+) -> IoResult<()> {
+    let indent = "  ".repeat(depth);
+    let Some(value) = read_object_ivar(env, object, ivar_name) else {
+        return Ok(());
+    };
+    writeln!(
+        writer,
+        "{indent}.{ivar_name} = {}",
+        object_to_debug_with_count(env, value)
+    )
+}
+
+fn dump_optional_string_ivar(
+    env: &mut Environment,
+    writer: &mut dyn Write,
+    object: id,
+    ivar_name: &str,
+    depth: usize,
+) -> IoResult<()> {
+    let indent = "  ".repeat(depth);
+    let Some(value) = read_object_ivar(env, object, ivar_name) else {
+        return Ok(());
+    };
+    writeln!(
+        writer,
+        "{indent}.{ivar_name} = {}",
+        string_object_to_debug(env, value)
+    )
+}
+
+fn dump_optional_point_ivar(
+    env: &Environment,
+    writer: &mut dyn Write,
+    object: id,
+    ivar_name: &str,
+    depth: usize,
+) -> IoResult<()> {
+    let indent = "  ".repeat(depth);
+    if debug_object_class(env, object).is_none() {
+        return Ok(());
+    }
+    let Some(ivar) = env
+        .objc
+        .object_lookup_ivar(&env.mem, object, &ivar_name.to_string())
+    else {
+        return Ok(());
+    };
+    let value: CGPoint = env.mem.read(ivar.cast());
+    writeln!(writer, "{indent}.{ivar_name} = {value}")
+}
+
+fn dump_optional_size_ivar(
+    env: &Environment,
+    writer: &mut dyn Write,
+    object: id,
+    ivar_name: &str,
+    depth: usize,
+) -> IoResult<()> {
+    let indent = "  ".repeat(depth);
+    if debug_object_class(env, object).is_none() {
+        return Ok(());
+    }
+    let Some(ivar) = env
+        .objc
+        .object_lookup_ivar(&env.mem, object, &ivar_name.to_string())
+    else {
+        return Ok(());
+    };
+    let value: CGSize = env.mem.read(ivar.cast());
+    writeln!(writer, "{indent}.{ivar_name} = {value}")
+}
+
+fn dump_optional_rect_ivar(
+    env: &Environment,
+    writer: &mut dyn Write,
+    object: id,
+    ivar_name: &str,
+    depth: usize,
+) -> IoResult<()> {
+    let indent = "  ".repeat(depth);
+    if debug_object_class(env, object).is_none() {
+        return Ok(());
+    }
+    let Some(ivar) = env
+        .objc
+        .object_lookup_ivar(&env.mem, object, &ivar_name.to_string())
+    else {
+        return Ok(());
+    };
+    let value: CGRect = env.mem.read(ivar.cast());
+    writeln!(
+        writer,
+        "{indent}.{ivar_name} = {{{}, {}}}",
+        value.origin, value.size
+    )
+}
+
+fn dump_optional_f32_ivar(
+    env: &Environment,
+    writer: &mut dyn Write,
+    object: id,
+    ivar_name: &str,
+    depth: usize,
+) -> IoResult<()> {
+    let indent = "  ".repeat(depth);
+    let Some(value) = read_f32_ivar(env, object, ivar_name) else {
+        return Ok(());
+    };
+    writeln!(writer, "{indent}.{ivar_name} = {value:.3}")
+}
+
+fn dump_optional_i32_ivar(
+    env: &Environment,
+    writer: &mut dyn Write,
+    object: id,
+    ivar_name: &str,
+    depth: usize,
+) -> IoResult<()> {
+    let indent = "  ".repeat(depth);
+    if debug_object_class(env, object).is_none() {
+        return Ok(());
+    }
+    let Some(ivar) = env
+        .objc
+        .object_lookup_ivar(&env.mem, object, &ivar_name.to_string())
+    else {
+        return Ok(());
+    };
+    let value: i32 = env.mem.read(ivar.cast());
+    writeln!(writer, "{indent}.{ivar_name} = {value}")
+}
+
+fn dump_attachment_array_ivar(
+    env: &mut Environment,
+    writer: &mut dyn Write,
+    object: id,
+    ivar_name: &str,
+    depth: usize,
+) -> IoResult<()> {
+    let indent = "  ".repeat(depth);
+    let Some(array) = read_object_ivar(env, object, ivar_name) else {
+        return Ok(());
+    };
+    let Some(count) = count_if_collection(env, array) else {
+        return Ok(());
+    };
+    if count == 0 {
+        return Ok(());
+    }
+    if depth >= 8 {
+        writeln!(
+            writer,
+            "{indent}.{ivar_name} entries omitted at depth {depth} count={count}"
+        )?;
+        return Ok(());
+    }
+
+    writeln!(
+        writer,
+        "{indent}.{ivar_name} entries showing {}/{}:",
+        count.min(32),
+        count
+    )?;
+    for idx in 0..count.min(32) {
+        let entry_indent = "  ".repeat(depth + 1);
+        let Some(entry) = object_at_index_if_collection(env, array, idx) else {
+            continue;
+        };
+        writeln!(
+            writer,
+            "{entry_indent}[{idx}] {}",
+            object_to_debug_with_count(env, entry)
+        )?;
+        dump_texture_debug_ivars(env, writer, entry, depth + 2)?;
+    }
+
+    Ok(())
+}
+
+fn dump_texture_debug_ivars(
+    env: &mut Environment,
+    writer: &mut dyn Write,
+    node: id,
+    depth: usize,
+) -> IoResult<()> {
+    for ivar_name in [
+        "spriteMan",
+        "attachments",
+        "particles",
+        "unitDictionary",
+        "actorDictionary",
+        "spriteDictionary",
+        "skeletonDictionary",
+        "fightData",
+        "farmData",
+        "currentAttackVariation",
+        "sprite",
+        "actor",
+        "childAttachments",
+        "parentAttachment",
+    ] {
+        dump_optional_ivar(env, writer, node, ivar_name, depth)?;
+    }
+    for ivar_name in ["spriteFileName", "spriteFrameFile", "actionString", "image"] {
+        dump_optional_string_ivar(env, writer, node, ivar_name, depth)?;
+    }
+    for ivar_name in [
+        "originalAnchor",
+        "offsetFromRefPoint",
+        "lastFramePosition",
+        "frameOffset",
+        "destinationPoint",
+        "currentTile",
+        "destinationTile",
+        "myHomeTile",
+        "rootTile",
+        "actorSpecificOffset",
+        "collisionBoxOffset",
+        "knockBackPoint",
+        "throwOffset",
+        "lifeBarOffset",
+    ] {
+        dump_optional_point_ivar(env, writer, node, ivar_name, depth)?;
+    }
+    for ivar_name in ["collisionBoxSize"] {
+        dump_optional_size_ivar(env, writer, node, ivar_name, depth)?;
+    }
+    for ivar_name in ["atlasRect", "rect"] {
+        dump_optional_rect_ivar(env, writer, node, ivar_name, depth)?;
+    }
+    for ivar_name in [
+        "lastFrameRotation",
+        "changeInRotation",
+        "lastFrameScale",
+        "originalRotation",
+        "rotation",
+        "scale",
+        "scaleX",
+        "scaleY",
+        "walkingSpeed",
+        "animSpeed",
+        "hitPoints",
+        "hitPointsTotal",
+    ] {
+        dump_optional_f32_ivar(env, writer, node, ivar_name, depth)?;
+    }
+    for ivar_name in [
+        "attachmentID",
+        "tagID",
+        "attachmentZOrder",
+        "currentTileX",
+        "currentTileY",
+        "destinationTileX",
+        "destinationTileY",
+        "myHomeTileX",
+        "myHomeTileY",
+        "type",
+        "subType",
+        "flags",
+    ] {
+        dump_optional_i32_ivar(env, writer, node, ivar_name, depth)?;
+    }
+    for ivar_name in ["attachments", "childAttachments"] {
+        dump_attachment_array_ivar(env, writer, node, ivar_name, depth)?;
+    }
+    Ok(())
+}
+
+fn dump_cocos_node(
+    env: &mut Environment,
+    writer: &mut dyn Write,
+    node: id,
+    depth: usize,
+    visited: &mut Vec<u32>,
+) -> IoResult<()> {
+    if node == nil {
+        return Ok(());
+    }
+    if debug_object_class(env, node).is_none() {
+        return Ok(());
+    }
+    let node_bits = node.to_bits();
+    let indent = "  ".repeat(depth);
+    if visited.contains(&node_bits) {
+        writeln!(writer, "{indent}0x{node_bits:x} <cycle>")?;
+        return Ok(());
+    }
+    visited.push(node_bits);
+
+    let children_selector = env.objc.lookup_selector("children");
+    let children = children_selector.and_then(|selector| {
+        env.objc
+            .object_has_method(&env.mem, node, selector)
+            .then(|| msg_send_no_type_checking(env, (node, selector)))
+    });
+    let child_count = children.and_then(|children| count_if_collection(env, children));
+    let node_summary = cocos_node_summary(env, node);
+    writeln!(
+        writer,
+        "{indent}0x{node_bits:x} {} children={} {node_summary}",
+        debug_class_name(env, node),
+        child_count
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "n/a".to_string())
+    )?;
+
+    dump_texture_debug_ivars(env, writer, node, depth + 1)?;
+
+    if depth >= 10 {
+        return Ok(());
+    }
+    let Some(children) = children else {
+        return Ok(());
+    };
+    let Some(count) = child_count else {
+        return Ok(());
+    };
+    let Some(object_at_index_selector) = env.objc.lookup_selector("objectAtIndex:") else {
+        return Ok(());
+    };
+    if !env
+        .objc
+        .object_has_method(&env.mem, children, object_at_index_selector)
+    {
+        return Ok(());
+    }
+    for idx in 0..count.min(80) {
+        let child: id = msg_send_no_type_checking(env, (children, object_at_index_selector, idx));
+        dump_cocos_node(env, writer, child, depth + 1, visited)?;
+    }
+    Ok(())
+}
+
+fn dump_cocos_scene(env: &mut Environment, writer: &mut dyn Write) -> IoResult<()> {
+    writeln!(writer, "== Cocos Scene Inspector ==")?;
+    let Some(scene) = get_running_scene(env) else {
+        writeln!(writer, "(no running scene)")?;
+        return Ok(());
+    };
+    let mut visited = Vec::new();
+    dump_cocos_node(env, writer, scene, 0, &mut visited)
 }
 
 fn get_actor_list_from_actor_manager(env: &mut Environment) -> Option<id> {
@@ -1037,6 +1544,10 @@ fn dump_actor_summary(env: &mut Environment, writer: &mut dyn Write, actor: id) 
 }
 
 fn get_zombie_menu(env: &mut Environment) -> Option<id> {
+    if env.bundle.bundle_identifier() == "com.playforge.ZombieFarm2" {
+        return None;
+    }
+
     let zombie_menu_class = env.objc.get_known_class("ZFZombieMenu", &mut env.mem);
     let zombie_menu_selector = env.objc.lookup_selector("zombieMenu")?;
     if !env
@@ -1136,6 +1647,7 @@ pub fn write_actor_snapshot(env: &mut Environment, mut writer: impl Write) -> Io
             actor_manager_actor_list,
         )?;
         dump_zombie_menu(env, &mut writer)?;
+        dump_cocos_scene(env, &mut writer)?;
         Ok(())
     })();
     env.cpu.regs_mut().copy_from_slice(&regs);

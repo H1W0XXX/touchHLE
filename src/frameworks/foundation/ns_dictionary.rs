@@ -64,6 +64,18 @@ impl DictionaryHostObject {
         }
         nil
     }
+    pub(super) fn lookup_key(&self, env: &mut Environment, key: id) -> id {
+        let hash: Hash = msg![env; key hash];
+        let Some(collisions) = self.map.get(&hash) else {
+            return nil;
+        };
+        for &(candidate_key, _value) in collisions {
+            if candidate_key == key || msg![env; candidate_key isEqual:key] {
+                return candidate_key;
+            }
+        }
+        nil
+    }
     pub(super) fn insert(&mut self, env: &mut Environment, key: id, value: id, copy_key: bool) {
         self.plist_source_path = None;
         let key: id = if copy_key {
@@ -372,6 +384,24 @@ fn init_with_dictionary_common_inner(
 
     *env.objc.borrow_mut(this) = host_object;
     this
+}
+
+fn set_dictionary_contents(env: &mut Environment, this: id, other_dict: id) {
+    let mut host_object = <DictionaryHostObject as Default>::default();
+
+    if other_dict != nil {
+        let keys: id = msg![env; other_dict allKeys];
+        let count: NSUInteger = msg![env; keys count];
+        for i in 0..count {
+            let key: id = msg![env; keys objectAtIndex:i];
+            let object: id = msg![env; other_dict objectForKey:key];
+            host_object.insert(env, key, object, /* copy_key: */ true);
+        }
+    }
+
+    let mut old_host_object: DictionaryHostObject =
+        std::mem::replace(env.objc.borrow_mut(this), host_object);
+    old_host_object.release(env);
 }
 
 /// Helper function so share `initWithObjects:ForKeys:` implementations
@@ -738,6 +768,43 @@ pub const CLASSES: ClassExports = objc_classes! {
     res
 }
 
+- (id)objectForKeyedSubscript:(id)key {
+    msg![env; this objectForKey:key]
+}
+
+- (())setObject:(id)object
+         forKey:(id)key {
+    assert_ne!(object, nil);
+    assert_ne!(key, nil);
+    let mut host_obj: DictionaryHostObject = std::mem::take(env.objc.borrow_mut(this));
+    host_obj.insert(env, key, object, /* copy_key: */ true);
+    *env.objc.borrow_mut(this) = host_obj;
+}
+
+- (())removeObjectForKey:(id)key {
+    assert!(!key.is_null());
+    let mut host_obj: DictionaryHostObject = std::mem::take(env.objc.borrow_mut(this));
+    host_obj.remove(env, key);
+    *env.objc.borrow_mut(this) = host_obj;
+}
+
+- (())removeAllObjects {
+    let mut old_host_obj: DictionaryHostObject = std::mem::take(env.objc.borrow_mut(this));
+    old_host_obj.release(env);
+}
+
+- (())setDictionary:(id)other {
+    set_dictionary_contents(env, this, other);
+}
+
+- (())setObject:(id)object forKeyedSubscript:(id)key {
+    if object == nil {
+        () = msg![env; this removeObjectForKey:key];
+    } else {
+        () = msg![env; this setObject:object forKey:key];
+    }
+}
+
 - (id)allKeys {
     all_keys_common(env, this)
 }
@@ -745,6 +812,23 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)keyEnumerator { // NSEnumerator*
     let keys: id = msg![env; this allKeys];
     msg![env; keys objectEnumerator]
+}
+
+- (id)allValues {
+    let host_obj: DictionaryHostObject = std::mem::take(env.objc.borrow_mut(this));
+    let values: Vec<id> = host_obj.map.values().flatten().map(|&(_key, value)| value).collect();
+    *env.objc.borrow_mut(this) = host_obj;
+
+    for &val in &values {
+        retain(env, val);
+    }
+    let res = ns_array::from_vec(env, values);
+    autorelease(env, res)
+}
+
+- (id)objectEnumerator { // NSEnumerator*
+    let values: id = msg![env; this allValues];
+    msg![env; values objectEnumerator]
 }
 
 // NSFastEnumeration implementation
@@ -868,6 +952,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     res
 }
 
+- (id)objectForKeyedSubscript:(id)key {
+    msg![env; this objectForKey:key]
+}
+
 // NSFastEnumeration implementation
 - (NSUInteger)countByEnumeratingWithState:(MutPtr<NSFastEnumerationState>)state
                                   objects:(MutPtr<id>)stackbuf
@@ -939,6 +1027,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     *env.objc.borrow_mut(this) = host_obj;
 }
 
+- (())setObject:(id)object forKeyedSubscript:(id)key {
+    if object == nil {
+        () = msg![env; this removeObjectForKey:key];
+    } else {
+        () = msg![env; this setObject:object forKey:key];
+    }
+}
+
 - (())removeObjectForKey:(id)key {
     assert!(!key.is_null());
     let mut host_obj: DictionaryHostObject = std::mem::take(env.objc.borrow_mut(this));
@@ -957,6 +1053,10 @@ pub const CLASSES: ClassExports = objc_classes! {
         () = msg![env; this setObject:(*v) forKey:(*k)];
     }
     *env.objc.borrow_mut(other) = host_obj;
+}
+
+- (())setDictionary:(id)other {
+    set_dictionary_contents(env, this, other);
 }
 
 - (id)description {

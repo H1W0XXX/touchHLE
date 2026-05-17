@@ -5,7 +5,7 @@
  */
 //! `NSNull`.
 
-use crate::objc::{id, objc_classes, ClassExports, TrivialHostObject};
+use crate::objc::{id, objc_classes, ClassExports, NSZonePtr, TrivialHostObject};
 
 #[derive(Default)]
 pub struct State {
@@ -37,6 +37,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)retain { this }
 - (())release {}
 - (id)autorelease { this }
+- (id)copyWithZone:(NSZonePtr)_zone { this }
 
 @end
 

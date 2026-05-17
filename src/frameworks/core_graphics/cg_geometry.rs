@@ -15,9 +15,45 @@ use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant}
 use crate::mem::SafeRead;
 use crate::Environment;
 
-fn parse_tuple(s: &str) -> Result<(f32, f32), ()> {
-    let (a, b) = s.split_once(", ").ok_or(())?;
-    Ok((a.parse().map_err(|_| ())?, b.parse().map_err(|_| ())?))
+fn parse_cg_float_list(s: &str) -> Result<Vec<CGFloat>, ()> {
+    let mut values = Vec::new();
+    let mut current = String::new();
+
+    for c in s.chars() {
+        let is_exponent = matches!(c, 'e' | 'E')
+            && current.chars().any(|c| c.is_ascii_digit())
+            && !current.contains('e')
+            && !current.contains('E');
+        let is_sign = matches!(c, '-' | '+')
+            && (current.is_empty() || current.ends_with('e') || current.ends_with('E'));
+        if c.is_ascii_digit() || c == '.' || is_exponent || is_sign {
+            current.push(c);
+        } else if !current.is_empty() {
+            values.push(current.parse().map_err(|_| ())?);
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        values.push(current.parse().map_err(|_| ())?);
+    }
+
+    Ok(values)
+}
+
+fn parse_two_cg_floats(s: &str) -> Result<(CGFloat, CGFloat), ()> {
+    let values = parse_cg_float_list(s)?;
+    match values.as_slice() {
+        [a, b] => Ok((*a, *b)),
+        _ => Err(()),
+    }
+}
+
+fn parse_four_cg_floats(s: &str) -> Result<(CGFloat, CGFloat, CGFloat, CGFloat), ()> {
+    let values = parse_cg_float_list(s)?;
+    match values.as_slice() {
+        [a, b, c, d] => Ok((*a, *b, *c, *d)),
+        _ => Err(()),
+    }
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
@@ -45,8 +81,7 @@ impl GuestArg for CGPoint {
 impl std::str::FromStr for CGPoint {
     type Err = ();
     fn from_str(s: &str) -> Result<CGPoint, ()> {
-        let s = s.strip_prefix('{').ok_or(())?.strip_suffix('}').ok_or(())?;
-        let (x, y) = parse_tuple(s)?;
+        let (x, y) = parse_two_cg_floats(s)?;
         Ok(CGPoint { x, y })
     }
 }
@@ -120,8 +155,7 @@ impl GuestArg for CGSize {
 impl std::str::FromStr for CGSize {
     type Err = ();
     fn from_str(s: &str) -> Result<CGSize, ()> {
-        let s = s.strip_prefix('{').ok_or(())?.strip_suffix('}').ok_or(())?;
-        let (w, h) = parse_tuple(s)?;
+        let (w, h) = parse_two_cg_floats(s)?;
         Ok(CGSize {
             width: w,
             height: h,
@@ -201,14 +235,7 @@ impl GuestArg for CGRect {
 impl std::str::FromStr for CGRect {
     type Err = ();
     fn from_str(s: &str) -> Result<CGRect, ()> {
-        let s = s
-            .strip_prefix("{{")
-            .ok_or(())?
-            .strip_suffix("}}")
-            .ok_or(())?;
-        let (a, b) = s.split_once("}, {").ok_or(())?;
-        let (x, y) = parse_tuple(a)?;
-        let (width, height) = parse_tuple(b)?;
+        let (x, y, width, height) = parse_four_cg_floats(s)?;
         Ok(CGRect {
             origin: CGPoint { x, y },
             size: CGSize { width, height },
@@ -334,6 +361,10 @@ fn CGRectIsNull(_env: &mut Environment, rect: CGRect) -> bool {
     rect == CGRectNull
 }
 
+fn CGRectIsEmpty(_env: &mut Environment, rect: CGRect) -> bool {
+    rect == CGRectNull || rect.size.width <= 0.0 || rect.size.height <= 0.0
+}
+
 fn CGRectOffset(_env: &mut Environment, rect: CGRect, dx: CGFloat, dy: CGFloat) -> CGRect {
     assert!(rect != CGRectNull); // TODO
     CGRect {
@@ -365,6 +396,54 @@ fn CGRectInset(_env: &mut Environment, rect: CGRect, dx: CGFloat, dy: CGFloat) -
     res
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{CGPoint, CGRect, CGSize};
+
+    #[test]
+    fn parses_cg_point_with_or_without_spaces() {
+        assert_eq!(
+            "{-33, -0}".parse::<CGPoint>(),
+            Ok(CGPoint { x: -33.0, y: -0.0 })
+        );
+        assert_eq!(
+            "{-33,-0}".parse::<CGPoint>(),
+            Ok(CGPoint { x: -33.0, y: -0.0 })
+        );
+    }
+
+    #[test]
+    fn parses_cg_size_with_or_without_spaces() {
+        assert_eq!(
+            "{100, 138}".parse::<CGSize>(),
+            Ok(CGSize {
+                width: 100.0,
+                height: 138.0,
+            })
+        );
+        assert_eq!(
+            "{100,138}".parse::<CGSize>(),
+            Ok(CGSize {
+                width: 100.0,
+                height: 138.0,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_cg_rect_with_or_without_spaces() {
+        let rect = CGRect {
+            origin: CGPoint { x: 62.0, y: 98.0 },
+            size: CGSize {
+                width: 34.0,
+                height: 24.0,
+            },
+        };
+        assert_eq!("{{62, 98}, {34, 24}}".parse::<CGRect>(), Ok(rect));
+        assert_eq!("{{62,98},{34,24}}".parse::<CGRect>(), Ok(rect));
+    }
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGPointEqualToPoint(_, _)),
     export_c_func!(CGSizeEqualToSize(_, _)),
@@ -381,6 +460,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGRectGetWidth(_)),
     export_c_func!(CGRectMake(_, _, _, _)),
     export_c_func!(CGRectIsNull(_)),
+    export_c_func!(CGRectIsEmpty(_)),
     export_c_func!(CGRectOffset(_, _, _)),
     export_c_func!(CGRectInset(_, _, _)),
 ];

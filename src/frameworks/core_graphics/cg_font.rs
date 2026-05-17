@@ -75,10 +75,18 @@ fn CGFontCopyPostScriptName(env: &mut Environment, font: CGFontRef) -> id {
     get_static_str(env, "touchHLE")
 }
 
+fn CGFontGetUnitsPerEm(_env: &mut Environment, font: CGFontRef) -> u32 {
+    if font.is_null() {
+        return 0;
+    }
+    1000
+}
+
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGFontCreateWithDataProvider(_)),
     export_c_func!(CGFontRetain(_)),
     export_c_func!(CGFontRelease(_)),
     export_c_func!(CGFontCopyFullName(_)),
     export_c_func!(CGFontCopyPostScriptName(_)),
+    export_c_func!(CGFontGetUnitsPerEm(_)),
 ];

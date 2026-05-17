@@ -42,6 +42,14 @@ pub(super) struct ArrayHostObject {
 }
 impl HostObject for ArrayHostObject {}
 
+fn alloc_array_storage(env: &mut Environment, class: id) -> id {
+    let host_object = Box::new(ArrayHostObject {
+        array: Vec::new(),
+        plist_source_path: None,
+    });
+    env.objc.alloc_object(class, host_object, &mut env.mem)
+}
+
 fn is_zombie_farm(env: &Environment) -> bool {
     let bundle_id = env.bundle.bundle_identifier();
     bundle_id.starts_with("com.playforge.ZombieFarm") || bundle_id.starts_with("com.playforge.ZFR")
@@ -54,7 +62,7 @@ fn object_at_index(env: &mut Environment, this: id, index: NSUInteger) -> id {
     }
 
     if is_zombie_farm(env) {
-        log!(
+        log_dbg!(
             "ZombieFarm workaround: NSArray {:?} objectAtIndex:{} out of bounds for count {}, returning nil",
             this,
             index,
@@ -84,9 +92,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 + (id)allocWithZone:(NSZonePtr)zone {
     // NSArray might be subclassed by something which needs allocWithZone:
-    // to have the normal behaviour. Unimplemented: call superclass alloc then.
-    assert!(this == env.objc.get_known_class("NSArray", &mut env.mem));
-    msg_class![env; _touchHLE_NSArray allocWithZone:zone]
+    // give those subclasses the same storage while preserving their class.
+    if this == env.objc.get_known_class("NSArray", &mut env.mem) {
+        msg_class![env; _touchHLE_NSArray allocWithZone:zone]
+    } else {
+        alloc_array_storage(env, this)
+    }
 }
 
 + (id)array {
@@ -320,9 +331,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 + (id)allocWithZone:(NSZonePtr)zone {
     // NSArray might be subclassed by something which needs allocWithZone:
-    // to have the normal behaviour. Unimplemented: call superclass alloc then.
-    assert!(this == env.objc.get_known_class("NSMutableArray", &mut env.mem));
-    msg_class![env; _touchHLE_NSMutableArray allocWithZone:zone]
+    // give those subclasses the same storage while preserving their class.
+    if this == env.objc.get_known_class("NSMutableArray", &mut env.mem) {
+        msg_class![env; _touchHLE_NSMutableArray allocWithZone:zone]
+    } else {
+        alloc_array_storage(env, this)
+    }
 }
 
 + (id)arrayWithCapacity:(NSUInteger)capacity {
@@ -410,11 +424,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 @implementation _touchHLE_NSArray: NSArray
 
 + (id)allocWithZone:(NSZonePtr)_zone {
-    let host_object = Box::new(ArrayHostObject {
-        array: Vec::new(),
-        plist_source_path: None,
-    });
-    env.objc.alloc_object(this, host_object, &mut env.mem)
+    alloc_array_storage(env, this)
 }
 
 // NSCoding implementation
@@ -515,6 +525,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     object_at_index(env, this, index)
 }
 
+- (id)objectAtIndexedSubscript:(NSUInteger)index {
+    object_at_index(env, this, index)
+}
+
 - (id)description {
     build_description(env, this)
 }
@@ -575,11 +589,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 @implementation _touchHLE_NSMutableArray: NSMutableArray
 
 + (id)allocWithZone:(NSZonePtr)_zone {
-    let host_object = Box::new(ArrayHostObject {
-        array: Vec::new(),
-        plist_source_path: None,
-    });
-    env.objc.alloc_object(this, host_object, &mut env.mem)
+    alloc_array_storage(env, this)
 }
 
 - (id)initWithCapacity:(NSUInteger)capacity {
@@ -595,6 +605,17 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)initWithArray:(id)array copyItems:(bool)copy_items { // NSArray*
     let objects = retained_objects_from_array(env, array, copy_items);
+    replace_array_contents(env, this, objects);
+    this
+}
+
+- (id)initWithObjects:(ConstPtr<id>)objects_ptr count:(NSUInteger)count {
+    let mut objects = Vec::new();
+    for i in 0..count {
+        let obj: id = env.mem.read(objects_ptr + i);
+        retain(env, obj);
+        objects.push(obj);
+    }
     replace_array_contents(env, this, objects);
     this
 }
@@ -727,6 +748,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     object_at_index(env, this, index)
 }
 
+- (id)objectAtIndexedSubscript:(NSUInteger)index {
+    object_at_index(env, this, index)
+}
+
 - (id)description {
     build_description(env, this)
 }
@@ -777,6 +802,14 @@ pub const CLASSES: ClassExports = objc_classes! {
     retain(env, obj);
     let object = std::mem::replace(&mut env.objc.borrow_mut::<ArrayHostObject>(this).array[index as usize], obj);
     release(env, object);
+}
+
+- (())setObject:(id)obj atIndexedSubscript:(NSUInteger)index {
+    if index == env.objc.borrow::<ArrayHostObject>(this).array.len() as NSUInteger {
+        () = msg![env; this addObject:obj];
+    } else {
+        () = msg![env; this replaceObjectAtIndex:index withObject:obj];
+    }
 }
 
 - (())exchangeObjectAtIndex:(NSUInteger)index1 withObjectAtIndex:(NSUInteger)index2 {

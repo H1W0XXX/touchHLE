@@ -31,6 +31,8 @@ pub struct UILabelHostObject {
     text_alignment: UITextAlignment,
     line_break_mode: UILineBreakMode,
     number_of_lines: NSInteger,
+    adjusts_font_size_to_fit_width: bool,
+    minimum_font_size: CGFloat,
 }
 impl_HostObject_with_superclass!(UILabelHostObject);
 impl Default for UILabelHostObject {
@@ -43,6 +45,8 @@ impl Default for UILabelHostObject {
             text_alignment: UITextAlignmentLeft,
             line_break_mode: UILineBreakModeTailTruncation,
             number_of_lines: 1,
+            adjusts_font_size_to_fit_width: false,
+            minimum_font_size: 0.0,
         }
     }
 }
@@ -123,6 +127,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         text_alignment: _,
         line_break_mode: _,
         number_of_lines: _,
+        adjusts_font_size_to_fit_width: _,
+        minimum_font_size: _,
     } = env.objc.borrow(this);
     release(env, text);
     release(env, font);
@@ -169,10 +175,18 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (bool)adjustsFontSizeToFitWidth {
-    false // default value
+    env.objc.borrow::<UILabelHostObject>(this).adjusts_font_size_to_fit_width
 }
 - (())setAdjustsFontSizeToFitWidth:(bool)adjusts {
-    assert!(!adjusts); // TODO
+    env.objc.borrow_mut::<UILabelHostObject>(this).adjusts_font_size_to_fit_width = adjusts;
+    () = msg![env; this setNeedsDisplay];
+}
+- (CGFloat)minimumFontSize {
+    env.objc.borrow::<UILabelHostObject>(this).minimum_font_size
+}
+- (())setMinimumFontSize:(CGFloat)minimum_font_size {
+    env.objc.borrow_mut::<UILabelHostObject>(this).minimum_font_size = minimum_font_size;
+    () = msg![env; this setNeedsDisplay];
 }
 
 - (id)textColor {
@@ -256,6 +270,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         text_alignment,
         line_break_mode,
         number_of_lines,
+        adjusts_font_size_to_fit_width: _,
+        minimum_font_size: _,
     } = env.objc.borrow_mut(this);
 
     let (r, g, b, a) = ui_color::get_rgba(&env.objc, text_color);

@@ -176,6 +176,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 }
 
+- (id)member:(id)object {
+    let host_obj: SetHostObject = std::mem::take(env.objc.borrow_mut(this));
+    let member = host_obj.dict.lookup_key(env, object);
+    *env.objc.borrow_mut(this) = host_obj;
+    member
+}
+
 - (id)allObjects {
     let objects = env.objc.borrow_mut::<SetHostObject>(this).dict.iter_keys().collect();
     ns_array::from_vec(env, objects)
@@ -254,6 +261,13 @@ pub const CLASSES: ClassExports = objc_classes! {
         Some(object) => object,
         None => nil
     }
+}
+
+- (id)member:(id)object {
+    let host_obj: SetHostObject = std::mem::take(env.objc.borrow_mut(this));
+    let member = host_obj.dict.lookup_key(env, object);
+    *env.objc.borrow_mut(this) = host_obj;
+    member
 }
 
 - (id)allObjects {

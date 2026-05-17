@@ -5,7 +5,7 @@
  */
 //! Small libgcc/compiler-rt helpers used by older ARM iOS binaries.
 
-use crate::dyld::{export_c_func, FunctionExports};
+use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
 use crate::mem::ConstPtr;
 use crate::Environment;
 
@@ -125,3 +125,13 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(__umoddi3(_, _)),
     export_c_func!(__umodsi3(_, _)),
 ];
+
+pub const CONSTANTS: ConstantExports = &[(
+    "___stack_chk_guard",
+    HostConstant::Custom(|env| {
+        env.mem
+            .alloc_and_write(0x5448_4c45u32)
+            .cast_void()
+            .cast_const()
+    }),
+)];

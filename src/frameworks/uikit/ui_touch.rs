@@ -24,6 +24,8 @@ pub const UITouchPhaseMoved: UITouchPhase = 1;
 pub const UITouchPhaseStationary: UITouchPhase = 2;
 pub const UITouchPhaseEnded: UITouchPhase = 3;
 
+const ZOMBIE_FARM_MOUSE_MOVE_DEAD_ZONE: f32 = 6.0;
+
 #[derive(Default)]
 pub struct State {
     current_touches: HashMap<FingerId, id>,
@@ -43,6 +45,10 @@ pub(super) struct UITouchHostObject {
     phase: UITouchPhase,
 }
 impl HostObject for UITouchHostObject {}
+
+fn is_zombie_farm_2(env: &Environment) -> bool {
+    env.bundle.bundle_identifier() == "com.playforge.ZombieFarm2"
+}
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -264,6 +270,15 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             location_in_window,
             window,
         );
+        if is_zombie_farm_2(env) {
+            log!(
+                "ZombieFarm2 UI hit trace: touch down selected view {:?} ({}) frame {:?} at {:?}",
+                view,
+                view_class_name,
+                view_frame,
+                location_in_window,
+            );
+        }
 
         let is_multi_touch_enabled: bool = msg![env; view isMultipleTouchEnabled];
         if !is_multi_touch_enabled {
@@ -356,11 +371,22 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             y: coords.1,
         };
 
+        let use_move_dead_zone = is_zombie_farm_2(env) && matches!(finger_id, FingerId::Mouse);
         let view = env.objc.borrow::<UITouchHostObject>(touch).view;
         let host_object = env.objc.borrow_mut::<UITouchHostObject>(touch);
 
         if host_object.location == location {
             continue;
+        }
+
+        if use_move_dead_zone {
+            let dx = location.x - host_object.location.x;
+            let dy = location.y - host_object.location.y;
+            if dx * dx + dy * dy
+                < ZOMBIE_FARM_MOUSE_MOVE_DEAD_ZONE * ZOMBIE_FARM_MOUSE_MOVE_DEAD_ZONE
+            {
+                continue;
+            }
         }
 
         host_object.previous_location = host_object.location;

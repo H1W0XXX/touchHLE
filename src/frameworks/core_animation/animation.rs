@@ -249,6 +249,54 @@ impl State {
                     );
                     presentation.position = from_value + by_value * interpolation_amount;
                 }
+                "position.x" => {
+                    let from_value = id_as_option(from_value).map(|obj| msg![env; obj floatValue]);
+                    let to_value = id_as_option(to_value).map(|obj| msg![env; obj floatValue]);
+                    let by_value = id_as_option(by_value).map(|obj| msg![env; obj floatValue]);
+                    let (from_value, by_value) = get_from_and_by_values(
+                        Some(presentation.position.x),
+                        from_value,
+                        to_value,
+                        by_value,
+                    );
+                    presentation.position.x = from_value + by_value * interpolation_amount;
+                }
+                "position.y" => {
+                    let from_value = id_as_option(from_value).map(|obj| msg![env; obj floatValue]);
+                    let to_value = id_as_option(to_value).map(|obj| msg![env; obj floatValue]);
+                    let by_value = id_as_option(by_value).map(|obj| msg![env; obj floatValue]);
+                    let (from_value, by_value) = get_from_and_by_values(
+                        Some(presentation.position.y),
+                        from_value,
+                        to_value,
+                        by_value,
+                    );
+                    presentation.position.y = from_value + by_value * interpolation_amount;
+                }
+                "bounds.size.width" => {
+                    let from_value = id_as_option(from_value).map(|obj| msg![env; obj floatValue]);
+                    let to_value = id_as_option(to_value).map(|obj| msg![env; obj floatValue]);
+                    let by_value = id_as_option(by_value).map(|obj| msg![env; obj floatValue]);
+                    let (from_value, by_value) = get_from_and_by_values(
+                        Some(presentation.bounds.size.width),
+                        from_value,
+                        to_value,
+                        by_value,
+                    );
+                    presentation.bounds.size.width = from_value + by_value * interpolation_amount;
+                }
+                "bounds.size.height" => {
+                    let from_value = id_as_option(from_value).map(|obj| msg![env; obj floatValue]);
+                    let to_value = id_as_option(to_value).map(|obj| msg![env; obj floatValue]);
+                    let by_value = id_as_option(by_value).map(|obj| msg![env; obj floatValue]);
+                    let (from_value, by_value) = get_from_and_by_values(
+                        Some(presentation.bounds.size.height),
+                        from_value,
+                        to_value,
+                        by_value,
+                    );
+                    presentation.bounds.size.height = from_value + by_value * interpolation_amount;
+                }
                 _ => panic!("Attempted to animate on key {}", key_path),
             }
         }

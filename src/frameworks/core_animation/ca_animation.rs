@@ -94,6 +94,7 @@ impl Default for CAAnimationHostObject {
 struct CAPropertyAnimationHostObject {
     superclass: CAAnimationHostObject,
     key_path: id, // NSString*
+    additive: bool,
 }
 impl_HostObject_with_superclass!(CAPropertyAnimationHostObject);
 
@@ -242,6 +243,17 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (id)keyPath {
     env.objc.borrow::<CAPropertyAnimationHostObject>(this).key_path
+}
+
+- (())setAdditive:(bool)additive {
+    log_dbg!("[(CAPropertyAnimation*){:?} setAdditive:{:?}]", this, additive);
+    env.objc.borrow_mut::<CAPropertyAnimationHostObject>(this).additive = additive;
+}
+- (bool)isAdditive {
+    env.objc.borrow::<CAPropertyAnimationHostObject>(this).additive
+}
+- (bool)additive {
+    env.objc.borrow::<CAPropertyAnimationHostObject>(this).additive
 }
 
 - (())dealloc {

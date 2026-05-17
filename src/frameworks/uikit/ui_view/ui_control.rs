@@ -96,6 +96,15 @@ fn send_actions(env: &mut Environment, this: id, event: id, control_event: UICon
 
     for (target, action) in action_targets {
         assert!(target != nil); // TODO
+        if env.bundle.bundle_identifier() == "com.playforge.ZombieFarm2" {
+            log!(
+                "ZombieFarm2 UI action: control {:?} event {} -> {:?} {}",
+                this,
+                control_event,
+                target,
+                action.as_str(&env.mem),
+            );
+        }
 
         () = msg![env; this sendAction:action to:target forEvent:event];
     }

@@ -7,6 +7,18 @@ use crate::libc::stdio::printf::printf_inner;
 use crate::objc::id;
 use crate::Environment;
 
+fn should_suppress_nslog(env: &Environment, message: &str) -> bool {
+    if std::env::var("TOUCHHLE_SHOW_NOISY_NSLOG").ok().as_deref() == Some("1") {
+        return false;
+    }
+
+    env.bundle
+        .bundle_identifier()
+        .starts_with("com.playforge.Z")
+        && message.contains("/libs/CCTableViewSuite/CCTableView.m:")
+        && message.contains("-[CCTableView scrollViewDidScroll:]: cells in ")
+}
+
 fn NSLog(
     env: &mut Environment,
     format: id, // NSString
@@ -37,11 +49,15 @@ fn NSLogv(
         arg,
     );
     // TODO: Should we include a timestamp, like the real NSLog?
+    let message = String::from_utf8_lossy(&res);
+    if should_suppress_nslog(env, &message) {
+        return;
+    }
     echo!(
         "{}[{}] {}",
         env.bundle.executable_path().file_name().unwrap(),
         env.current_thread,
-        String::from_utf8_lossy(&res)
+        message
     );
 }
 

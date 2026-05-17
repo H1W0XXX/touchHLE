@@ -58,6 +58,7 @@ pub const UIInterfaceOrientationLandscapeRight: UIInterfaceOrientation =
     UIDeviceOrientationLandscapeLeft;
 
 type UIRemoteNotificationType = NSUInteger;
+type UIApplicationState = NSInteger;
 type UIStatusBarAnimation = NSInteger;
 type UIStatusBarStyle = NSInteger;
 
@@ -91,6 +92,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)retain { this }
 - (id)autorelease { this }
 - (())release {}
+
+- (UIApplicationState)applicationState {
+    // UIApplicationStateActive. touchHLE only runs the foreground app.
+    0
+}
 
 - (id)delegate {
     env.objc.borrow::<UIApplicationHostObject>(this).delegate

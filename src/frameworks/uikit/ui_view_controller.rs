@@ -37,8 +37,110 @@ pub(crate) struct UIViewControllerHostObject {
     /// of the nib by name, may be nil.
     /// `NSBundle*`
     bundle: id,
+    /// Strong reference to the currently presented modal controller.
+    presented_view_controller: id,
+    /// Weak reference to the presenting controller.
+    presenting_view_controller: id,
 }
 impl HostObject for UIViewControllerHostObject {}
+
+fn present_modal_view_controller(
+    env: &mut Environment,
+    presenter: id,
+    view_controller: id,
+    animated: bool,
+) {
+    if view_controller == nil {
+        return;
+    }
+
+    let presenting_view: id = msg![env; presenter view];
+    if presenting_view == nil {
+        return;
+    }
+    let superview: id = msg![env; presenting_view superview];
+    let container: id = if superview != nil {
+        superview
+    } else {
+        let window: id = msg![env; presenting_view window];
+        if window != nil {
+            window
+        } else {
+            presenting_view
+        }
+    };
+
+    let presented_view: id = msg![env; view_controller view];
+    if presented_view == nil {
+        return;
+    }
+
+    let old_presented = {
+        let host = env.objc.borrow_mut::<UIViewControllerHostObject>(presenter);
+        std::mem::replace(&mut host.presented_view_controller, view_controller)
+    };
+    retain(env, view_controller);
+    release(env, old_presented);
+    env.objc
+        .borrow_mut::<UIViewControllerHostObject>(view_controller)
+        .presenting_view_controller = presenter;
+
+    let frame: CGRect = msg![env; container bounds];
+    () = msg![env; presented_view setFrame:frame];
+    () = msg![env; presented_view setHidden:false];
+    () = msg![env; presented_view setUserInteractionEnabled:true];
+    () = msg![env; view_controller viewWillAppear:animated];
+    () = msg![env; container addSubview:presented_view];
+    () = msg![env; view_controller viewDidAppear:animated];
+}
+
+fn dismiss_modal_view_controller(env: &mut Environment, this: id, animated: bool) {
+    let target = {
+        let host = env.objc.borrow::<UIViewControllerHostObject>(this);
+        if host.presented_view_controller != nil {
+            host.presented_view_controller
+        } else {
+            this
+        }
+    };
+
+    let presenter = env
+        .objc
+        .borrow::<UIViewControllerHostObject>(target)
+        .presenting_view_controller;
+    let view: id = msg![env; target view];
+    if view != nil {
+        () = msg![env; target viewWillDisappear:animated];
+        () = msg![env; view removeFromSuperview];
+        () = msg![env; target viewDidDisappear:animated];
+    }
+
+    if presenter != nil {
+        let old_presented = {
+            let presenter_host = env.objc.borrow_mut::<UIViewControllerHostObject>(presenter);
+            if presenter_host.presented_view_controller == target {
+                std::mem::replace(&mut presenter_host.presented_view_controller, nil)
+            } else {
+                nil
+            }
+        };
+        release(env, old_presented);
+    } else if target != this {
+        let old_presented = {
+            let host = env.objc.borrow_mut::<UIViewControllerHostObject>(this);
+            if host.presented_view_controller == target {
+                std::mem::replace(&mut host.presented_view_controller, nil)
+            } else {
+                nil
+            }
+        };
+        release(env, old_presented);
+    }
+
+    env.objc
+        .borrow_mut::<UIViewControllerHostObject>(target)
+        .presenting_view_controller = nil;
+}
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -75,7 +177,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())dealloc {
-    let &UIViewControllerHostObject { view, nib_name, bundle } = env.objc.borrow(this);
+    let &UIViewControllerHostObject {
+        view,
+        nib_name,
+        bundle,
+        presented_view_controller,
+        presenting_view_controller: _,
+    } = env.objc.borrow(this);
 
     if view != nil {
         set_view_controller(env, view, nil);
@@ -83,6 +191,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, view);
     release(env, nib_name);
     release(env, bundle);
+    release(env, presented_view_controller);
 
     env.objc.dealloc_object(this, &mut env.mem);
 }
@@ -199,7 +308,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())dismissModalViewControllerAnimated:(bool)animated {
-    log!("TODO: [(UIViewController*){:?} dismissModalViewControllerAnimated:{}]", this, animated); // TODO
+    log_dbg!(
+        "[(UIViewController*){:?} dismissModalViewControllerAnimated:{}]",
+        this,
+        animated
+    );
+    dismiss_modal_view_controller(env, this, animated);
 }
 - (())presentModalViewController:(id)view_controller animated:(bool)animated {
     log_dbg!(
@@ -214,7 +328,9 @@ pub const CLASSES: ClassExports = objc_classes! {
             .object_has_method_named(&env.mem, view_controller, "_touchHLE_simulateMailComposeSuccess")
     {
         let _: () = msg![env; view_controller _touchHLE_simulateMailComposeSuccess];
+        return;
     }
+    present_modal_view_controller(env, this, view_controller, animated);
 }
 - (())dismissMoviePlayerViewControllerAnimated {
     log!("TODO: [(UIViewController*){:?} dismissMoviePlayerViewControllerAnimated]", this); // TODO

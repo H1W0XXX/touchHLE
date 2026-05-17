@@ -87,12 +87,31 @@ impl CALayerHostObject {
     }
 }
 
-pub fn diagnostic_snapshot(objc: &ObjC, layer: id) -> (id, CGRect, Vec<id>) {
+pub fn diagnostic_snapshot(objc: &ObjC, layer: id) -> (id, CGRect, CGPoint, CGPoint, Vec<id>) {
     let host_obj = objc.borrow::<CALayerHostObject>(layer);
     (
         host_obj.delegate,
         host_obj.bounds,
+        host_obj.position,
+        host_obj.anchor_point,
         host_obj.sublayers.clone(),
+    )
+}
+
+pub fn diagnostic_render_snapshot(
+    objc: &ObjC,
+    layer: id,
+) -> (bool, bool, f32, bool, bool, bool, bool, bool) {
+    let host_obj = objc.borrow::<CALayerHostObject>(layer);
+    (
+        host_obj.hidden,
+        host_obj.opaque,
+        host_obj.opacity,
+        host_obj.background_color.is_some(),
+        host_obj.contents != nil,
+        host_obj.presented_pixels.is_some(),
+        host_obj.cg_context.is_some(),
+        host_obj.gles_texture.is_some(),
     )
 }
 
@@ -359,6 +378,27 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow_mut::<CALayerHostObject>(this).corner_radius = corner_radius;
 }
 
+- (CGColorRef)shadowColor {
+    nil
+}
+- (())setShadowColor:(CGColorRef)_shadow_color {
+}
+- (f32)shadowOpacity {
+    0.0
+}
+- (())setShadowOpacity:(f32)_shadow_opacity {
+}
+- (CGFloat)shadowRadius {
+    0.0
+}
+- (())setShadowRadius:(CGFloat)_shadow_radius {
+}
+- (CGSize)shadowOffset {
+    CGSize { width: 0.0, height: 0.0 }
+}
+- (())setShadowOffset:(CGSize)_shadow_offset {
+}
+
 - (bool)needsDisplay {
     env.objc.borrow::<CALayerHostObject>(this).needs_display
 }
@@ -554,6 +594,33 @@ pub const CLASSES: ClassExports = objc_classes! {
     if let Some(anim) = env.objc.borrow_mut::<CALayerHostObject>(this).animations.remove(&*key_string) {
         release(env, anim);
     };
+}
+
+- (id)animationForKey:(id)key { // NSString*
+    let key_string = to_rust_string(env, key);
+    env.objc
+        .borrow::<CALayerHostObject>(this)
+        .animations
+        .get(&*key_string)
+        .copied()
+        .unwrap_or(nil)
+}
+
+- (())removeAllAnimations {
+    let (animations, anonymous_animations) = {
+        let host_object = env.objc.borrow_mut::<CALayerHostObject>(this);
+        (
+            std::mem::take(&mut host_object.animations),
+            std::mem::take(&mut host_object.anonymous_animations),
+        )
+    };
+
+    for (_, animation) in animations {
+        release(env, animation);
+    }
+    for animation in anonymous_animations {
+        release(env, animation);
+    }
 }
 
 // TODO: more

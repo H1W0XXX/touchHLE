@@ -49,6 +49,10 @@ pub fn find_fullscreen_eagl_layer(env: &mut Environment) -> id {
     if env.options.force_composition {
         return nil;
     }
+    if env.bundle.bundle_identifier() == "com.playforge.ZombieFarm2" {
+        log_dbg!("ZombieFarm2 workaround: disabling CAEAGLLayer fullscreen fast path");
+        return nil;
+    }
 
     let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
     // Assumes the windows in the list are ordered back-to-front.

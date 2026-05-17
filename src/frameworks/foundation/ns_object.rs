@@ -123,6 +123,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     cancel_perform_requests(env, run_loop, target, selector, arg);
 }
 
++ (())cancelPreviousPerformRequestsWithTarget:(id)_target {
+    // TODO: NSRunLoop tracks delayed performs by selector. The target-only
+    // variant cancels all selectors for that target.
+}
+
 + (bool)accessInstanceVariablesDirectly {
     true
 }

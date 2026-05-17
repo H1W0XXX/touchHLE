@@ -13,6 +13,7 @@
 
 use super::{id, nil, Class, ObjC, IMP, SEL};
 use crate::abi::{CallFromHost, GuestRet};
+use crate::cpu::Cpu;
 use crate::environment::ThreadId;
 use crate::frameworks::core_graphics::{CGPoint, CGSize};
 use crate::frameworks::foundation::{
@@ -30,9 +31,10 @@ use crate::mem::{guest_size_of, ConstPtr, MutPtr, MutVoidPtr, SafeRead};
 use crate::objc::classes::InitializationStatus;
 use crate::Environment;
 use std::any::TypeId;
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    OnceLock,
+    Mutex, OnceLock,
 };
 
 pub(super) struct ThreadInitializer {
@@ -253,6 +255,62 @@ fn trace_zombie_farm_layout_to_console(selector_name: &str) -> bool {
     )
 }
 
+fn zombie_farm_sprite_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("TOUCHHLE_ZF_SPRITE_TRACE").ok().as_deref() == Some("1"))
+}
+
+fn zombie_farm_touch_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("TOUCHHLE_ZF2_TOUCH_TRACE").ok().as_deref() == Some("1"))
+}
+
+fn trace_zombie_farm_sprite_message(env: &Environment, receiver: id, selector_name: &str) {
+    if !zombie_farm_sprite_trace_enabled() || !zombie_farm_uses_playforge_bundle(env) {
+        return;
+    }
+
+    let Some(class_name) = zombie_farm_object_class_name(env, receiver) else {
+        return;
+    };
+    let interesting_class = class_name.starts_with("SpecialStageActor")
+        || class_name == "StageActor"
+        || class_name == "ActorAttachment"
+        || class_name == "CCSprite"
+        || class_name == "CCSpriteSheet";
+    if !interesting_class {
+        return;
+    }
+
+    let details = match selector_name {
+        "setPosition:" | "setAnchorPoint:" => {
+            format!(" {}", point_arg_from_regs(env.cpu.regs(), 2))
+        }
+        "setScale:" | "setScaleX:" | "setScaleY:" | "setRotation:" => {
+            format!(" {:.3}", f32::from_bits(env.cpu.regs()[2]))
+        }
+        "setVisible:" => format!(" {}", env.cpu.regs()[2] != 0),
+        "setTextureRect:" => format!(" origin {}", point_arg_from_regs(env.cpu.regs(), 2)),
+        _ => {
+            if !matches!(
+                selector_name,
+                "setTextureRect:rotated:untrimmedSize:" | "setDisplayFrame:" | "setTexture:"
+            ) {
+                return;
+            }
+            String::new()
+        }
+    };
+
+    log!(
+        "ZombieFarm sprite trace: [{} {}] receiver {:?}{}",
+        class_name,
+        selector_name,
+        receiver,
+        details
+    );
+}
+
 fn point_arg_from_regs(regs: &[u32], start: usize) -> CGPoint {
     CGPoint {
         x: f32::from_bits(regs[start]),
@@ -375,6 +433,262 @@ fn zombie_farm_set_gui_layer_server_date_to_now(env: &mut Environment, receiver:
 
 static ZOMBIE_FARM_APPLIED_LOCAL_HUNGER: AtomicBool = AtomicBool::new(false);
 static ZOMBIE_FARM_APPLY_TRACE_DEPTH: AtomicUsize = AtomicUsize::new(0);
+static ZOMBIE_FARM_LAST_MAIN_MENU: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Default)]
+struct ZombieFarmCocosTouchHandlers {
+    targeted: Vec<u32>,
+    standard: Vec<u32>,
+    claimed_targeted: HashMap<u32, Vec<u32>>,
+}
+
+static ZOMBIE_FARM_COCOS_TOUCH_HANDLERS: OnceLock<
+    Mutex<HashMap<u32, ZombieFarmCocosTouchHandlers>>,
+> = OnceLock::new();
+
+fn zombie_farm_cocos_touch_handlers() -> &'static Mutex<HashMap<u32, ZombieFarmCocosTouchHandlers>>
+{
+    ZOMBIE_FARM_COCOS_TOUCH_HANDLERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Clone, Copy, Default)]
+struct ZombieFarmSyncOperationInfo {
+    manager: u32,
+    delegate: u32,
+}
+
+static ZOMBIE_FARM_SYNC_OPERATIONS: OnceLock<Mutex<HashMap<u32, ZombieFarmSyncOperationInfo>>> =
+    OnceLock::new();
+
+fn zombie_farm_sync_operations() -> &'static Mutex<HashMap<u32, ZombieFarmSyncOperationInfo>> {
+    ZOMBIE_FARM_SYNC_OPERATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn zombie_farm_send_noarg_if_responds(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if receiver == nil {
+        return false;
+    }
+    let Some(selector) = env.objc.lookup_selector(selector_name) else {
+        return false;
+    };
+    if !env.objc.object_has_method(&env.mem, receiver, selector) {
+        return false;
+    }
+
+    let regs = *env.cpu.regs();
+    log!(
+        "ZombieFarm2 workaround: sending [{} {}] during skipped startup sync",
+        zombie_farm_object_class_name(env, receiver).unwrap_or("unknown"),
+        selector_name
+    );
+    let _: () = msg_send_no_type_checking(env, (receiver, selector));
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    true
+}
+
+fn zombie_farm_forward_backing_array_fast_enumeration(
+    env: &mut Environment,
+    receiver: id,
+    selector: SEL,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2"
+        || selector_name != "countByEnumeratingWithState:objects:count:"
+    {
+        return false;
+    }
+    let Some(array_selector) = env.objc.lookup_selector("_array") else {
+        return false;
+    };
+    if !env
+        .objc
+        .object_has_method(&env.mem, receiver, array_selector)
+    {
+        return false;
+    }
+
+    let regs = *env.cpu.regs();
+    let backing_array: id = msg_send_no_type_checking(env, (receiver, array_selector));
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    if backing_array == nil {
+        return false;
+    }
+
+    let state = MutVoidPtr::from_bits(regs[2]);
+    let objects = MutVoidPtr::from_bits(regs[3]);
+    let count: NSUInteger = env.mem.read(ConstPtr::<u32>::from_bits(regs[Cpu::SP]));
+    let result: NSUInteger =
+        msg_send_no_type_checking(env, (backing_array, selector, state, objects, count));
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    env.cpu.regs_mut()[0] = result;
+    log_dbg!(
+        "ZombieFarm2 workaround: forwarded fast enumeration for {} through backing array {:?}",
+        zombie_farm_object_class_name(env, receiver).unwrap_or("unknown"),
+        backing_array
+    );
+    true
+}
+
+fn zombie_farm_ignore_null_attachment_placeholder(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2"
+        || zombie_farm_object_class_name(env, receiver) != Some("NSNull")
+        || !matches!(
+            selector_name,
+            "calculateRotateValue"
+                | "calculateBonePosition"
+                | "rotateBone:aroundPoint:"
+                | "flipBonePosition"
+                | "rotateBone:aroundPoint:rotateChildren:"
+                | "addBone:"
+                | "setRotation:"
+                | "setSprite:"
+                | "setOriginalAnchor:"
+                | "setOffsetFromRefPoint:"
+                | "setLastFramePosition:"
+                | "setAtlasRect:"
+                | "setLastFrameRotation:"
+                | "setChangeInRotation:"
+                | "setLastFrameScale:"
+                | "setInheritColor:"
+                | "setCanSwap:"
+                | "setChildAttachments:"
+                | "setParentAttachment:"
+                | "setOriginalRotation:"
+                | "setFollowRotation:"
+                | "setImage:"
+                | "setAttachmentZOrder:"
+                | "setFlippedAsset:"
+                | "childAttachments"
+                | "parentAttachment"
+                | "sprite"
+                | "image"
+                | "originalAnchor"
+                | "offsetFromRefPoint"
+                | "lastFramePosition"
+                | "atlasRect"
+                | "lastFrameRotation"
+                | "changeInRotation"
+                | "lastFrameScale"
+                | "inheritColor"
+                | "canSwap"
+                | "originalRotation"
+                | "followRotation"
+                | "attachmentZOrder"
+                | "flippedAsset"
+                | "tag"
+                | "setTag:"
+                | "parent"
+                | "children"
+                | "isVisible"
+                | "visible"
+                | "setVisible:"
+                | "opacity"
+                | "setOpacity:"
+                | "rotation"
+                | "scale"
+                | "scaleX"
+                | "scaleY"
+                | "setScale:"
+                | "setScaleX:"
+                | "setScaleY:"
+                | "addChild:"
+                | "addChild:z:"
+                | "removeFromParent"
+                | "removeFromParentAndCleanup:"
+                | "stopAllActions"
+                | "runAction:"
+                | "cleanup"
+        )
+    {
+        return false;
+    }
+
+    env.cpu.regs_mut()[0] = 0;
+    env.cpu.regs_mut()[1] = 0;
+    log_dbg!(
+        "ZombieFarm2 workaround: ignoring NSNull attachment placeholder [{}]",
+        selector_name
+    );
+    true
+}
+
+fn zombie_farm_last_main_menu() -> Option<id> {
+    let bits = ZOMBIE_FARM_LAST_MAIN_MENU.load(Ordering::Relaxed) as u32;
+    (bits != 0).then_some(id::from_bits(bits))
+}
+
+fn zombie_farm_remove_view_controller_view(
+    env: &mut Environment,
+    controller: id,
+    context: &str,
+) -> bool {
+    if controller == nil {
+        return false;
+    }
+    let Some(view_selector) = env.objc.lookup_selector("view") else {
+        return false;
+    };
+    if !env
+        .objc
+        .object_has_method(&env.mem, controller, view_selector)
+    {
+        return false;
+    }
+
+    let regs = *env.cpu.regs();
+    let view: id = msg_send_no_type_checking(env, (controller, view_selector));
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    if view == nil {
+        return false;
+    }
+
+    let Some(remove_selector) = env.objc.lookup_selector("removeFromSuperview") else {
+        return false;
+    };
+    if !env.objc.object_has_method(&env.mem, view, remove_selector) {
+        return false;
+    }
+
+    let regs = *env.cpu.regs();
+    let _: () = msg_send_no_type_checking(env, (view, remove_selector));
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    log!(
+        "ZombieFarm2 workaround: removed {} view {:?} from superview",
+        context,
+        view
+    );
+    true
+}
+
+fn zombie_farm_remove_stale_uikit_subviews_by_class(env: &mut Environment, class_name: &str) {
+    let removed = crate::frameworks::uikit::ui_view::remove_subviews_by_class(env, class_name);
+    if removed > 0 {
+        log!(
+            "ZombieFarm2 workaround: removed {} stale {} UIKit view(s)",
+            removed,
+            class_name
+        );
+    }
+}
+
+fn zombie_farm_reveal_hud_controls(env: &mut Environment, context: &str) {
+    let revealed = crate::frameworks::uikit::ui_view::reveal_zombie_farm_hud_controls(env);
+    if revealed > 0 {
+        log!(
+            "ZombieFarm2 workaround: revealed {} hidden HUD/UIKit control(s) after {}",
+            revealed,
+            context
+        );
+    }
+}
 
 fn zombie_farm_get_gui_layer(env: &mut Environment) -> Option<id> {
     let gui_layer_class = env.objc.get_known_class("ZFGuiLayer", &mut env.mem);
@@ -402,6 +716,95 @@ fn zombie_farm_get_game_state(env: &mut Environment) -> Option<id> {
     (game_state != nil).then_some(game_state)
 }
 
+fn zombie_farm_get_running_scene(env: &mut Environment) -> Option<id> {
+    let director_class = env.objc.get_known_class("CCDirector", &mut env.mem);
+    let shared_director_selector = env.objc.lookup_selector("sharedDirector")?;
+    if !env
+        .objc
+        .object_has_method(&env.mem, director_class, shared_director_selector)
+    {
+        return None;
+    }
+    let director: id = msg_send_no_type_checking(env, (director_class, shared_director_selector));
+    if director == nil {
+        return None;
+    }
+    let running_scene_selector = env.objc.lookup_selector("runningScene")?;
+    if !env
+        .objc
+        .object_has_method(&env.mem, director, running_scene_selector)
+    {
+        return None;
+    }
+    let running_scene: id = msg_send_no_type_checking(env, (director, running_scene_selector));
+    (running_scene != nil).then_some(running_scene)
+}
+
+fn zombie_farm_find_cocos_child_by_class(
+    env: &mut Environment,
+    root: id,
+    class_name: &str,
+    depth: usize,
+) -> Option<id> {
+    if root == nil || depth > 8 {
+        return None;
+    }
+    if zombie_farm_object_class_name(env, root) == Some(class_name) {
+        return Some(root);
+    }
+
+    let children_selector = env.objc.lookup_selector("children")?;
+    if !env
+        .objc
+        .object_has_method(&env.mem, root, children_selector)
+    {
+        return None;
+    }
+    let children: id = msg_send_no_type_checking(env, (root, children_selector));
+    if children == nil {
+        return None;
+    }
+
+    let count_selector = env.objc.lookup_selector("count")?;
+    let object_at_index_selector = env.objc.lookup_selector("objectAtIndex:")?;
+    if !env
+        .objc
+        .object_has_method(&env.mem, children, count_selector)
+        || !env
+            .objc
+            .object_has_method(&env.mem, children, object_at_index_selector)
+    {
+        return None;
+    }
+    let count: NSUInteger = msg_send_no_type_checking(env, (children, count_selector));
+    for idx in 0..count.min(200) {
+        let child: id = msg_send_no_type_checking(env, (children, object_at_index_selector, idx));
+        if let Some(found) =
+            zombie_farm_find_cocos_child_by_class(env, child, class_name, depth + 1)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn zombie_farm_get_farm_tile_map(env: &mut Environment) -> Option<id> {
+    let running_scene = zombie_farm_get_running_scene(env)?;
+    if let Some(farm_tile_map_selector) = env.objc.lookup_selector("farmTileMap") {
+        if env
+            .objc
+            .object_has_method(&env.mem, running_scene, farm_tile_map_selector)
+        {
+            let tile_map: id =
+                msg_send_no_type_checking(env, (running_scene, farm_tile_map_selector));
+            if tile_map != nil {
+                return Some(tile_map);
+            }
+        }
+    }
+    zombie_farm_find_cocos_child_by_class(env, running_scene, "ZFFarmTileMap", 0)
+}
+
 fn zombie_farm_get_actor_list(env: &mut Environment) -> Option<id> {
     let game_state = zombie_farm_get_game_state(env)?;
     let zf_game_data_selector = env.objc.lookup_selector("zfGameData")?;
@@ -425,6 +828,19 @@ fn zombie_farm_get_actor_list(env: &mut Environment) -> Option<id> {
     }
     let actor_list: id = msg_send_no_type_checking(env, (game_data, actor_list_selector));
     (actor_list != nil).then_some(actor_list)
+}
+
+fn zombie_farm_get_game_data(env: &mut Environment) -> Option<id> {
+    let game_state = zombie_farm_get_game_state(env)?;
+    let zf_game_data_selector = env.objc.lookup_selector("zfGameData")?;
+    if !env
+        .objc
+        .object_has_method(&env.mem, game_state, zf_game_data_selector)
+    {
+        return None;
+    }
+    let game_data: id = msg_send_no_type_checking(env, (game_state, zf_game_data_selector));
+    (game_data != nil).then_some(game_data)
 }
 
 fn zombie_farm_get_live_actor_list(env: &mut Environment) -> Option<id> {
@@ -456,6 +872,21 @@ fn zombie_farm_get_live_actor_list(env: &mut Environment) -> Option<id> {
 fn zombie_farm_actor_is_zombie(env: &Environment, actor: id) -> bool {
     zombie_farm_object_class_name(env, actor)
         .is_some_and(|class_name| class_name.starts_with("ZombieActor"))
+}
+
+fn zombie_farm_write_actor_hunger_ivar(env: &mut Environment, actor: id, hunger: f32) -> bool {
+    let ivar_name = "hunger".to_string();
+    let Some(ivar) = env.objc.object_lookup_ivar(&env.mem, actor, &ivar_name) else {
+        return false;
+    };
+    env.mem.write(ivar.cast(), hunger);
+    true
+}
+
+fn zombie_farm_read_actor_hunger_ivar(env: &Environment, actor: id) -> Option<f32> {
+    let ivar_name = "hunger".to_string();
+    let ivar = env.objc.object_lookup_ivar(&env.mem, actor, &ivar_name)?;
+    Some(env.mem.read(ivar.cast()))
 }
 
 fn zombie_farm_read_object_ivar(env: &Environment, object: id, ivar_name: &str) -> Option<id> {
@@ -733,6 +1164,10 @@ fn zombie_farm_skip_cocos2d_projection_setup(
 ) -> bool {
     if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2"
         || selector_name != "setProjection:"
+        || std::env::var("TOUCHHLE_ZF2_SKIP_PROJECTION")
+            .ok()
+            .as_deref()
+            != Some("1")
     {
         return false;
     }
@@ -1009,6 +1444,324 @@ fn zombie_farm_skip_brain_client_network(
     true
 }
 
+fn zombie_farm_skip_sync_queue_network(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2" {
+        return false;
+    }
+
+    let Some(class_name) = zombie_farm_object_class_name(env, receiver).map(str::to_string) else {
+        return false;
+    };
+
+    let is_sync_operation = matches!(
+        class_name.as_str(),
+        "SyncOperation"
+            | "SetupOperation"
+            | "SetupActiveOperation"
+            | "LoadSaveOperation"
+            | "SyncSaveOperation"
+            | "DownloadSaveOperation"
+            | "UploadSaveOperation"
+            | "SaveGameOperation"
+    );
+    if is_sync_operation
+        && matches!(
+            selector_name,
+            "initWithManager:andDelegate:" | "initWithManager:delegate:" | "initWithDelegate:"
+        )
+    {
+        let (manager, delegate) = if selector_name == "initWithDelegate:" {
+            (nil, id::from_bits(env.cpu.regs()[2]))
+        } else {
+            (
+                id::from_bits(env.cpu.regs()[2]),
+                id::from_bits(env.cpu.regs()[3]),
+            )
+        };
+        zombie_farm_sync_operations().lock().unwrap().insert(
+            receiver.to_bits(),
+            ZombieFarmSyncOperationInfo {
+                manager: manager.to_bits(),
+                delegate: delegate.to_bits(),
+            },
+        );
+        env.cpu.regs_mut()[0] = receiver.to_bits();
+        log!(
+            "ZombieFarm2 workaround: host-handled SyncQueue operation init [{} {}] manager {:?} delegate {:?} ({})",
+            class_name,
+            selector_name,
+            manager,
+            delegate,
+            zombie_farm_object_class_name(env, delegate).unwrap_or("unknown")
+        );
+        return true;
+    }
+
+    let should_skip = if class_name == "SyncQueue" {
+        matches!(
+            selector_name,
+            "addOperation:"
+                | "addOperation:withPriority:"
+                | "addOperations:waitUntilFinished:"
+                | "cancelAllOperations"
+        )
+    } else if is_sync_operation {
+        matches!(selector_name, "start" | "main" | "cancel")
+    } else if class_name == "NSOperationQueue" && selector_name == "addOperation:" {
+        let operation = id::from_bits(env.cpu.regs()[2]);
+        zombie_farm_object_class_name(env, operation).is_some_and(|operation_class| {
+            operation_class == "SyncOperation"
+                || operation_class == "SetupOperation"
+                || operation_class.ends_with("Operation") && operation_class.contains("Save")
+                || operation_class == "SetupActiveOperation"
+        })
+    } else {
+        false
+    };
+
+    if !should_skip {
+        return false;
+    }
+
+    let skipped_setup_active_operation = matches!(
+        selector_name,
+        "addOperation:" | "addOperation:withPriority:"
+    ) && {
+        let operation = id::from_bits(env.cpu.regs()[2]);
+        matches!(
+            zombie_farm_object_class_name(env, operation),
+            Some("SetupOperation" | "SetupActiveOperation")
+        )
+    };
+    if skipped_setup_active_operation {
+        let operation = id::from_bits(env.cpu.regs()[2]);
+        zombie_farm_complete_skipped_setup_operation(env, operation);
+    }
+
+    env.cpu.regs_mut()[0] = 0;
+    log!(
+        "ZombieFarm2 workaround: skipping SyncQueue network [{} {}]",
+        class_name,
+        selector_name
+    );
+    true
+}
+
+fn zombie_farm_complete_skipped_setup_operation(env: &mut Environment, operation: id) {
+    let info = zombie_farm_sync_operations()
+        .lock()
+        .unwrap()
+        .get(&operation.to_bits())
+        .copied();
+    let Some(info) = info else {
+        zombie_farm_finish_skipped_startup_sync(env);
+        return;
+    };
+
+    let delegate = id::from_bits(info.delegate);
+    let manager = id::from_bits(info.manager);
+    log!(
+        "ZombieFarm2 workaround: completing skipped {:?} ({}) manager {:?} delegate {:?} ({})",
+        operation,
+        zombie_farm_object_class_name(env, operation).unwrap_or("unknown"),
+        manager,
+        delegate,
+        zombie_farm_object_class_name(env, delegate).unwrap_or("unknown")
+    );
+
+    if zombie_farm_object_class_name(env, delegate) == Some("LoadingScreen")
+        && zombie_farm_send_noarg_if_responds(env, delegate, "loadFarmScene")
+    {
+        let _ = zombie_farm_remove_view_controller_view(env, delegate, "LoadingScreen");
+        if let Some(main_menu) = zombie_farm_last_main_menu() {
+            let _ = zombie_farm_remove_view_controller_view(env, main_menu, "MainMenu");
+        }
+        zombie_farm_remove_stale_uikit_subviews_by_class(env, "WhiteDimLayer");
+        zombie_farm_reveal_hud_controls(env, "LoadingScreen loadFarmScene");
+        zombie_farm_finish_skipped_startup_sync(env);
+        return;
+    }
+
+    let sent_sync_finished = zombie_farm_send_noarg_if_responds(env, delegate, "syncFinished");
+    if zombie_farm_get_farm_tile_map(env).is_none() {
+        zombie_farm_send_noarg_if_responds(env, delegate, "startGame");
+    }
+    if !sent_sync_finished && zombie_farm_get_farm_tile_map(env).is_none() {
+        zombie_farm_finish_skipped_startup_sync(env);
+    }
+}
+
+fn zombie_farm_finish_skipped_startup_sync(env: &mut Environment) {
+    let Some(gui_layer) = zombie_farm_get_gui_layer(env) else {
+        return;
+    };
+    let Some(startup_complete_selector) = env.objc.lookup_selector("startUpChecksComplete") else {
+        return;
+    };
+    if !env
+        .objc
+        .object_has_method(&env.mem, gui_layer, startup_complete_selector)
+    {
+        return;
+    }
+
+    let regs = *env.cpu.regs();
+    log!("ZombieFarm2 workaround: completing skipped startup sync locally");
+    let _: () = msg_send_no_type_checking(env, (gui_layer, startup_complete_selector));
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    zombie_farm_reveal_hud_controls(env, "startup sync");
+}
+
+fn zombie_farm_return_safe_game_state_count(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2"
+        || zombie_farm_object_class_name(env, receiver) != Some("GameState")
+    {
+        return false;
+    }
+
+    let value = match selector_name {
+        "curArmySize" | "armySize" => 0,
+        "maxArmySize" => 8,
+        _ => return false,
+    };
+
+    env.cpu.regs_mut()[0] = value;
+    log!(
+        "ZombieFarm2 workaround: [{} {}] -> {}",
+        "GameState",
+        selector_name,
+        value
+    );
+    true
+}
+
+fn zombie_farm_skip_remote_dependent_game_state_update(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2"
+        || zombie_farm_object_class_name(env, receiver) != Some("GameState")
+        || selector_name != "updateRemoteDataDependantSystems"
+    {
+        return false;
+    }
+
+    env.cpu.regs_mut()[0] = 0;
+    log!("ZombieFarm2 workaround: skipping [GameState updateRemoteDataDependantSystems]");
+    true
+}
+
+fn zombie_farm_return_self_for_game_data_copy(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2"
+        || zombie_farm_object_class_name(env, receiver) != Some("GameData")
+        || !matches!(
+            selector_name,
+            "copyWithZone:" | "mutableCopyWithZone:" | "copy"
+        )
+    {
+        return false;
+    }
+
+    env.cpu.regs_mut()[0] = retain(env, receiver).to_bits();
+    log!(
+        "ZombieFarm2 workaround: returning retained self for [GameData {}]",
+        selector_name
+    );
+    true
+}
+
+fn zombie_farm_host_actor_manager_init(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2"
+        || zombie_farm_object_class_name(env, receiver) != Some("ZFActorManager")
+    {
+        return false;
+    }
+
+    if matches!(selector_name, "deleteAllFarmActors" | "removeAllActors") {
+        env.cpu.regs_mut()[0] = 0;
+        log!(
+            "ZombieFarm2 workaround: skipping [ZFActorManager {}]",
+            selector_name
+        );
+        return true;
+    }
+
+    false
+}
+
+fn zombie_farm_skip_tool_manager_transient_actions(
+    _env: &mut Environment,
+    _receiver: id,
+    _selector_name: &str,
+) -> bool {
+    false
+}
+
+fn zombie_farm_skip_quest_manager_reset(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2"
+        || zombie_farm_object_class_name(env, receiver) != Some("ZFQuestMan")
+        || !matches!(selector_name, "reset" | "enable:")
+    {
+        return false;
+    }
+
+    env.cpu.regs_mut()[0] = 0;
+    log!(
+        "ZombieFarm2 workaround: skipping [ZFQuestMan {}]",
+        selector_name
+    );
+    true
+}
+
+fn zombie_farm_skip_unsafe_toolbar_build(
+    _env: &mut Environment,
+    _receiver: id,
+    _selector_name: &str,
+) -> bool {
+    false
+}
+
+fn zombie_farm_skip_market_offers(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2"
+        || zombie_farm_object_class_name(env, receiver) != Some("MarketDataManager")
+        || !matches!(selector_name, "offersAvailable" | "hasOffersAvailable")
+    {
+        return false;
+    }
+
+    env.cpu.regs_mut()[0] = 0;
+    log!(
+        "ZombieFarm2 workaround: treating [MarketDataManager {}] as false",
+        selector_name
+    );
+    true
+}
+
 fn zombie_farm_skip_event_ad_networks(
     env: &mut Environment,
     receiver: id,
@@ -1039,13 +1792,21 @@ fn zombie_farm_skip_event_ad_networks(
             || class_name.starts_with("Kiip")
             || class_name == "Flurry"
             || class_name.starts_with("Flurry")
+            || class_name == "Chartboost"
+            || class_name.starts_with("Chartboost")
+            || class_name.starts_with("AdColony")
+            || class_name.starts_with("ADC")
     };
 
     if !should_skip {
         return false;
     }
 
-    env.cpu.regs_mut()[0] = 0;
+    env.cpu.regs_mut()[0] = if selector_name.starts_with("init") {
+        receiver.to_bits()
+    } else {
+        0
+    };
     log!(
         "ZombieFarm2 workaround: skipping ad network [{} {}]",
         class_name,
@@ -1065,6 +1826,7 @@ fn zombie_farm_skip_startup_profile_detection(
             selector_name,
             "determineStartupPlayer"
                 | "determineStartupPlayer:"
+                | "updatePlayerInfo"
                 | "showStartupPlayerSelection"
                 | "showStartupPlayerSelection:"
         )
@@ -1109,6 +1871,172 @@ fn zombie_farm_skip_startup_internet_loading(
         class_name,
         selector_name
     );
+    true
+}
+
+fn zombie_farm_host_load_farm_scene(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2"
+        || zombie_farm_object_class_name(env, receiver) != Some("LoadingScreen")
+        || selector_name != "loadFarmScene"
+        || std::env::var("TOUCHHLE_ZF2_HOST_LOAD_SCENE")
+            .ok()
+            .as_deref()
+            != Some("1")
+    {
+        return false;
+    }
+
+    let regs = *env.cpu.regs();
+    let game_data = zombie_farm_get_game_data(env).unwrap_or(nil);
+    let scene_class = env.objc.get_known_class("ZFFarmGameScene", &mut env.mem);
+    let scene: id = if let Some(node_selector) = env.objc.lookup_selector("node") {
+        if env
+            .objc
+            .object_has_method(&env.mem, scene_class, node_selector)
+        {
+            msg_send_no_type_checking(env, (scene_class, node_selector))
+        } else {
+            nil
+        }
+    } else {
+        nil
+    };
+    let scene: id = if scene != nil {
+        scene
+    } else {
+        let Some(alloc_selector) = env.objc.lookup_selector("alloc") else {
+            return false;
+        };
+        let Some(init_selector) = env.objc.lookup_selector("init") else {
+            return false;
+        };
+        let allocated_scene: id = msg_send_no_type_checking(env, (scene_class, alloc_selector));
+        if allocated_scene == nil {
+            nil
+        } else {
+            msg_send_no_type_checking(env, (allocated_scene, init_selector))
+        }
+    };
+    if scene == nil {
+        env.cpu.regs_mut().copy_from_slice(&regs);
+        return false;
+    }
+
+    if game_data != nil {
+        if let Some(load_scene_selector) = env.objc.lookup_selector("loadSceneWithGameData:") {
+            if env
+                .objc
+                .object_has_method(&env.mem, scene, load_scene_selector)
+            {
+                let _: () = msg_send_no_type_checking(env, (scene, load_scene_selector, game_data));
+            }
+        }
+    }
+    if let Some(startup_selector) = env.objc.lookup_selector("startup") {
+        if env
+            .objc
+            .object_has_method(&env.mem, scene, startup_selector)
+        {
+            let _: () = msg_send_no_type_checking(env, (scene, startup_selector));
+        }
+    }
+
+    let director_class = env.objc.get_known_class("CCDirector", &mut env.mem);
+    if let Some(shared_director_selector) = env.objc.lookup_selector("sharedDirector") {
+        let director: id =
+            msg_send_no_type_checking(env, (director_class, shared_director_selector));
+        if director != nil {
+            let running_scene =
+                if let Some(running_scene_selector) = env.objc.lookup_selector("runningScene") {
+                    if env
+                        .objc
+                        .object_has_method(&env.mem, director, running_scene_selector)
+                    {
+                        msg_send_no_type_checking(env, (director, running_scene_selector))
+                    } else {
+                        nil
+                    }
+                } else {
+                    nil
+                };
+            let scene_selector_name = if running_scene == nil {
+                "runWithScene:"
+            } else {
+                "replaceScene:"
+            };
+            if let Some(scene_selector) = env.objc.lookup_selector(scene_selector_name) {
+                if env
+                    .objc
+                    .object_has_method(&env.mem, director, scene_selector)
+                {
+                    let _: () = msg_send_no_type_checking(env, (director, scene_selector, scene));
+                }
+            }
+        }
+    }
+
+    let tile_map = zombie_farm_get_farm_tile_map(env).unwrap_or(nil);
+    let main_menu = zombie_farm_last_main_menu();
+    let _ = zombie_farm_remove_view_controller_view(env, receiver, "LoadingScreen");
+    if let Some(main_menu) = main_menu {
+        let _ = zombie_farm_remove_view_controller_view(env, main_menu, "MainMenu");
+    }
+    zombie_farm_reveal_hud_controls(env, "host loadFarmScene");
+    zombie_farm_finish_skipped_startup_sync(env);
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    env.cpu.regs_mut()[0] = 0;
+    log!(
+        "ZombieFarm2 workaround: host-loaded farm scene {:?}, tile map {:?}",
+        scene,
+        tile_map
+    );
+    true
+}
+
+fn zombie_farm_skip_farmer_head_modal(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2"
+        || zombie_farm_object_class_name(env, receiver) != Some("FarmerHeadMenu")
+        || selector_name != "open"
+    {
+        return false;
+    }
+
+    let regs = *env.cpu.regs();
+    if let Some(select_selector) = env.objc.lookup_selector("selectHeadIndex:") {
+        if env
+            .objc
+            .object_has_method(&env.mem, receiver, select_selector)
+        {
+            let _: () = msg_send_no_type_checking(env, (receiver, select_selector, 0i32));
+        }
+    }
+    env.cpu.regs_mut().copy_from_slice(&regs);
+
+    let regs = *env.cpu.regs();
+    if let Some(selected_selector) = env.objc.lookup_selector("headSelected") {
+        if env
+            .objc
+            .object_has_method(&env.mem, receiver, selected_selector)
+        {
+            let _: () = msg_send_no_type_checking(env, (receiver, selected_selector));
+        }
+    }
+    env.cpu.regs_mut().copy_from_slice(&regs);
+
+    let _ = zombie_farm_remove_view_controller_view(env, receiver, "FarmerHeadMenu");
+    zombie_farm_remove_stale_uikit_subviews_by_class(env, "WhiteDimLayer");
+    zombie_farm_reveal_hud_controls(env, "FarmerHeadMenu");
+    zombie_farm_finish_skipped_startup_sync(env);
+    env.cpu.regs_mut()[0] = 0;
+    log!("ZombieFarm2 workaround: selected default farmer head and skipped FarmerHeadMenu open");
     true
 }
 
@@ -1165,6 +2093,591 @@ fn zombie_farm_skip_cocos_denshion_effects(
     true
 }
 
+fn zombie_farm_route_eagl_view_touches(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2"
+        || zombie_farm_object_class_name(env, receiver) != Some("EAGLView")
+        || !matches!(
+            selector_name,
+            "touchesBegan:withEvent:"
+                | "touchesMoved:withEvent:"
+                | "touchesEnded:withEvent:"
+                | "touchesCancelled:withEvent:"
+        )
+    {
+        return false;
+    }
+
+    let dispatcher_class = env.objc.get_known_class("CCTouchDispatcher", &mut env.mem);
+    let Some(shared_dispatcher_selector) = env.objc.lookup_selector("sharedDispatcher") else {
+        return false;
+    };
+    if !env
+        .objc
+        .object_has_method(&env.mem, dispatcher_class, shared_dispatcher_selector)
+    {
+        return false;
+    }
+    let Some(touch_selector) = env.objc.lookup_selector(selector_name) else {
+        return false;
+    };
+
+    let touches = id::from_bits(env.cpu.regs()[2]);
+    let event = id::from_bits(env.cpu.regs()[3]);
+    let regs = *env.cpu.regs();
+    let dispatcher: id =
+        msg_send_no_type_checking(env, (dispatcher_class, shared_dispatcher_selector));
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    if dispatcher == nil
+        || !env
+            .objc
+            .object_has_method(&env.mem, dispatcher, touch_selector)
+    {
+        return false;
+    }
+
+    let regs = *env.cpu.regs();
+    let _: () = msg_send_no_type_checking(env, (dispatcher, touch_selector, touches, event));
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    env.cpu.regs_mut()[0] = 0;
+    log!(
+        "ZombieFarm2 workaround: routed [EAGLView {}] to CCTouchDispatcher {:?}",
+        selector_name,
+        dispatcher
+    );
+    true
+}
+
+fn zombie_farm_host_cocos_touch_dispatcher(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2"
+        || zombie_farm_object_class_name(env, receiver) != Some("CCTouchDispatcher")
+    {
+        return false;
+    }
+
+    match selector_name {
+        "addTargetedDelegate:priority:swallowsTouches:" => {
+            let delegate = id::from_bits(env.cpu.regs()[2]);
+            if zombie_farm_object_pointer_looks_valid(env, delegate) {
+                let mut handlers = zombie_farm_cocos_touch_handlers().lock().unwrap();
+                let entry = handlers.entry(receiver.to_bits()).or_default();
+                let delegate_bits = delegate.to_bits();
+                if !entry.targeted.contains(&delegate_bits) {
+                    entry.targeted.push(delegate_bits);
+                }
+                log!(
+                    "ZombieFarm2 workaround: host CCTouchDispatcher add targeted delegate {:?} ({})",
+                    delegate,
+                    zombie_farm_object_class_name(env, delegate).unwrap_or("unknown")
+                );
+            }
+            env.cpu.regs_mut()[0] = 0;
+            true
+        }
+        "addStandardDelegate:priority:" => {
+            let delegate = id::from_bits(env.cpu.regs()[2]);
+            if zombie_farm_object_pointer_looks_valid(env, delegate) {
+                let mut handlers = zombie_farm_cocos_touch_handlers().lock().unwrap();
+                let entry = handlers.entry(receiver.to_bits()).or_default();
+                let delegate_bits = delegate.to_bits();
+                if !entry.standard.contains(&delegate_bits) {
+                    entry.standard.push(delegate_bits);
+                }
+                log!(
+                    "ZombieFarm2 workaround: host CCTouchDispatcher add standard delegate {:?} ({})",
+                    delegate,
+                    zombie_farm_object_class_name(env, delegate).unwrap_or("unknown")
+                );
+            }
+            env.cpu.regs_mut()[0] = 0;
+            true
+        }
+        "removeDelegate:" => {
+            let delegate_bits = env.cpu.regs()[2];
+            let mut handlers = zombie_farm_cocos_touch_handlers().lock().unwrap();
+            if let Some(entry) = handlers.get_mut(&receiver.to_bits()) {
+                entry.targeted.retain(|&value| value != delegate_bits);
+                entry.standard.retain(|&value| value != delegate_bits);
+                for claimed in entry.claimed_targeted.values_mut() {
+                    claimed.retain(|&value| value != delegate_bits);
+                }
+            }
+            env.cpu.regs_mut()[0] = 0;
+            true
+        }
+        "removeAllDelegates" => {
+            zombie_farm_cocos_touch_handlers()
+                .lock()
+                .unwrap()
+                .remove(&receiver.to_bits());
+            env.cpu.regs_mut()[0] = 0;
+            true
+        }
+        "dispatchEvents" => {
+            env.cpu.regs_mut()[0] = 1;
+            true
+        }
+        "setDispatchEvents:" => {
+            env.cpu.regs_mut()[0] = 0;
+            true
+        }
+        "touchesBegan:withEvent:"
+        | "touchesMoved:withEvent:"
+        | "touchesEnded:withEvent:"
+        | "touchesCancelled:withEvent:" => {
+            zombie_farm_dispatch_cocos_touches(env, receiver, selector_name);
+            env.cpu.regs_mut()[0] = 0;
+            true
+        }
+        "touches:withEvent:withTouchType:" => {
+            env.cpu.regs_mut()[0] = 0;
+            log!("ZombieFarm2 workaround: ignoring raw CCTouchDispatcher touch multiplexer");
+            true
+        }
+        _ => false,
+    }
+}
+
+fn zombie_farm_dispatch_cocos_touches(env: &mut Environment, dispatcher: id, selector_name: &str) {
+    let mut handlers = zombie_farm_cocos_touch_handlers()
+        .lock()
+        .unwrap()
+        .get(&dispatcher.to_bits())
+        .cloned()
+        .unwrap_or_default();
+
+    let regs = *env.cpu.regs();
+    let fallback_touch_delegate = zombie_farm_get_farm_tile_map(env);
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    if let Some(touch_delegate) = fallback_touch_delegate {
+        let delegate_bits = touch_delegate.to_bits();
+        if !handlers.targeted.contains(&delegate_bits) {
+            log!(
+                "ZombieFarm2 workaround: adding {:?} ({}) as fallback Cocos touch delegate",
+                touch_delegate,
+                zombie_farm_object_class_name(env, touch_delegate).unwrap_or("unknown")
+            );
+            handlers.targeted.push(delegate_bits);
+        }
+    }
+
+    if handlers.targeted.is_empty() && handlers.standard.is_empty() {
+        log!(
+            "ZombieFarm2 workaround: no Cocos touch delegates for {}",
+            selector_name
+        );
+        return;
+    }
+
+    let touches = id::from_bits(env.cpu.regs()[2]);
+    let event = id::from_bits(env.cpu.regs()[3]);
+    let Some(any_object_selector) = env.objc.lookup_selector("anyObject") else {
+        return;
+    };
+    let regs = *env.cpu.regs();
+    let touch: id = msg_send_no_type_checking(env, (touches, any_object_selector));
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    if touch == nil {
+        return;
+    }
+    let touch_bits = touch.to_bits();
+    let touch_trace_enabled = zombie_farm_touch_trace_enabled();
+    if touch_trace_enabled {
+        if let Some(location_selector) = env.objc.lookup_selector("locationInView:") {
+            let regs = *env.cpu.regs();
+            let location: CGPoint = msg_send_no_type_checking(env, (touch, location_selector, nil));
+            env.cpu.regs_mut().copy_from_slice(&regs);
+            log!(
+                "ZombieFarm2 touch trace: dispatch {} touch {:?} location {} targeted={} standard={}",
+                selector_name,
+                touch,
+                location,
+                handlers.targeted.len(),
+                handlers.standard.len(),
+            );
+        }
+    }
+
+    let (targeted_selector_name, standard_selector_name, targeted_returns_bool) =
+        match selector_name {
+            "touchesBegan:withEvent:" => {
+                ("ccTouchBegan:withEvent:", "ccTouchesBegan:withEvent:", true)
+            }
+            "touchesMoved:withEvent:" => (
+                "ccTouchMoved:withEvent:",
+                "ccTouchesMoved:withEvent:",
+                false,
+            ),
+            "touchesEnded:withEvent:" => (
+                "ccTouchEnded:withEvent:",
+                "ccTouchesEnded:withEvent:",
+                false,
+            ),
+            "touchesCancelled:withEvent:" => (
+                "ccTouchCancelled:withEvent:",
+                "ccTouchesCancelled:withEvent:",
+                false,
+            ),
+            _ => return,
+        };
+
+    if let Some(targeted_selector) = env.objc.lookup_selector(targeted_selector_name) {
+        let targeted_delegates = if selector_name == "touchesBegan:withEvent:" {
+            handlers.targeted.clone()
+        } else {
+            let claimed = handlers
+                .claimed_targeted
+                .get(&touch_bits)
+                .cloned()
+                .unwrap_or_default();
+            if claimed.is_empty() {
+                log_dbg!(
+                    "ZombieFarm2 workaround: no claimed Cocos touch delegates for {}, falling back to registered targeted delegates",
+                    selector_name
+                );
+                handlers.targeted.clone()
+            } else {
+                claimed
+            }
+        };
+        let mut claimed_delegates = Vec::new();
+        for delegate_bits in targeted_delegates {
+            let delegate = id::from_bits(delegate_bits);
+            if !zombie_farm_object_pointer_looks_valid(env, delegate)
+                || !env
+                    .objc
+                    .object_has_method(&env.mem, delegate, targeted_selector)
+            {
+                continue;
+            }
+            let regs = *env.cpu.regs();
+            if targeted_returns_bool {
+                let claimed: bool =
+                    msg_send_no_type_checking(env, (delegate, targeted_selector, touch, event));
+                if claimed {
+                    claimed_delegates.push(delegate_bits);
+                }
+                log_dbg!(
+                    "ZombieFarm2 workaround: [{} ccTouchBegan] returned {}",
+                    zombie_farm_object_class_name(env, delegate).unwrap_or("unknown"),
+                    claimed
+                );
+                if touch_trace_enabled {
+                    log!(
+                        "ZombieFarm2 touch trace: [{} ccTouchBegan] returned {}",
+                        zombie_farm_object_class_name(env, delegate).unwrap_or("unknown"),
+                        claimed
+                    );
+                }
+            } else {
+                let _: () =
+                    msg_send_no_type_checking(env, (delegate, targeted_selector, touch, event));
+                if touch_trace_enabled {
+                    log!(
+                        "ZombieFarm2 touch trace: sent [{} {}]",
+                        zombie_farm_object_class_name(env, delegate).unwrap_or("unknown"),
+                        targeted_selector_name
+                    );
+                }
+            }
+            env.cpu.regs_mut().copy_from_slice(&regs);
+        }
+        if selector_name == "touchesBegan:withEvent:" {
+            let mut all_handlers = zombie_farm_cocos_touch_handlers().lock().unwrap();
+            let entry = all_handlers.entry(dispatcher.to_bits()).or_default();
+            if claimed_delegates.is_empty() {
+                entry.claimed_targeted.remove(&touch_bits);
+            } else {
+                entry.claimed_targeted.insert(touch_bits, claimed_delegates);
+            }
+        } else if matches!(
+            selector_name,
+            "touchesEnded:withEvent:" | "touchesCancelled:withEvent:"
+        ) {
+            let mut all_handlers = zombie_farm_cocos_touch_handlers().lock().unwrap();
+            if let Some(entry) = all_handlers.get_mut(&dispatcher.to_bits()) {
+                entry.claimed_targeted.remove(&touch_bits);
+            }
+        }
+    }
+
+    if let Some(standard_selector) = env.objc.lookup_selector(standard_selector_name) {
+        for delegate_bits in handlers.standard {
+            let delegate = id::from_bits(delegate_bits);
+            if !zombie_farm_object_pointer_looks_valid(env, delegate)
+                || !env
+                    .objc
+                    .object_has_method(&env.mem, delegate, standard_selector)
+            {
+                continue;
+            }
+            let regs = *env.cpu.regs();
+            let _: () =
+                msg_send_no_type_checking(env, (delegate, standard_selector, touches, event));
+            env.cpu.regs_mut().copy_from_slice(&regs);
+        }
+    }
+}
+
+fn zombie_farm_skip_unsafe_cocos_touch_dispatch(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2"
+        || !matches!(selector_name, "touchesCancelled:withEvent:")
+        || zombie_farm_object_class_name(env, receiver) != Some("CCTouchDispatcher")
+    {
+        return false;
+    }
+
+    env.cpu.regs_mut()[0] = 0;
+    log!(
+        "ZombieFarm2 workaround: skipping unsafe CCTouchDispatcher {}",
+        selector_name
+    );
+    true
+}
+
+fn zombie_farm_trace_game_interaction_message(
+    env: &Environment,
+    receiver: id,
+    selector_name: &str,
+) {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2" {
+        return;
+    }
+
+    if !zombie_farm_touch_trace_enabled() {
+        return;
+    }
+
+    if !matches!(
+        selector_name,
+        "tileTapped:"
+            | "actorTapped:"
+            | "touchedTileNodeForLocation:checkDimensions:"
+            | "tileFromScreenPoint:considerOffMap:"
+            | "validTile:"
+            | "touched:checkDimensions:"
+            | "onTileClickUp:forTool:"
+            | "onActorClickUp:forTool:"
+            | "attemptToPlaceItemAtPoint:"
+            | "placeToolOnNearestTileToPointOnMap:forTool:"
+            | "pushGameAction:onTile:withRect:withItem:"
+            | "popGameActionAndExecute:"
+            | "setCurrentPlayerAction:"
+            | "currentPlayerAction"
+            | "clearMap"
+            | "harvestPlantCropAt:"
+            | "harvestZombieCropAt:"
+            | "isPlantCrop"
+            | "isZombieCrop"
+            | "isHarvestable"
+            | "ready"
+            | "timeLeftToHarvestCropTile:"
+            | "isTilePlantable:"
+            | "canPlaceTileOfSize:at:"
+            | "tutorialZombieHarvested"
+            | "selectTool:withLabel:withImage:"
+            | "selectTool:withLabel:"
+            | "toolSelected:"
+            | "currentGameTool"
+            | "setCurrentGameTool:"
+            | "toolCleanup:"
+            | "payForItemFromTool:"
+            | "deductResourceForAction:"
+            | "clearAllGameActions"
+            | "menuTapped"
+            | "marketTapped"
+            | "itemTapped:"
+            | "questJournalTapped"
+            | "goldBarTapped"
+            | "brainsBarTapped"
+    ) {
+        return;
+    }
+
+    let stack_detail = if selector_name == "onTileClickUp:forTool:" {
+        let stack_tool: u32 = env.mem.read(ConstPtr::from_bits(env.cpu.regs()[Cpu::SP]));
+        format!(" stack_tool={}", stack_tool)
+    } else {
+        String::new()
+    };
+
+    log!(
+        "ZombieFarm2 touch trace: [{} {}] r2=0x{:x} r3=0x{:x}{}",
+        zombie_farm_object_class_name(env, receiver).unwrap_or("unknown"),
+        selector_name,
+        env.cpu.regs()[2],
+        env.cpu.regs()[3],
+        stack_detail,
+    );
+}
+
+fn zombie_farm_force_status_bar_timeout(env: &mut Environment, receiver: id, selector_name: &str) {
+    if !env
+        .bundle
+        .bundle_identifier()
+        .starts_with("com.playforge.Z")
+    {
+        return;
+    }
+
+    let is_status_bar_message = selector_name == "statusMessage:cancelAfter:";
+    let is_status_bar_view_message = zombie_farm_object_class_name(env, receiver)
+        == Some("StatusBar")
+        && matches!(
+            selector_name,
+            "showMessage:withCancelTimeout:andCancelNotification:"
+                | "updateMessage:andCancelTimeout:andCancelNotification:"
+        );
+    if !is_status_bar_message && !is_status_bar_view_message {
+        return;
+    }
+
+    let regs = *env.cpu.regs();
+    let timeout: id = msg_class![env; NSNumber numberWithFloat:1.0f32];
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    env.cpu.regs_mut()[3] = timeout.to_bits();
+    log!(
+        "ZombieFarm workaround: forcing [StatusBar {}] timeout to 1s",
+        selector_name
+    );
+    zombie_farm_schedule_status_bar_hide(env, receiver);
+}
+
+fn zombie_farm_schedule_delayed_noarg_selector(
+    env: &mut Environment,
+    target: id,
+    selector_name: &str,
+    delay: f64,
+) -> bool {
+    if target == nil {
+        return false;
+    }
+    let Some(selector) = env.objc.lookup_selector(selector_name) else {
+        return false;
+    };
+    if !env.objc.object_has_method(&env.mem, target, selector) {
+        return false;
+    }
+    let Some(delayed_selector) = env
+        .objc
+        .lookup_selector("performSelector:withObject:afterDelay:")
+    else {
+        return false;
+    };
+    if !env
+        .objc
+        .object_has_method(&env.mem, target, delayed_selector)
+    {
+        return false;
+    }
+
+    let regs = *env.cpu.regs();
+    let _: () = msg_send_no_type_checking(env, (target, delayed_selector, selector, nil, delay));
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    true
+}
+
+fn zombie_farm_schedule_status_bar_hide(env: &mut Environment, receiver: id) {
+    let regs = *env.cpu.regs();
+    let status_bar_class = env.objc.get_known_class("StatusBar", &mut env.mem);
+    let status_bar = if let Some(status_bar_selector) = env.objc.lookup_selector("statusBar") {
+        if env
+            .objc
+            .object_has_method(&env.mem, status_bar_class, status_bar_selector)
+        {
+            msg_send_no_type_checking(env, (status_bar_class, status_bar_selector))
+        } else {
+            nil
+        }
+    } else {
+        nil
+    };
+    let status_bar =
+        if status_bar == nil && zombie_farm_object_class_name(env, receiver) == Some("StatusBar") {
+            receiver
+        } else {
+            status_bar
+        };
+    env.cpu.regs_mut().copy_from_slice(&regs);
+
+    let scheduled_hide = zombie_farm_schedule_delayed_noarg_selector(env, status_bar, "hide", 1.0);
+
+    let view = if status_bar != nil {
+        let regs = *env.cpu.regs();
+        let view = if let Some(view_selector) = env.objc.lookup_selector("view") {
+            if env
+                .objc
+                .object_has_method(&env.mem, status_bar, view_selector)
+            {
+                msg_send_no_type_checking(env, (status_bar, view_selector))
+            } else {
+                nil
+            }
+        } else {
+            nil
+        };
+        env.cpu.regs_mut().copy_from_slice(&regs);
+        view
+    } else {
+        nil
+    };
+    let scheduled_remove =
+        zombie_farm_schedule_delayed_noarg_selector(env, view, "removeFromSuperview", 1.0);
+
+    log!(
+        "ZombieFarm workaround: scheduled StatusBar cleanup in 1s (hide={}, removeView={})",
+        scheduled_hide,
+        scheduled_remove
+    );
+}
+
+fn zombie_farm_trace_game_interaction_return(env: &Environment, receiver: id, selector_name: &str) {
+    if env.bundle.bundle_identifier() != "com.playforge.ZombieFarm2"
+        || !zombie_farm_touch_trace_enabled()
+        || !matches!(
+            zombie_farm_object_class_name(env, receiver),
+            Some("ZFFarmTileMap" | "ZFTileManager" | "ZFToolManager" | "Tile")
+        )
+        || !matches!(
+            selector_name,
+            "touchedTileNodeForLocation:checkDimensions:"
+                | "tileFromScreenPoint:considerOffMap:"
+                | "validTile:"
+                | "touched:checkDimensions:"
+                | "harvestPlantCropAt:"
+                | "harvestZombieCropAt:"
+                | "isPlantCrop"
+                | "isZombieCrop"
+                | "isHarvestable"
+                | "ready"
+                | "timeLeftToHarvestCropTile:"
+                | "isTilePlantable:"
+                | "canPlaceTileOfSize:at:"
+                | "toolSelected:"
+        )
+    {
+        return;
+    }
+
+    log!(
+        "ZombieFarm2 touch trace: [{} {}] -> r0=0x{:x}",
+        zombie_farm_object_class_name(env, receiver).unwrap_or("unknown"),
+        selector_name,
+        env.cpu.regs()[0],
+    );
+}
+
 fn zombie_farm_actor_hunger(env: &mut Environment, actor: id) -> Option<f32> {
     if actor == nil {
         return None;
@@ -1186,6 +2699,10 @@ fn zombie_farm_set_actor_hunger(env: &mut Environment, actor: id, hunger: f32) -
         return false;
     }
 
+    if zombie_farm_actor_is_zombie(env, actor) {
+        return zombie_farm_write_actor_hunger_ivar(env, actor, hunger.max(1.0).clamp(0.0, 1.0));
+    }
+
     if let Some(set_hunger_selector) = env.objc.lookup_selector("setHunger:") {
         if env
             .objc
@@ -1196,12 +2713,105 @@ fn zombie_farm_set_actor_hunger(env: &mut Environment, actor: id, hunger: f32) -
         }
     }
 
-    let ivar_name = "hunger".to_string();
-    let Some(ivar) = env.objc.object_lookup_ivar(&env.mem, actor, &ivar_name) else {
-        return false;
+    zombie_farm_write_actor_hunger_ivar(env, actor, hunger)
+}
+
+fn zombie_farm_force_zombie_hunger_in_list(env: &mut Environment, actor_list: id) -> (u32, u32) {
+    let Some(count_selector) = env.objc.lookup_selector("count") else {
+        return (0, 0);
     };
-    env.mem.write(ivar.cast(), hunger);
-    true
+    let Some(object_at_index_selector) = env.objc.lookup_selector("objectAtIndex:") else {
+        return (0, 0);
+    };
+    if !env
+        .objc
+        .object_has_method(&env.mem, actor_list, count_selector)
+        || !env
+            .objc
+            .object_has_method(&env.mem, actor_list, object_at_index_selector)
+    {
+        return (0, 0);
+    }
+
+    let count: NSUInteger = msg_send_no_type_checking(env, (actor_list, count_selector));
+    let mut zombies = 0u32;
+    let mut changed = 0u32;
+    for idx in 0..count {
+        let actor: id = msg_send_no_type_checking(env, (actor_list, object_at_index_selector, idx));
+        if actor == nil || !zombie_farm_actor_is_zombie(env, actor) {
+            continue;
+        }
+        zombies += 1;
+        let old_hunger = zombie_farm_read_actor_hunger_ivar(env, actor).unwrap_or(0.0);
+        if old_hunger < 0.999 && zombie_farm_write_actor_hunger_ivar(env, actor, 1.0) {
+            changed += 1;
+        }
+    }
+    (zombies, changed)
+}
+
+fn zombie_farm_force_all_zombie_hunger(env: &mut Environment, reason: &str) {
+    if !zombie_farm_uses_playforge_bundle(env) {
+        return;
+    }
+
+    let mut zombies = 0u32;
+    let mut changed = 0u32;
+    for actor_list in [
+        zombie_farm_get_actor_list(env),
+        zombie_farm_get_live_actor_list(env),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let (list_zombies, list_changed) = zombie_farm_force_zombie_hunger_in_list(env, actor_list);
+        zombies += list_zombies;
+        changed += list_changed;
+    }
+
+    if zombies > 0 && changed > 0 {
+        log_dbg!(
+            "ZombieFarm status: force-filled hunger for {}/{} zombie actor entries before {}",
+            changed,
+            zombies,
+            reason
+        );
+    }
+}
+
+fn zombie_farm_force_zombie_hunger_message(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if !zombie_farm_uses_playforge_bundle(env) {
+        return false;
+    }
+
+    if selector_name == "getAverageHunger" {
+        zombie_farm_force_all_zombie_hunger(env, "getAverageHunger");
+        env.cpu.regs_mut()[0] = 1.0f32.to_bits();
+        log_dbg!("ZombieFarm status: [getAverageHunger] -> 1.000");
+        return true;
+    }
+
+    if !zombie_farm_actor_is_zombie(env, receiver) {
+        return false;
+    }
+
+    match selector_name {
+        "hunger" => {
+            zombie_farm_write_actor_hunger_ivar(env, receiver, 1.0);
+            env.cpu.regs_mut()[0] = 1.0f32.to_bits();
+            true
+        }
+        "setHunger:" => {
+            zombie_farm_write_actor_hunger_ivar(env, receiver, 1.0);
+            env.cpu.regs_mut()[0] = 0;
+            true
+        }
+        _ => false,
+    }
 }
 
 fn zombie_farm_zombie_hungers_in_list(env: &mut Environment, actor_list: id) -> Vec<f32> {
@@ -1231,6 +2841,102 @@ fn zombie_farm_zombie_hungers_in_list(env: &mut Environment, actor_list: id) -> 
         hungers.push(zombie_farm_actor_hunger(env, actor).unwrap_or(0.0));
     }
     hungers
+}
+
+fn zombie_farm_apply_zombie_hungers_to_list(
+    env: &mut Environment,
+    actor_list: id,
+    target_hungers: &[f32],
+) -> (u32, u32, f32) {
+    let Some(count_selector) = env.objc.lookup_selector("count") else {
+        return (0, 0, 0.0);
+    };
+    let Some(object_at_index_selector) = env.objc.lookup_selector("objectAtIndex:") else {
+        return (0, 0, 0.0);
+    };
+    if !env
+        .objc
+        .object_has_method(&env.mem, actor_list, count_selector)
+        || !env
+            .objc
+            .object_has_method(&env.mem, actor_list, object_at_index_selector)
+    {
+        return (0, 0, 0.0);
+    }
+
+    let count: NSUInteger = msg_send_no_type_checking(env, (actor_list, count_selector));
+    let mut zombies = 0u32;
+    let mut changed = 0u32;
+    let mut max_hunger = 0.0f32;
+    for idx in 0..count {
+        let actor: id = msg_send_no_type_checking(env, (actor_list, object_at_index_selector, idx));
+        if actor == nil || !zombie_farm_actor_is_zombie(env, actor) {
+            continue;
+        }
+
+        let Some(&target_hunger) = target_hungers.get(zombies as usize) else {
+            break;
+        };
+        zombies += 1;
+        let old_hunger = zombie_farm_actor_hunger(env, actor).unwrap_or(0.0);
+        let new_hunger = old_hunger.max(target_hunger).clamp(0.0, 1.0);
+        if new_hunger > old_hunger + 0.001 && zombie_farm_set_actor_hunger(env, actor, new_hunger) {
+            changed += 1;
+        }
+        max_hunger = max_hunger.max(new_hunger);
+    }
+
+    (zombies, changed, max_hunger)
+}
+
+fn zombie_farm_sync_actor_hunger_lists(env: &mut Environment) -> (u32, u32, f32) {
+    let lists = [
+        zombie_farm_get_actor_list(env),
+        zombie_farm_get_live_actor_list(env),
+    ];
+    let mut target_hungers = Vec::new();
+    for actor_list in lists.into_iter().flatten() {
+        for (idx, hunger) in zombie_farm_zombie_hungers_in_list(env, actor_list)
+            .into_iter()
+            .enumerate()
+        {
+            if idx == target_hungers.len() {
+                target_hungers.push(hunger);
+            } else if let Some(target) = target_hungers.get_mut(idx) {
+                *target = (*target).max(hunger);
+            }
+        }
+    }
+    if target_hungers.is_empty() {
+        return (0, 0, 0.0);
+    }
+
+    let mut zombies = 0u32;
+    let mut changed = 0u32;
+    let mut max_hunger = 0.0f32;
+    for actor_list in [
+        zombie_farm_get_actor_list(env),
+        zombie_farm_get_live_actor_list(env),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let (list_zombies, list_changed, list_max_hunger) =
+            zombie_farm_apply_zombie_hungers_to_list(env, actor_list, &target_hungers);
+        zombies += list_zombies;
+        changed += list_changed;
+        max_hunger = max_hunger.max(list_max_hunger);
+    }
+
+    if changed > 0 {
+        log_dbg!(
+            "ZombieFarm status: synced hunger for {}/{} zombie actor entries, max hunger {:.3}",
+            changed,
+            zombies,
+            max_hunger
+        );
+    }
+    (zombies, changed, max_hunger)
 }
 
 fn zombie_farm_zombie_eat_dates_near(
@@ -1444,8 +3150,13 @@ fn zombie_farm_apply_offline_actor_hunger(env: &mut Environment) {
         max_hunger = max_hunger.max(list_max_hunger);
     }
 
+    let (sync_zombies, sync_changed, sync_max_hunger) = zombie_farm_sync_actor_hunger_lists(env);
+    zombies += sync_zombies;
+    changed += sync_changed;
+    max_hunger = max_hunger.max(sync_max_hunger);
+
     zombie_farm_set_game_state_save_date(env, game_state, now);
-    log!(
+    log_dbg!(
         "ZombieFarm status: local hunger advanced {}/{} zombie actor entries by {:.0}s since saveDate ({:.3} hunger), max hunger {:.3}",
         changed,
         zombies,
@@ -1488,6 +3199,11 @@ fn zombie_farm_apply_local_hunger_update(env: &mut Environment, receiver: id, se
     let is_gui_layer = gui_layer
         .map(|gui_layer| zombie_farm_set_gui_layer_server_date_to_now(env, gui_layer))
         .unwrap_or(false);
+    if env.bundle.bundle_identifier() == "com.playforge.ZombieFarm2" {
+        log_dbg!("ZombieFarm2 workaround: skipping offline hunger update during startup");
+        env.cpu.regs_mut().copy_from_slice(&regs);
+        return;
+    }
     let Some(apply_hunger_selector) = env.objc.lookup_selector("applyZombieHunger") else {
         zombie_farm_apply_offline_actor_hunger(env);
         env.cpu.regs_mut().copy_from_slice(&regs);
@@ -1501,7 +3217,7 @@ fn zombie_farm_apply_local_hunger_update(env: &mut Environment, receiver: id, se
                 .objc
                 .object_has_method(&env.mem, gui_layer, apply_hunger_selector)
         {
-            log!("ZombieFarm status: applying offline zombie hunger update");
+            log_dbg!("ZombieFarm status: applying offline zombie hunger update");
             let _: () = msg_send_no_type_checking(env, (gui_layer, apply_hunger_selector));
         }
     }
@@ -1518,6 +3234,12 @@ fn zombie_farm_prepare_local_hunger_update(env: &mut Environment, selector_name:
             | "updateSelectedZombieInfo"
             | "displayHunger"
             | "table:cellTouched:"
+            | "saveGame"
+            | "startInvasion:"
+            | "startInvasion:checkHunger:"
+            | "startInvasionWithDictionary:checkHunger:"
+            | "invadeButtonTapped:"
+            | "switchToFightScene"
     ) {
         return;
     }
@@ -1525,6 +3247,7 @@ fn zombie_farm_prepare_local_hunger_update(env: &mut Environment, selector_name:
     let regs = *env.cpu.regs();
     zombie_farm_ensure_game_state_save_date(env);
     zombie_farm_apply_offline_actor_hunger(env);
+    zombie_farm_force_all_zombie_hunger(env, selector_name);
     env.cpu.regs_mut().copy_from_slice(&regs);
 }
 
@@ -1995,6 +3718,31 @@ fn objc_msgSend_inner(
     maybe_initialize_class(env, receiver);
 
     let selector_name = selector.as_str(&env.mem).to_string();
+    trace_zombie_farm_sprite_message(env, receiver, &selector_name);
+    zombie_farm_trace_game_interaction_message(env, receiver, &selector_name);
+    zombie_farm_force_status_bar_timeout(env, receiver, &selector_name);
+    if zombie_farm_forward_backing_array_fast_enumeration(env, receiver, selector, &selector_name) {
+        return;
+    }
+    if zombie_farm_ignore_null_attachment_placeholder(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_force_zombie_hunger_message(env, receiver, &selector_name) {
+        return;
+    }
+    if env.bundle.bundle_identifier() == "com.playforge.ZombieFarm2"
+        && (zombie_farm_object_class_name(env, receiver) == Some("MainMenu")
+            || selector_name == "playTapped")
+    {
+        ZOMBIE_FARM_LAST_MAIN_MENU.store(receiver.to_bits() as usize, Ordering::Relaxed);
+        if selector_name == "playTapped" {
+            log!(
+                "ZombieFarm2 workaround: remembered {:?} ({}) as MainMenu candidate",
+                receiver,
+                zombie_farm_object_class_name(env, receiver).unwrap_or("unknown")
+            );
+        }
+    }
     if let Some(result) = zombie_farm_md5sum_override(env, &selector_name) {
         env.cpu.regs_mut()[0] = result.to_bits();
         return;
@@ -2036,7 +3784,40 @@ fn objc_msgSend_inner(
     if zombie_farm_skip_brain_client_network(env, receiver, &selector_name) {
         return;
     }
+    if zombie_farm_skip_sync_queue_network(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_return_safe_game_state_count(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_skip_remote_dependent_game_state_update(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_return_self_for_game_data_copy(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_host_actor_manager_init(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_skip_tool_manager_transient_actions(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_skip_quest_manager_reset(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_skip_unsafe_toolbar_build(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_skip_market_offers(env, receiver, &selector_name) {
+        return;
+    }
     if zombie_farm_skip_event_ad_networks(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_skip_farmer_head_modal(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_host_load_farm_scene(env, receiver, &selector_name) {
         return;
     }
     if zombie_farm_skip_startup_profile_detection(env, receiver, &selector_name) {
@@ -2046,6 +3827,15 @@ fn objc_msgSend_inner(
         return;
     }
     if zombie_farm_skip_cocos_denshion_effects(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_route_eagl_view_touches(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_host_cocos_touch_dispatcher(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_skip_unsafe_cocos_touch_dispatch(env, receiver, &selector_name) {
         return;
     }
     zombie_farm_prepare_local_server_date(env, receiver, &selector_name);
@@ -2130,7 +3920,9 @@ fn objc_msgSend_inner(
                     .unwrap_or(name)
                     .to_string();
                 let receiver_class_name = receiver_class_name_owned.as_str();
-                if zombie_farm_uses_playforge_bundle(env) {
+                let zombie_farm_debug_enabled =
+                    zombie_farm_uses_playforge_bundle(env) && crate::zombie_farm_debug::enabled();
+                if zombie_farm_debug_enabled {
                     crate::zombie_farm_debug::record_objc_message(
                         receiver,
                         receiver_class_name,
@@ -2138,32 +3930,32 @@ fn objc_msgSend_inner(
                         env.cpu.regs(),
                     );
                 }
-                let trace_zombie_farm_layout =
-                    trace_zombie_farm_layout_message(receiver_class_name, selector_name)
-                        || trace_zombie_farm_layout_message(name, selector_name);
-                let trace_zombie_farm_status =
-                    trace_zombie_farm_status_message(receiver_class_name, selector_name)
-                        || trace_zombie_farm_status_message(name, selector_name);
-                let record_zombie_farm_hunger =
-                    crate::zombie_farm_debug::should_record_hunger_message(
+                let trace_zombie_farm_layout = zombie_farm_debug_enabled
+                    && (trace_zombie_farm_layout_message(receiver_class_name, selector_name)
+                        || trace_zombie_farm_layout_message(name, selector_name));
+                let trace_zombie_farm_status = zombie_farm_debug_enabled
+                    && (trace_zombie_farm_status_message(receiver_class_name, selector_name)
+                        || trace_zombie_farm_status_message(name, selector_name));
+                let record_zombie_farm_hunger = zombie_farm_debug_enabled
+                    && (crate::zombie_farm_debug::should_record_hunger_message(
                         receiver_class_name,
                         selector_name,
                     ) || crate::zombie_farm_debug::should_record_hunger_message(
                         name,
                         selector_name,
-                    );
-                let trace_zombie_farm_apply_scope = zombie_farm_uses_playforge_bundle(env)
+                    ));
+                let trace_zombie_farm_apply_scope = zombie_farm_debug_enabled
                     && selector_name == "applyZombieHunger"
                     && (receiver_class_name == "ZFGuiLayer" || name == "ZFGuiLayer");
-                let record_zombie_farm_apply_trace =
-                    ZOMBIE_FARM_APPLY_TRACE_DEPTH.load(Ordering::Relaxed) > 0
-                        && (crate::zombie_farm_debug::should_record_apply_trace_message(
-                            receiver_class_name,
-                            selector_name,
-                        ) || crate::zombie_farm_debug::should_record_apply_trace_message(
-                            name,
-                            selector_name,
-                        ));
+                let record_zombie_farm_apply_trace = zombie_farm_debug_enabled
+                    && ZOMBIE_FARM_APPLY_TRACE_DEPTH.load(Ordering::Relaxed) > 0
+                    && (crate::zombie_farm_debug::should_record_apply_trace_message(
+                        receiver_class_name,
+                        selector_name,
+                    ) || crate::zombie_farm_debug::should_record_apply_trace_message(
+                        name,
+                        selector_name,
+                    ));
                 if trace_zombie_farm_status || trace_zombie_farm_layout {
                     let imp_description = match imp {
                         IMP::Host(_) => "host".to_string(),
@@ -2299,6 +4091,7 @@ Type mismatch when sending message {} to {:?}!
                         selector_name,
                     );
                 }
+                zombie_farm_trace_game_interaction_return(env, receiver, &selector_name_for_after);
                 zombie_farm_apply_local_hunger_update(env, receiver, &selector_name_for_after);
                 return;
             } else {

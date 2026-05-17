@@ -642,7 +642,7 @@ unsafe fn composite_layer_recursive(
     std::mem::drop(gles);
 
     // Avoid holding a borrow while querying ObjC and recursing.
-    let (delegate, bounds, sublayers) = diagnostic_snapshot(&env.objc, layer);
+    let (delegate, bounds, _position, _anchor, sublayers) = diagnostic_snapshot(&env.objc, layer);
     if delegate != nil {
         let ui_view_class = env.objc.get_known_class("UIView", &mut env.mem);
         if msg![env; delegate isKindOfClass:ui_view_class] {
