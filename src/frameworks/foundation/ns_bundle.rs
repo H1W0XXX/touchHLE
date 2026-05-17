@@ -260,7 +260,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     };
     let res: id = msg![env; dict objectForKey:key];
     if res == nil {
-        if value == nil || value == empty_str {
+        if value == nil
+            || value == empty_str
+            || (value != nil && ns_string::to_rust_string(env, value).is_empty())
+        {
             return key;
         }
         return value;

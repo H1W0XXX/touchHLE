@@ -15,7 +15,7 @@ use super::ca_layer::{diagnostic_snapshot, CALayerHostObject};
 use crate::frameworks::core_animation::animation;
 use crate::frameworks::core_graphics::cg_color::CGColorHostObject;
 use crate::frameworks::core_graphics::{cg_bitmap_context, cg_image, CGFloat, CGRect};
-use crate::frameworks::uikit::ui_view::get_clips_to_bounds;
+use crate::frameworks::uikit::ui_view::{self, get_clips_to_bounds};
 use crate::gles::gles11_raw as gles11; // constants only
 use crate::gles::gles11_raw::types::*;
 use crate::gles::present::{present_frame, FpsCounter};
@@ -143,6 +143,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         env.window().rotation_matrix(),
         env.window().virtual_cursor_visible_at(),
     );
+    let inspector_overlay = ui_view::debug_inspector_overlay(env);
 
     // TODO: draw status bar if it's not hidden
 
@@ -377,6 +378,14 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
             present_frame_args.1,
             present_frame_args.2,
         );
+        if let Some(overlay) = &inspector_overlay {
+            ui_view::draw_debug_inspector_overlay(
+                gles.as_mut(),
+                present_frame_args.0,
+                present_frame_args.1,
+                overlay,
+            );
+        }
     }
     std::mem::drop(gles);
     window.swap_window();

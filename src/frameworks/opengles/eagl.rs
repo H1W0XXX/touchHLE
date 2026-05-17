@@ -12,6 +12,7 @@ use crate::frameworks::core_animation::ca_eagl_layer::{
 use crate::frameworks::core_graphics::{CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::frameworks::foundation::NSUInteger;
+use crate::frameworks::uikit::ui_view;
 use crate::gles::gles11_raw as gles11; // constants only
 use crate::gles::gles11_raw::types::*;
 use crate::gles::present::{present_frame, FpsCounter};
@@ -552,6 +553,7 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
     let viewport = env.window.as_mut().unwrap().viewport();
     let rotation_matrix = env.window.as_mut().unwrap().rotation_matrix();
     let virtual_cursor_visible_at = env.window.as_mut().unwrap().virtual_cursor_visible_at();
+    let inspector_overlay = ui_view::debug_inspector_overlay(env);
 
     let gles_ctx = super::get_thread_context(
         &mut env.framework_state.opengles,
@@ -645,6 +647,7 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
     }
     let old_color: [GLfloat; 4] = get_floats(gles, gles11::CURRENT_COLOR);
     gles.Color4f(1.0, 1.0, 1.0, 1.0);
+    let old_line_width: [GLfloat; 1] = get_floats(gles, gles11::LINE_WIDTH);
 
     // Back up other things that will be modified while drawing.
     let old_viewport: (GLint, GLint, GLsizei, GLsizei) = {
@@ -684,6 +687,9 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
 
     // Draw the quad
     present_frame(gles, viewport, rotation_matrix, virtual_cursor_visible_at);
+    if let Some(overlay) = &inspector_overlay {
+        ui_view::draw_debug_inspector_overlay(gles, viewport, rotation_matrix, overlay);
+    }
 
     // Clean up the texture
     gles.DeleteTextures(1, &texture);
@@ -712,6 +718,7 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
     }
     gles.MatrixMode(old_matrix_mode);
     gles.Color4f(old_color[0], old_color[1], old_color[2], old_color[3]);
+    gles.LineWidth(old_line_width[0]);
     gles.Viewport(
         old_viewport.0,
         old_viewport.1,

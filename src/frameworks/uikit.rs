@@ -152,6 +152,15 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
             Event::DumpInspector => {
                 ui_view::dump_debug_inspector(env);
             }
+            Event::ToggleElementInspector => {
+                ui_view::toggle_debug_element_inspector(env);
+            }
+            Event::InspectorPointerMove(coords) => {
+                ui_view::debug_element_inspector_pointer_move(env, coords);
+            }
+            Event::InspectElementAt(coords) => {
+                ui_view::debug_element_inspector_click(env, coords);
+            }
             Event::TextInput(text_event) => {
                 let responder = env.framework_state.uikit.ui_responder.first_responder;
                 let class = msg![env; responder class];

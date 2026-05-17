@@ -36,6 +36,88 @@ struct NSInvocationHostObject {
 }
 impl HostObject for NSInvocationHostObject {}
 
+pub struct DebugInvocationInfo {
+    pub target: id,
+    pub selector_name: Option<String>,
+    pub arguments: Vec<DebugInvocationArgument>,
+}
+
+pub struct DebugInvocationArgument {
+    pub index: usize,
+    pub type_: String,
+    pub value: Option<DebugInvocationArgumentValue>,
+}
+
+pub enum DebugInvocationArgumentValue {
+    Object(id),
+    Selector(SEL),
+    F32(f32),
+    F64(f64),
+    I32(i32),
+    U32(u32),
+    I64(i64),
+    U64(u64),
+    Pointer(u32),
+}
+
+pub fn debug_invocation_info(
+    env: &crate::Environment,
+    invocation: id,
+) -> Option<DebugInvocationInfo> {
+    let host = env.objc.borrow::<NSInvocationHostObject>(invocation);
+    let selector_name = host
+        .selector
+        .map(|selector| selector.as_str(&env.mem).to_string());
+    let mut arguments = Vec::new();
+    for (index, type_) in host.argument_types.iter().enumerate().skip(2) {
+        let value = host.arguments.get(index).and_then(|argument| {
+            let argument = (*argument)?;
+            Some(match type_.as_str() {
+                "@" => DebugInvocationArgumentValue::Object(env.mem.read(argument.cast())),
+                ":" => DebugInvocationArgumentValue::Selector(env.mem.read(argument.cast())),
+                "f" => DebugInvocationArgumentValue::F32(env.mem.read(argument.cast())),
+                "d" => DebugInvocationArgumentValue::F64(env.mem.read(argument.cast())),
+                "c" | "B" => {
+                    let value: u8 = env.mem.read(argument.cast());
+                    DebugInvocationArgumentValue::U32(value as u32)
+                }
+                "s" => {
+                    let value: i16 = env.mem.read(argument.cast());
+                    DebugInvocationArgumentValue::I32(value as i32)
+                }
+                "S" => {
+                    let value: u16 = env.mem.read(argument.cast());
+                    DebugInvocationArgumentValue::U32(value as u32)
+                }
+                "i" | "l" => DebugInvocationArgumentValue::I32(env.mem.read(argument.cast())),
+                "I" | "L" => DebugInvocationArgumentValue::U32(env.mem.read(argument.cast())),
+                "q" => DebugInvocationArgumentValue::I64(env.mem.read(argument.cast())),
+                "Q" => DebugInvocationArgumentValue::U64(env.mem.read(argument.cast())),
+                "*" => {
+                    let ptr: MutPtr<u8> = env.mem.read(argument.cast());
+                    DebugInvocationArgumentValue::Pointer(ptr.to_bits())
+                }
+                _ if type_.starts_with('^') => {
+                    let ptr: MutVoidPtr = env.mem.read(argument.cast());
+                    DebugInvocationArgumentValue::Pointer(ptr.to_bits())
+                }
+                _ => DebugInvocationArgumentValue::Pointer(argument.to_bits()),
+            })
+        });
+        arguments.push(DebugInvocationArgument {
+            index,
+            type_: type_.clone(),
+            value,
+        });
+    }
+
+    Some(DebugInvocationInfo {
+        target: host.target,
+        selector_name,
+        arguments,
+    })
+}
+
 fn scalar_size_for_type(type_: &str) -> Option<usize> {
     Some(match type_ {
         "c" | "B" => 1,

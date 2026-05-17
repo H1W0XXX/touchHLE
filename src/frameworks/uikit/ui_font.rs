@@ -419,6 +419,7 @@ fn get_equivalent_font(system_font: &str) -> Option<FontKind> {
         // Font Family: AppleGothic
         "AppleGothic" => None,
         // Font Family: Arial
+        "Arial" => Some(FontKind::SansRegular),
         "ArialMT" => Some(FontKind::SansRegular),
         "Arial-BoldMT" => Some(FontKind::SansBold),
         "Arial-BoldItalicMT" => Some(FontKind::SansBoldItalic),

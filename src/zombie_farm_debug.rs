@@ -31,9 +31,25 @@ struct State {
     tables: BTreeMap<u32, TableState>,
     recent: VecDeque<String>,
     hunger_events: VecDeque<String>,
+    cocos_label_texts: BTreeMap<u32, String>,
 }
 
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+
+pub struct CocosNodeHit {
+    pub node: id,
+    pub class_name: String,
+    pub world_point: CGPoint,
+    pub local_point: CGPoint,
+    pub world_rect: CGRect,
+    pub depth: usize,
+    pub summary: String,
+}
+
+pub fn running_scene_size(env: &mut Environment) -> Option<CGSize> {
+    let scene = get_running_scene(env)?;
+    node_size_by_getter(env, scene, "contentSize")
+}
 
 fn state() -> &'static Mutex<State> {
     STATE.get_or_init(|| Mutex::new(State::default()))
@@ -548,6 +564,52 @@ pub fn record_table_object_return(
     push_recent(&mut state.recent, line);
 }
 
+pub fn should_record_cocos_label_text(class_name: &str, selector_name: &str) -> bool {
+    class_name == "CCLabel"
+        && (selector_name == "setString:"
+            || selector_name.starts_with("initWithString:")
+            || selector_name.starts_with("labelWithString:"))
+}
+
+pub fn record_cocos_label_text_return(
+    env: &mut Environment,
+    receiver: id,
+    class_name: &str,
+    selector_name: &str,
+    regs_before: &[u32; 16],
+) {
+    if !should_record_cocos_label_text(class_name, selector_name) {
+        return;
+    }
+
+    let string = id::from_bits(regs_before[2]);
+    if string == nil || debug_object_class(env, string).is_none() {
+        return;
+    }
+    let Some(text) = object_string_value_including_empty(env, string) else {
+        return;
+    };
+
+    let label = if selector_name == "setString:" {
+        receiver
+    } else {
+        id::from_bits(env.cpu.regs()[0])
+    };
+    if label == nil || debug_object_class(env, label).is_none() {
+        return;
+    }
+
+    let line = format!(
+        "[0x{:x} {class_name} {selector_name}] label=0x{:x} text={:?}",
+        receiver.to_bits(),
+        label.to_bits(),
+        text
+    );
+    let mut state = state().lock().unwrap();
+    state.cocos_label_texts.insert(label.to_bits(), text);
+    push_recent(&mut state.recent, line);
+}
+
 pub fn write_snapshot(mut writer: impl Write) -> IoResult<()> {
     let state = state().lock().unwrap();
 
@@ -594,6 +656,15 @@ pub fn write_snapshot(mut writer: impl Write) -> IoResult<()> {
     writeln!(writer, "== Recent Hunger Events ==")?;
     for line in &state.hunger_events {
         writeln!(writer, "{line}")?;
+    }
+
+    writeln!(writer)?;
+    writeln!(writer, "== Recorded Cocos Label Text ==")?;
+    if state.cocos_label_texts.is_empty() {
+        writeln!(writer, "(none recorded yet)")?;
+    }
+    for (label, text) in &state.cocos_label_texts {
+        writeln!(writer, "0x{label:x} {:?}", text)?;
     }
 
     Ok(())
@@ -725,6 +796,16 @@ fn get_running_scene(env: &mut Environment) -> Option<id> {
     (running_scene != nil).then_some(running_scene)
 }
 
+fn node_children(env: &mut Environment, node: id) -> Option<(id, NSUInteger)> {
+    let children_selector = env.objc.lookup_selector("children")?;
+    if !debug_object_has_method(env, node, children_selector) {
+        return None;
+    }
+    let children: id = msg_send_no_type_checking(env, (node, children_selector));
+    let count = count_if_collection(env, children)?;
+    Some((children, count))
+}
+
 fn get_actor_list_from_game_state(env: &mut Environment) -> Option<id> {
     let game_data = get_game_data(env)?;
     let actor_list_selector = env.objc.lookup_selector("actorList")?;
@@ -800,6 +881,1283 @@ fn node_world_origin(env: &mut Environment, object: id) -> Option<CGPoint> {
     }
     let origin = CGPoint { x: 0.0, y: 0.0 };
     Some(msg_send_no_type_checking(env, (object, selector, origin)))
+}
+
+fn node_point_to_local(env: &mut Environment, object: id, point: CGPoint) -> Option<CGPoint> {
+    let selector = env.objc.lookup_selector("convertToNodeSpace:")?;
+    debug_object_has_method(env, object, selector)
+        .then(|| msg_send_no_type_checking(env, (object, selector, point)))
+}
+
+fn node_point_to_world(env: &mut Environment, object: id, point: CGPoint) -> Option<CGPoint> {
+    let selector = env.objc.lookup_selector("convertToWorldSpace:")?;
+    debug_object_has_method(env, object, selector)
+        .then(|| msg_send_no_type_checking(env, (object, selector, point)))
+}
+
+fn point_in_size(point: CGPoint, size: CGSize) -> bool {
+    point.x >= 0.0 && point.y >= 0.0 && point.x <= size.width && point.y <= size.height
+}
+
+fn rect_from_world_corners(corners: [CGPoint; 4]) -> CGRect {
+    let mut min_x = corners[0].x;
+    let mut max_x = corners[0].x;
+    let mut min_y = corners[0].y;
+    let mut max_y = corners[0].y;
+    for corner in corners.into_iter().skip(1) {
+        min_x = min_x.min(corner.x);
+        max_x = max_x.max(corner.x);
+        min_y = min_y.min(corner.y);
+        max_y = max_y.max(corner.y);
+    }
+    CGRect {
+        origin: CGPoint { x: min_x, y: min_y },
+        size: CGSize {
+            width: max_x - min_x,
+            height: max_y - min_y,
+        },
+    }
+}
+
+fn node_world_rect(env: &mut Environment, node: id, size: CGSize) -> Option<CGRect> {
+    let bottom_left = node_point_to_world(env, node, CGPoint { x: 0.0, y: 0.0 })?;
+    let bottom_right = node_point_to_world(
+        env,
+        node,
+        CGPoint {
+            x: size.width,
+            y: 0.0,
+        },
+    )?;
+    let top_left = node_point_to_world(
+        env,
+        node,
+        CGPoint {
+            x: 0.0,
+            y: size.height,
+        },
+    )?;
+    let top_right = node_point_to_world(
+        env,
+        node,
+        CGPoint {
+            x: size.width,
+            y: size.height,
+        },
+    )?;
+    Some(rect_from_world_corners([
+        bottom_left,
+        bottom_right,
+        top_left,
+        top_right,
+    ]))
+}
+
+fn inspect_cocos_node_inner(
+    env: &mut Environment,
+    node: id,
+    world_point: CGPoint,
+    scene_size: CGSize,
+    depth: usize,
+    visited: &mut Vec<u32>,
+) -> Option<CocosNodeHit> {
+    if node == nil || debug_object_class(env, node).is_none() {
+        return None;
+    }
+    let node_bits = node.to_bits();
+    if visited.contains(&node_bits) {
+        return None;
+    }
+    visited.push(node_bits);
+
+    let visible = node_bool_by_getter(env, node, "isVisible")
+        .or_else(|| node_bool_by_getter(env, node, "visible"))
+        .unwrap_or(true);
+    if !visible {
+        return None;
+    }
+
+    let mut best = None;
+    if let Some((children, count)) = node_children(env, node) {
+        for idx in (0..count.min(256)).rev() {
+            let Some(child) = object_at_index_if_collection(env, children, idx) else {
+                continue;
+            };
+            if let Some(hit) =
+                inspect_cocos_node_inner(env, child, world_point, scene_size, depth + 1, visited)
+            {
+                best = Some(hit);
+                break;
+            }
+        }
+    }
+    if best.is_some() {
+        return best;
+    }
+
+    let size = node_size_by_getter(env, node, "contentSize")?;
+    if size.width <= 0.0 || size.height <= 0.0 {
+        return None;
+    }
+    let local_point = node_point_to_local(env, node, world_point)?;
+    if !point_in_size(local_point, size) {
+        return None;
+    }
+    let world_rect = node_world_rect(env, node, size)?;
+
+    let class_name = debug_class_name(env, node).to_string();
+    let local_area = size.width * size.height;
+    let world_area = world_rect.size.width * world_rect.size.height;
+    let scene_area = scene_size.width * scene_size.height;
+    let is_near_full_scene =
+        scene_area > 0.0 && (local_area >= scene_area * 0.70 || world_area >= scene_area * 0.70);
+    let is_known_container = matches!(
+        class_name.as_str(),
+        "CCMenu" | "CCLayer" | "CCScene" | "ZFFightGameScene" | "ZFFarmGameScene"
+    ) || class_name.contains("Delegate")
+        || class_name.ends_with("Scene")
+        || class_name.ends_with("Layer");
+    let is_broad_container =
+        is_near_full_scene || is_known_container && local_area >= 1024.0 * 700.0;
+    if is_broad_container {
+        return None;
+    }
+
+    Some(CocosNodeHit {
+        node,
+        class_name,
+        world_point,
+        local_point,
+        world_rect,
+        depth,
+        summary: cocos_node_summary(env, node),
+    })
+}
+
+pub fn inspect_cocos_node_at_points(
+    env: &mut Environment,
+    points: &[CGPoint],
+) -> Option<CocosNodeHit> {
+    let scene = get_running_scene(env)?;
+    let scene_size = node_size_by_getter(env, scene, "contentSize").unwrap_or(CGSize {
+        width: 1024.0,
+        height: 768.0,
+    });
+    let mut best = None;
+    for &point in points {
+        let mut visited = Vec::new();
+        let Some(hit) = inspect_cocos_node_inner(env, scene, point, scene_size, 0, &mut visited)
+        else {
+            continue;
+        };
+        let replace = best.as_ref().is_none_or(|best_hit: &CocosNodeHit| {
+            hit.depth > best_hit.depth
+                || (hit.depth == best_hit.depth
+                    && hit.world_rect.size.width * hit.world_rect.size.height
+                        < best_hit.world_rect.size.width * best_hit.world_rect.size.height)
+        });
+        if replace {
+            best = Some(hit);
+        }
+    }
+    best
+}
+
+pub fn write_cocos_node_detail(
+    env: &mut Environment,
+    writer: &mut dyn Write,
+    node: id,
+    depth: usize,
+) -> IoResult<()> {
+    let indent = "  ".repeat(depth);
+    writeln!(
+        writer,
+        "{indent}0x{:x} {} {}",
+        node.to_bits(),
+        debug_class_name(env, node),
+        cocos_node_summary(env, node)
+    )?;
+    dump_texture_debug_ivars(env, writer, node, depth + 1)?;
+    writeln!(writer, "{indent}Text scan:")?;
+    let mut visited = Vec::new();
+    dump_cocos_text_scan(env, writer, node, depth + 1, 4, &mut visited)
+}
+
+pub fn write_nearby_cocos_text(
+    env: &mut Environment,
+    writer: &mut dyn Write,
+    selected_rect: CGRect,
+    depth: usize,
+) -> IoResult<()> {
+    let indent = "  ".repeat(depth);
+    let search_rect = expand_rect(selected_rect, 120.0);
+    writeln!(
+        writer,
+        "{indent}Nearby Cocos text candidates (world rect expanded by 120): {}",
+        rect_to_debug(search_rect)
+    )?;
+
+    let Some(scene) = get_running_scene(env) else {
+        writeln!(writer, "{indent}  (no running scene)")?;
+        return Ok(());
+    };
+
+    let mut visited = Vec::new();
+    let mut found = 0usize;
+    dump_nearby_cocos_text_inner(
+        env,
+        writer,
+        scene,
+        search_rect,
+        depth + 1,
+        0,
+        &mut visited,
+        &mut found,
+    )?;
+    if found == 0 {
+        writeln!(writer, "{indent}  (none found)")?;
+    }
+    Ok(())
+}
+
+fn object_is_ns_string(env: &mut Environment, object: id) -> bool {
+    let Some(class) = debug_object_class(env, object) else {
+        return false;
+    };
+    let string_class = env.objc.get_known_class("NSString", &mut env.mem);
+    env.objc.class_is_subclass_of(class, string_class)
+}
+
+fn object_is_known_class(env: &mut Environment, object: id, known_class_name: &str) -> bool {
+    let Some(class) = debug_object_class(env, object) else {
+        return false;
+    };
+    let known_class = env.objc.get_known_class(known_class_name, &mut env.mem);
+    env.objc.class_is_subclass_of(class, known_class)
+}
+
+fn object_is_ns_dictionary(env: &mut Environment, object: id) -> bool {
+    object_is_known_class(env, object, "NSDictionary")
+}
+
+fn object_string_value(env: &mut Environment, object: id) -> Option<String> {
+    if !object_is_ns_string(env, object) {
+        return None;
+    }
+    let value = ns_string::to_rust_string(env, object).into_owned();
+    (!value.is_empty()).then_some(value)
+}
+
+fn object_string_value_including_empty(env: &mut Environment, object: id) -> Option<String> {
+    if !object_is_ns_string(env, object) {
+        return None;
+    }
+    Some(ns_string::to_rust_string(env, object).into_owned())
+}
+
+fn object_scalar_debug_value(env: &mut Environment, object: id) -> Option<String> {
+    if object == nil || debug_object_class(env, object).is_none() {
+        return None;
+    }
+    if let Some(text) = object_string_value_including_empty(env, object) {
+        return Some(format!("{text:?} ({})", object_to_debug(env, object)));
+    }
+    if object_is_known_class(env, object, "NSNumber") {
+        let Some(selector) = env.objc.lookup_selector("stringValue") else {
+            return Some(object_to_debug(env, object));
+        };
+        if !debug_object_has_method(env, object, selector) {
+            return Some(object_to_debug(env, object));
+        }
+        let string: id = msg_send_no_type_checking(env, (object, selector));
+        if let Some(text) = object_string_value_including_empty(env, string) {
+            return Some(format!("{text} ({})", object_to_debug(env, object)));
+        }
+    }
+    None
+}
+
+fn object_number_f64(env: &mut Environment, object: id) -> Option<f64> {
+    if object == nil || debug_object_class(env, object).is_none() {
+        return None;
+    }
+    if object_is_known_class(env, object, "NSNumber") {
+        let selector = env.objc.lookup_selector("doubleValue")?;
+        if debug_object_has_method(env, object, selector) {
+            return Some(msg_send_no_type_checking(env, (object, selector)));
+        }
+    }
+    object_string_value_including_empty(env, object).and_then(|text| text.parse().ok())
+}
+
+fn format_duration_seconds(seconds: f64) -> String {
+    let seconds = seconds.max(0.0).round() as u64;
+    let days = seconds / 86_400;
+    let hours = (seconds % 86_400) / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    let seconds = seconds % 60;
+
+    let mut parts = Vec::new();
+    if days > 0 {
+        parts.push(format!("{days}d"));
+    }
+    if hours > 0 {
+        parts.push(format!("{hours}h"));
+    }
+    if minutes > 0 {
+        parts.push(format!("{minutes}m"));
+    }
+    if parts.is_empty() || seconds > 0 {
+        parts.push(format!("{seconds}s"));
+    }
+    parts.join(" ")
+}
+
+fn object_context_debug_value(env: &mut Environment, object: id) -> String {
+    let mut description = object_scalar_debug_value(env, object)
+        .unwrap_or_else(|| object_to_debug_with_count(env, object));
+    if let Some(text) = recorded_cocos_label_text(object) {
+        description.push_str(&format!(" recorded_text={text:?}"));
+    }
+    description
+}
+
+fn dump_dictionary_common_fields(
+    env: &mut Environment,
+    writer: &mut dyn Write,
+    dictionary: id,
+    depth: usize,
+) -> IoResult<()> {
+    let Some(all_keys_selector) = env.objc.lookup_selector("allKeys") else {
+        return Ok(());
+    };
+    let Some(object_for_key_selector) = env.objc.lookup_selector("objectForKey:") else {
+        return Ok(());
+    };
+    if !debug_object_has_method(env, dictionary, all_keys_selector)
+        || !debug_object_has_method(env, dictionary, object_for_key_selector)
+    {
+        return Ok(());
+    }
+
+    let keys: id = msg_send_no_type_checking(env, (dictionary, all_keys_selector));
+    let Some(count) = count_if_collection(env, keys) else {
+        return Ok(());
+    };
+
+    let mut fields = Vec::new();
+    for idx in 0..count.min(48) {
+        let Some(key) = object_at_index_if_collection(env, keys, idx) else {
+            continue;
+        };
+        let Some(key_name) = object_string_value_including_empty(env, key) else {
+            continue;
+        };
+        if !dictionary_key_looks_common_field(&key_name) {
+            continue;
+        }
+
+        let value: id = msg_send_no_type_checking(env, (dictionary, object_for_key_selector, key));
+        if value == nil || debug_object_class(env, value).is_none() {
+            continue;
+        }
+        let mut description = object_context_debug_value(env, value);
+        if dictionary_key_looks_duration_field(&key_name) {
+            if let Some(seconds) = object_number_f64(env, value) {
+                description.push_str(&format!(" ({})", format_duration_seconds(seconds)));
+            }
+        }
+        fields.push(format!("{key_name}={description}"));
+    }
+    if fields.is_empty() {
+        return Ok(());
+    }
+    let indent = "  ".repeat(depth);
+    writeln!(writer, "{indent}common fields: {}", fields.join(", "))
+}
+
+fn dictionary_key_looks_common_field(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    [
+        "id", "key", "name", "title", "display", "info", "desc", "category", "type", "cost",
+        "price", "sell", "buy", "value", "coin", "gold", "cash", "reward", "yield", "harvest",
+        "grow", "mature", "duration", "time", "xp", "level", "sprite", "image", "icon",
+    ]
+    .iter()
+    .any(|needle| key.contains(needle))
+}
+
+fn dictionary_key_looks_duration_field(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    ["grow", "mature", "duration", "time", "cooldown", "seconds"]
+        .iter()
+        .any(|needle| key.contains(needle))
+}
+
+fn dump_text_getters(
+    env: &mut Environment,
+    writer: &mut dyn Write,
+    object: id,
+    indent: &str,
+) -> IoResult<()> {
+    for selector_name in [
+        "string",
+        "text",
+        "title",
+        "label",
+        "name",
+        "displayName",
+        "itemName",
+        "getString",
+        "fontName",
+        "font",
+        "titleText",
+        "labelString",
+    ] {
+        let Some(selector) = env.objc.lookup_selector(selector_name) else {
+            continue;
+        };
+        if !debug_object_has_method(env, object, selector) {
+            continue;
+        }
+        let value: id = msg_send_no_type_checking(env, (object, selector));
+        if let Some(text) = object_string_value(env, value) {
+            writeln!(
+                writer,
+                "{indent}getter {selector_name} => {:?} ({})",
+                text,
+                object_to_debug(env, value)
+            )?;
+        } else if value != nil && debug_object_class(env, value).is_some() {
+            writeln!(
+                writer,
+                "{indent}getter {selector_name} => {}",
+                object_to_debug(env, value)
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn dump_text_ivars(
+    env: &mut Environment,
+    writer: &mut dyn Write,
+    object: id,
+    depth: usize,
+    remaining: usize,
+    visited: &mut Vec<u32>,
+) -> IoResult<()> {
+    let indent = "  ".repeat(depth);
+    for ivar_name in [
+        "string",
+        "_string",
+        "text",
+        "_text",
+        "title",
+        "_title",
+        "label",
+        "_label",
+        "name",
+        "_name",
+        "displayName",
+        "itemName",
+        "string_",
+        "text_",
+        "title_",
+        "name_",
+        "fontName",
+        "fontName_",
+        "titleText",
+        "labelString",
+        "titleLabel",
+        "textLabel",
+        "nameLabel",
+        "descriptionLabel",
+        "priceLabel",
+        "costLabel",
+        "countLabel",
+        "label_",
+        "m_pLabel",
+        "m_pLabelChild",
+    ] {
+        let Some(value) = read_object_ivar(env, object, ivar_name) else {
+            continue;
+        };
+        if value == nil || debug_object_class(env, value).is_none() {
+            continue;
+        }
+        if let Some(text) = object_string_value(env, value) {
+            writeln!(
+                writer,
+                "{indent}ivar {ivar_name} => {:?} ({})",
+                text,
+                object_to_debug(env, value)
+            )?;
+            continue;
+        }
+
+        writeln!(
+            writer,
+            "{indent}ivar {ivar_name} => {}",
+            object_to_debug(env, value)
+        )?;
+        if remaining > 0 {
+            dump_cocos_text_scan(env, writer, value, depth + 1, remaining - 1, visited)?;
+        }
+    }
+    Ok(())
+}
+
+fn dump_text_collection_ivar(
+    env: &mut Environment,
+    writer: &mut dyn Write,
+    object: id,
+    ivar_name: &str,
+    depth: usize,
+    remaining: usize,
+    visited: &mut Vec<u32>,
+) -> IoResult<()> {
+    if remaining == 0 {
+        return Ok(());
+    }
+    let Some(collection) = read_object_ivar(env, object, ivar_name) else {
+        return Ok(());
+    };
+    let Some(count) = count_if_collection(env, collection) else {
+        return Ok(());
+    };
+    let indent = "  ".repeat(depth);
+    writeln!(
+        writer,
+        "{indent}ivar {ivar_name} collection={} count={}",
+        object_to_debug(env, collection),
+        count
+    )?;
+    for idx in 0..count.min(48) {
+        let Some(entry) = object_at_index_if_collection(env, collection, idx) else {
+            continue;
+        };
+        if entry == nil || debug_object_class(env, entry).is_none() {
+            continue;
+        }
+        let entry_indent = "  ".repeat(depth + 1);
+        writeln!(
+            writer,
+            "{entry_indent}[{idx}] {}",
+            object_to_debug(env, entry)
+        )?;
+        dump_cocos_text_scan(env, writer, entry, depth + 2, remaining - 1, visited)?;
+    }
+    Ok(())
+}
+
+fn dump_child_text_scan(
+    env: &mut Environment,
+    writer: &mut dyn Write,
+    object: id,
+    depth: usize,
+    remaining: usize,
+    visited: &mut Vec<u32>,
+) -> IoResult<()> {
+    if remaining == 0 {
+        return Ok(());
+    }
+    let Some((children, count)) = node_children(env, object) else {
+        return Ok(());
+    };
+    let indent = "  ".repeat(depth);
+    writeln!(
+        writer,
+        "{indent}children={} count={}",
+        object_to_debug(env, children),
+        count
+    )?;
+    for idx in 0..count.min(80) {
+        let Some(child) = object_at_index_if_collection(env, children, idx) else {
+            continue;
+        };
+        if child == nil || debug_object_class(env, child).is_none() {
+            continue;
+        }
+        let child_indent = "  ".repeat(depth + 1);
+        writeln!(
+            writer,
+            "{child_indent}[{idx}] 0x{:x} {} {}",
+            child.to_bits(),
+            debug_class_name(env, child),
+            cocos_node_summary(env, child)
+        )?;
+        dump_cocos_text_scan(env, writer, child, depth + 2, remaining - 1, visited)?;
+    }
+    Ok(())
+}
+
+fn dump_cocos_text_scan(
+    env: &mut Environment,
+    writer: &mut dyn Write,
+    object: id,
+    depth: usize,
+    remaining: usize,
+    visited: &mut Vec<u32>,
+) -> IoResult<()> {
+    if object == nil || debug_object_class(env, object).is_none() {
+        return Ok(());
+    }
+    let object_bits = object.to_bits();
+    let indent = "  ".repeat(depth);
+    if visited.contains(&object_bits) {
+        writeln!(writer, "{indent}0x{object_bits:x} <cycle>")?;
+        return Ok(());
+    }
+    visited.push(object_bits);
+
+    writeln!(
+        writer,
+        "{indent}0x{object_bits:x} {}",
+        debug_class_name(env, object)
+    )?;
+    if let Some(text) = recorded_cocos_label_text(object) {
+        writeln!(writer, "{indent}  recorded text => {:?}", text)?;
+    }
+    if debug_class_name(env, object) == "CCLabel" {
+        dump_cocos_label_render_state(env, writer, object, depth + 1)?;
+    }
+    let class_name = debug_class_name(env, object);
+    dump_text_getters(env, writer, object, &format!("{indent}  "))?;
+    dump_text_ivars(env, writer, object, depth + 1, remaining, visited)?;
+    if class_name_looks_text_related(&class_name) {
+        dump_class_text_ivars(env, writer, object, depth + 1)?;
+    }
+    if class_name_looks_market_context(&class_name) {
+        dump_market_context_ivars(env, writer, object, depth + 1, remaining, visited)?;
+    }
+    for ivar_name in ["children", "attachments", "childAttachments"] {
+        dump_text_collection_ivar(
+            env,
+            writer,
+            object,
+            ivar_name,
+            depth + 1,
+            remaining,
+            visited,
+        )?;
+    }
+    dump_child_text_scan(env, writer, object, depth + 1, remaining, visited)
+}
+
+fn recorded_cocos_label_text(object: id) -> Option<String> {
+    let state = state().lock().unwrap();
+    state.cocos_label_texts.get(&object.to_bits()).cloned()
+}
+
+fn dump_cocos_label_render_state(
+    env: &mut Environment,
+    writer: &mut dyn Write,
+    object: id,
+    depth: usize,
+) -> IoResult<()> {
+    let indent = "  ".repeat(depth);
+    if let Some(font_size) = read_f32_ivar(env, object, "fontSize_") {
+        writeln!(writer, "{indent}fontSize_={font_size:.3}")?;
+    }
+    for ivar_name in ["contentSize_", "dimensions_"] {
+        let Some(ivar) = env
+            .objc
+            .object_lookup_ivar(&env.mem, object, &ivar_name.to_string())
+        else {
+            continue;
+        };
+        let value: CGSize = env.mem.read(ivar.cast());
+        writeln!(writer, "{indent}{ivar_name}={value}")?;
+    }
+    if let Some(ivar) = env
+        .objc
+        .object_lookup_ivar(&env.mem, object, &"rect_".to_string())
+    {
+        let value: CGRect = env.mem.read(ivar.cast());
+        writeln!(writer, "{indent}rect_={:?}", value)?;
+    }
+    if let Some(texture) = read_object_ivar(env, object, "texture_") {
+        writeln!(writer, "{indent}texture_={}", object_to_debug(env, texture))?;
+    }
+    Ok(())
+}
+
+fn dump_class_text_ivars(
+    env: &mut Environment,
+    writer: &mut dyn Write,
+    object: id,
+    depth: usize,
+) -> IoResult<()> {
+    let Some(class) = debug_object_class(env, object) else {
+        return Ok(());
+    };
+
+    let mut ivars = env.objc.debug_all_class_ivars_as_strings(class);
+    ivars.sort();
+    ivars.dedup();
+    if ivars.is_empty() {
+        return Ok(());
+    }
+
+    let indent = "  ".repeat(depth);
+    writeln!(writer, "{indent}class ivars: {}", ivars.join(", "))?;
+    for ivar_name in ivars
+        .iter()
+        .filter(|name| ivar_name_looks_text_related(name))
+    {
+        let Some(value) = read_object_ivar(env, object, ivar_name) else {
+            continue;
+        };
+        if let Some(text) = object_string_value(env, value) {
+            writeln!(
+                writer,
+                "{indent}ivar {ivar_name} => {:?} ({})",
+                text,
+                object_to_debug(env, value)
+            )?;
+        } else if value != nil && debug_object_class(env, value).is_some() {
+            writeln!(
+                writer,
+                "{indent}ivar {ivar_name} => {}",
+                object_to_debug(env, value)
+            )?;
+        } else if value != nil {
+            writeln!(
+                writer,
+                "{indent}ivar {ivar_name} raw=0x{:x}",
+                value.to_bits()
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn dump_market_context_ivars(
+    env: &mut Environment,
+    writer: &mut dyn Write,
+    object: id,
+    depth: usize,
+    remaining: usize,
+    visited: &mut Vec<u32>,
+) -> IoResult<()> {
+    if remaining == 0 {
+        return Ok(());
+    }
+    if !visited.contains(&object.to_bits()) {
+        visited.push(object.to_bits());
+    }
+    let Some(class) = debug_object_class(env, object) else {
+        return Ok(());
+    };
+
+    let class_name = debug_class_name(env, object);
+    let mut ivars = env.objc.debug_all_class_ivars_as_strings(class);
+    ivars.sort();
+    ivars.dedup();
+
+    let mut rows = Vec::new();
+    for ivar_name in &ivars {
+        if should_skip_market_context_ivar(&ivar_name)
+            || !ivar_name_looks_market_context(&class_name, &ivar_name)
+        {
+            continue;
+        }
+
+        let Some(value) = read_object_ivar(env, object, &ivar_name) else {
+            continue;
+        };
+        if value == nil {
+            if ivar_name_is_primary_market_context(&ivar_name) {
+                rows.push((ivar_name.clone(), value, "nil".to_string()));
+            }
+            continue;
+        }
+
+        if let Some(text) = object_string_value_including_empty(env, value) {
+            rows.push((
+                ivar_name.clone(),
+                value,
+                format!("{:?} ({})", text, object_to_debug(env, value)),
+            ));
+        } else if debug_object_class(env, value).is_some() {
+            rows.push((
+                ivar_name.clone(),
+                value,
+                object_context_debug_value(env, value),
+            ));
+        } else if ivar_name_is_primary_market_context(&ivar_name) {
+            rows.push((
+                ivar_name.clone(),
+                value,
+                format!("raw=0x{:x}", value.to_bits()),
+            ));
+        }
+    }
+
+    let indent = "  ".repeat(depth);
+    writeln!(
+        writer,
+        "{indent}market/item class ivars: {}",
+        ivars.join(", ")
+    )?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    writeln!(writer, "{indent}market/item context ivars:")?;
+    for (ivar_name, value, description) in rows.into_iter().take(32) {
+        writeln!(writer, "{indent}  {ivar_name} => {description}")?;
+        if debug_class_name(env, value) == "NSInvocation" {
+            dump_invocation_debug(env, writer, value, depth + 2)?;
+        }
+        dump_market_collection_entries(env, writer, value, depth + 2, remaining - 1, visited)?;
+        if debug_class_name(env, value).contains("Buyable") {
+            dump_child_text_scan(env, writer, value, depth + 2, remaining - 1, visited)?;
+        }
+        if value == nil
+            || visited.contains(&value.to_bits())
+            || !debug_object_class(env, value).is_some()
+            || object_is_ns_string(env, value)
+            || !should_recurse_market_context_object(env, value)
+        {
+            continue;
+        }
+        visited.push(value.to_bits());
+        dump_market_context_ivars(env, writer, value, depth + 2, remaining - 1, visited)?;
+        if class_name_looks_text_related(&debug_class_name(env, value)) {
+            dump_class_text_ivars(env, writer, value, depth + 2)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn dump_market_collection_entries(
+    env: &mut Environment,
+    writer: &mut dyn Write,
+    collection: id,
+    depth: usize,
+    remaining: usize,
+    visited: &mut Vec<u32>,
+) -> IoResult<()> {
+    if collection == nil {
+        return Ok(());
+    }
+    if object_is_ns_dictionary(env, collection) {
+        return dump_market_dictionary_entries(env, writer, collection, depth, remaining, visited);
+    }
+    if remaining == 0 {
+        return Ok(());
+    }
+    let Some(count) = count_if_collection(env, collection) else {
+        return Ok(());
+    };
+    let indent = "  ".repeat(depth);
+    writeln!(
+        writer,
+        "{indent}entries showing {}/{}:",
+        count.min(16),
+        count
+    )?;
+    for idx in 0..count.min(16) {
+        let Some(entry) = object_at_index_if_collection(env, collection, idx) else {
+            continue;
+        };
+        let description = object_context_debug_value(env, entry);
+        writeln!(writer, "{indent}  [{idx}] {description}")?;
+        if entry == nil
+            || visited.contains(&entry.to_bits())
+            || debug_object_class(env, entry).is_none()
+            || object_is_ns_string(env, entry)
+            || !should_recurse_market_context_object(env, entry)
+        {
+            continue;
+        }
+        if object_is_ns_dictionary(env, entry) {
+            dump_market_dictionary_entries(env, writer, entry, depth + 2, remaining - 1, visited)?;
+        } else {
+            dump_market_context_ivars(env, writer, entry, depth + 2, remaining - 1, visited)?;
+        }
+        if debug_class_name(env, entry).contains("Buyable") {
+            dump_child_text_scan(env, writer, entry, depth + 2, remaining - 1, visited)?;
+        }
+    }
+    Ok(())
+}
+
+fn dump_market_dictionary_entries(
+    env: &mut Environment,
+    writer: &mut dyn Write,
+    dictionary: id,
+    depth: usize,
+    remaining: usize,
+    visited: &mut Vec<u32>,
+) -> IoResult<()> {
+    if dictionary == nil {
+        return Ok(());
+    }
+    if visited.contains(&dictionary.to_bits()) {
+        return Ok(());
+    }
+    visited.push(dictionary.to_bits());
+
+    let Some(count) = count_if_collection(env, dictionary) else {
+        return Ok(());
+    };
+    let Some(all_keys_selector) = env.objc.lookup_selector("allKeys") else {
+        return Ok(());
+    };
+    let Some(object_for_key_selector) = env.objc.lookup_selector("objectForKey:") else {
+        return Ok(());
+    };
+    if !debug_object_has_method(env, dictionary, all_keys_selector)
+        || !debug_object_has_method(env, dictionary, object_for_key_selector)
+    {
+        return Ok(());
+    }
+
+    let keys: id = msg_send_no_type_checking(env, (dictionary, all_keys_selector));
+    let indent = "  ".repeat(depth);
+    writeln!(
+        writer,
+        "{indent}dictionary entries showing {}/{}:",
+        count.min(24),
+        count
+    )?;
+    dump_dictionary_common_fields(env, writer, dictionary, depth + 1)?;
+    for idx in 0..count.min(24) {
+        let Some(key) = object_at_index_if_collection(env, keys, idx) else {
+            continue;
+        };
+        let value: id = msg_send_no_type_checking(env, (dictionary, object_for_key_selector, key));
+        writeln!(
+            writer,
+            "{indent}  [{}] {} => {}",
+            idx,
+            object_context_debug_value(env, key),
+            object_context_debug_value(env, value)
+        )?;
+
+        if value == nil
+            || visited.contains(&value.to_bits())
+            || debug_object_class(env, value).is_none()
+            || object_scalar_debug_value(env, value).is_some()
+            || !should_recurse_market_context_object(env, value)
+        {
+            continue;
+        }
+        if object_is_ns_dictionary(env, value) {
+            dump_market_dictionary_entries(
+                env,
+                writer,
+                value,
+                depth + 2,
+                remaining.saturating_sub(1),
+                visited,
+            )?;
+        } else {
+            if remaining == 0 {
+                continue;
+            }
+            dump_market_collection_entries(env, writer, value, depth + 2, remaining - 1, visited)?;
+            dump_market_context_ivars(env, writer, value, depth + 2, remaining - 1, visited)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn dump_invocation_debug(
+    env: &mut Environment,
+    writer: &mut dyn Write,
+    invocation: id,
+    depth: usize,
+) -> IoResult<()> {
+    let Some(info) =
+        crate::frameworks::foundation::ns_invocation::debug_invocation_info(env, invocation)
+    else {
+        return Ok(());
+    };
+    let indent = "  ".repeat(depth);
+    let selector = info.selector_name.as_deref().unwrap_or("<unset>");
+    writeln!(
+        writer,
+        "{indent}target={} selector={selector}",
+        object_to_debug(env, info.target)
+    )?;
+    if depth <= 5
+        && info.target != nil
+        && class_name_looks_market_context(&debug_class_name(env, info.target))
+    {
+        let mut visited = vec![invocation.to_bits()];
+        dump_market_context_ivars(env, writer, info.target, depth + 1, 3, &mut visited)?;
+    }
+    for argument in info.arguments {
+        let value = match argument.value {
+            Some(crate::frameworks::foundation::ns_invocation::DebugInvocationArgumentValue::Object(
+                object,
+            )) => {
+                if let Some(text) = object_string_value_including_empty(env, object) {
+                    format!("{:?} ({})", text, object_to_debug(env, object))
+                } else {
+                    object_to_debug(env, object)
+                }
+            }
+            Some(
+                crate::frameworks::foundation::ns_invocation::DebugInvocationArgumentValue::Selector(
+                    selector,
+                ),
+            ) => selector.as_str(&env.mem).to_string(),
+            Some(crate::frameworks::foundation::ns_invocation::DebugInvocationArgumentValue::F32(
+                value,
+            )) => format!("{value:.3}"),
+            Some(crate::frameworks::foundation::ns_invocation::DebugInvocationArgumentValue::F64(
+                value,
+            )) => format!("{value:.3}"),
+            Some(crate::frameworks::foundation::ns_invocation::DebugInvocationArgumentValue::I32(
+                value,
+            )) => value.to_string(),
+            Some(crate::frameworks::foundation::ns_invocation::DebugInvocationArgumentValue::U32(
+                value,
+            )) => value.to_string(),
+            Some(crate::frameworks::foundation::ns_invocation::DebugInvocationArgumentValue::I64(
+                value,
+            )) => value.to_string(),
+            Some(crate::frameworks::foundation::ns_invocation::DebugInvocationArgumentValue::U64(
+                value,
+            )) => value.to_string(),
+            Some(
+                crate::frameworks::foundation::ns_invocation::DebugInvocationArgumentValue::Pointer(
+                    value,
+                ),
+            ) => format!("0x{value:x}"),
+            None => "<unset>".to_string(),
+        };
+        writeln!(
+            writer,
+            "{indent}arg[{}] type={} value={value}",
+            argument.index, argument.type_
+        )?;
+    }
+    Ok(())
+}
+
+fn dump_nearby_cocos_text_inner(
+    env: &mut Environment,
+    writer: &mut dyn Write,
+    node: id,
+    search_rect: CGRect,
+    depth: usize,
+    tree_depth: usize,
+    visited: &mut Vec<u32>,
+    found: &mut usize,
+) -> IoResult<()> {
+    if node == nil || debug_object_class(env, node).is_none() || tree_depth > 14 || *found >= 80 {
+        return Ok(());
+    }
+
+    let node_bits = node.to_bits();
+    if visited.contains(&node_bits) {
+        return Ok(());
+    }
+    visited.push(node_bits);
+
+    let visible = node_bool_by_getter(env, node, "isVisible")
+        .or_else(|| node_bool_by_getter(env, node, "visible"))
+        .unwrap_or(true);
+    let class_name = debug_class_name(env, node).to_string();
+    let world_rect = node_size_by_getter(env, node, "contentSize")
+        .filter(|size| size.width > 0.0 && size.height > 0.0)
+        .and_then(|size| node_world_rect(env, node, size));
+    let origin = node_world_origin(env, node);
+    let is_near = world_rect.is_some_and(|rect| rects_intersect(rect, search_rect))
+        || origin.is_some_and(|point| point_in_rect(point, search_rect));
+
+    if visible && is_near && class_name_looks_text_related(&class_name) {
+        *found += 1;
+        let indent = "  ".repeat(depth);
+        let rect = world_rect
+            .map(rect_to_debug)
+            .unwrap_or_else(|| "n/a".to_string());
+        writeln!(
+            writer,
+            "{indent}[{}] 0x{:x} {} world_rect={} {}",
+            *found,
+            node_bits,
+            class_name,
+            rect,
+            cocos_node_summary(env, node)
+        )?;
+        let mut text_visited = Vec::new();
+        dump_cocos_text_scan(env, writer, node, depth + 1, 2, &mut text_visited)?;
+    }
+
+    if let Some((children, count)) = node_children(env, node) {
+        for idx in 0..count.min(256) {
+            let Some(child) = object_at_index_if_collection(env, children, idx) else {
+                continue;
+            };
+            dump_nearby_cocos_text_inner(
+                env,
+                writer,
+                child,
+                search_rect,
+                depth,
+                tree_depth + 1,
+                visited,
+                found,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn class_name_looks_text_related(class_name: &str) -> bool {
+    [
+        "Label",
+        "Text",
+        "Font",
+        "BMFont",
+        "BitmapFont",
+        "MenuItem",
+        "String",
+        "Title",
+        "Price",
+        "Cost",
+    ]
+    .iter()
+    .any(|needle| class_name.contains(needle))
+}
+
+fn class_name_looks_market_context(class_name: &str) -> bool {
+    [
+        "Market", "Shop", "Store", "Offer", "Product", "Item", "Crop", "Seed", "Plant", "Zombie",
+        "MenuItem", "Buyable",
+    ]
+    .iter()
+    .any(|needle| class_name.contains(needle))
+}
+
+fn ivar_name_looks_text_related(ivar_name: &str) -> bool {
+    let name = ivar_name.to_ascii_lowercase();
+    ["string", "text", "label", "font", "title", "name"]
+        .iter()
+        .any(|needle| name.contains(needle))
+}
+
+fn ivar_name_looks_market_context(class_name: &str, ivar_name: &str) -> bool {
+    if ivar_name_is_primary_market_context(ivar_name) {
+        return true;
+    }
+
+    let name = ivar_name.to_ascii_lowercase();
+    let broad_market_item = class_name.contains("MenuItem") || class_name.contains("Buyable");
+    broad_market_item
+        || [
+            "item", "market", "offer", "product", "crop", "seed", "plant", "zombie", "price",
+            "cost", "name", "key", "desc", "label", "sprite", "image", "icon", "data", "dict",
+            "array", "list", "category", "type", "id",
+        ]
+        .iter()
+        .any(|needle| name.contains(needle))
+}
+
+fn ivar_name_is_primary_market_context(ivar_name: &str) -> bool {
+    matches!(
+        ivar_name,
+        "itemLayer"
+            | "label_"
+            | "normalImage_"
+            | "selectedImage_"
+            | "disabledImage_"
+            | "subItems_"
+            | "userData"
+            | "invocation"
+            | "block_"
+            | "key"
+    )
+}
+
+fn should_skip_market_context_ivar(ivar_name: &str) -> bool {
+    matches!(
+        ivar_name,
+        "parent_"
+            | "children_"
+            | "camera_"
+            | "grid_"
+            | "transform_"
+            | "transformGL_"
+            | "inverse_"
+            | "contentSize_"
+            | "anchorPoint_"
+            | "anchorPointInPixels_"
+            | "position_"
+            | "rotation_"
+            | "scaleX_"
+            | "scaleY_"
+            | "zOrder_"
+            | "vertexZ_"
+            | "visible_"
+            | "isRunning_"
+            | "isSelected_"
+            | "isEnabled_"
+            | "isTransformDirty_"
+            | "isTransformGLDirty_"
+            | "isInverseDirty_"
+            | "isRelativeAnchorPoint_"
+            | "tag_"
+    )
+}
+
+fn should_recurse_market_context_object(env: &Environment, object: id) -> bool {
+    let class_name = debug_class_name(env, object);
+    class_name_looks_market_context(&class_name)
+        || class_name_looks_text_related(&class_name)
+        || class_name.contains("Sprite")
+        || class_name.contains("Layer")
+        || class_name.contains("Dictionary")
+        || class_name.contains("Array")
+}
+
+fn expand_rect(rect: CGRect, amount: f32) -> CGRect {
+    let x = rect.origin.x - amount;
+    let y = rect.origin.y - amount;
+    let width = rect.size.width + amount * 2.0;
+    let height = rect.size.height + amount * 2.0;
+    CGRect {
+        origin: CGPoint { x, y },
+        size: CGSize { width, height },
+    }
+}
+
+fn rects_intersect(a: CGRect, b: CGRect) -> bool {
+    let a_min_x = a.origin.x;
+    let a_min_y = a.origin.y;
+    let a_max_x = a.origin.x + a.size.width;
+    let a_max_y = a.origin.y + a.size.height;
+    let b_min_x = b.origin.x;
+    let b_min_y = b.origin.y;
+    let b_max_x = b.origin.x + b.size.width;
+    let b_max_y = b.origin.y + b.size.height;
+    a_min_x <= b_max_x && a_max_x >= b_min_x && a_min_y <= b_max_y && a_max_y >= b_min_y
+}
+
+fn point_in_rect(point: CGPoint, rect: CGRect) -> bool {
+    let min_x = rect.origin.x;
+    let min_y = rect.origin.y;
+    let max_x = rect.origin.x + rect.size.width;
+    let max_y = rect.origin.y + rect.size.height;
+    point.x >= min_x && point.x <= max_x && point.y >= min_y && point.y <= max_y
+}
+
+fn rect_to_debug(rect: CGRect) -> String {
+    let x = rect.origin.x;
+    let y = rect.origin.y;
+    let width = rect.size.width;
+    let height = rect.size.height;
+    format!("{{x={x:.1}, y={y:.1}, w={width:.1}, h={height:.1}}}")
 }
 
 fn cocos_node_summary(env: &mut Environment, node: id) -> String {

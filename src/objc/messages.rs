@@ -3956,6 +3956,14 @@ fn objc_msgSend_inner(
                         name,
                         selector_name,
                     ));
+                let record_zombie_farm_cocos_label_text = zombie_farm_uses_playforge_bundle(env)
+                    && (crate::zombie_farm_debug::should_record_cocos_label_text(
+                        receiver_class_name,
+                        selector_name,
+                    ) || crate::zombie_farm_debug::should_record_cocos_label_text(
+                        name,
+                        selector_name,
+                    ));
                 if trace_zombie_farm_status || trace_zombie_farm_layout {
                     let imp_description = match imp {
                         IMP::Host(_) => "host".to_string(),
@@ -4006,15 +4014,23 @@ fn objc_msgSend_inner(
                         }
                     }
                 }
+                let regs_before_zombie_farm_record = if record_zombie_farm_hunger
+                    || record_zombie_farm_apply_trace
+                    || record_zombie_farm_cocos_label_text
+                {
+                    Some(*env.cpu.regs())
+                } else {
+                    None
+                };
                 if record_zombie_farm_hunger || record_zombie_farm_apply_trace {
-                    let regs_before = *env.cpu.regs();
+                    let regs_before = regs_before_zombie_farm_record.as_ref().unwrap();
                     if record_zombie_farm_hunger {
                         crate::zombie_farm_debug::record_hunger_message(
                             env,
                             receiver,
                             receiver_class_name,
                             selector_name,
-                            &regs_before,
+                            regs_before,
                         );
                     }
                     if record_zombie_farm_apply_trace {
@@ -4023,7 +4039,7 @@ fn objc_msgSend_inner(
                             receiver,
                             receiver_class_name,
                             selector_name,
-                            &regs_before,
+                            regs_before,
                         );
                     }
                 }
@@ -4089,6 +4105,15 @@ Type mismatch when sending message {} to {:?}!
                         receiver,
                         receiver_class_name,
                         selector_name,
+                    );
+                }
+                if record_zombie_farm_cocos_label_text {
+                    crate::zombie_farm_debug::record_cocos_label_text_return(
+                        env,
+                        receiver,
+                        receiver_class_name,
+                        selector_name,
+                        regs_before_zombie_farm_record.as_ref().unwrap(),
                     );
                 }
                 zombie_farm_trace_game_interaction_return(env, receiver, &selector_name_for_after);

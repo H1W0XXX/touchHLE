@@ -160,6 +160,12 @@ pub enum Event {
     EnterDebugger,
     /// User pressed F11, requesting a UI/table inspector dump.
     DumpInspector,
+    /// User toggled the visual UIKit element inspector.
+    ToggleElementInspector,
+    /// User moved the pointer while the visual inspector is active.
+    InspectorPointerMove(Coords),
+    /// User clicked while the visual inspector is active.
+    InspectElementAt(Coords),
     TextInput(TextInputEvent),
 }
 
@@ -211,6 +217,7 @@ pub struct Window {
     _sdl_ctx: sdl2::Sdl,
     video_ctx: sdl2::VideoSubsystem,
     window: sdl2::video::Window,
+    title: String,
     event_pump: sdl2::EventPump,
     event_queue: VecDeque<Event>,
     last_polled: Instant,
@@ -239,6 +246,7 @@ pub struct Window {
     virtual_cursor_last: Option<(f32, f32, bool, bool)>,
     virtual_cursor_last_unsticky: Option<(f32, f32, Instant)>,
     virtual_accelerometer_last: Option<(f32, f32, bool)>,
+    element_inspector_enabled: bool,
     /// Whether or not we are on the "main" environment stack (rather than
     /// a coroutine stack). Checked in various functions to make sure that
     /// certain SDL functions (that call JNI functions) are on the main
@@ -364,6 +372,7 @@ impl Window {
             _sdl_ctx: sdl_ctx,
             video_ctx,
             window,
+            title: title.to_string(),
             event_pump,
             event_queue: VecDeque::new(),
             last_polled: Instant::now() - Duration::from_secs(1),
@@ -394,6 +403,7 @@ impl Window {
             virtual_cursor_last: None,
             virtual_cursor_last_unsticky: None,
             virtual_accelerometer_last: None,
+            element_inspector_enabled: false,
             on_main_stack: true,
         };
 
@@ -537,6 +547,35 @@ impl Window {
                     self.virtual_accelerometer_last = Some((x, y, false));
                 }
                 _ => {}
+            }
+
+            if self.element_inspector_enabled {
+                match event {
+                    E::MouseMotion { x, y, .. } => {
+                        let coords = transform_input_coords(self, (x as f32, y as f32), false);
+                        self.event_queue
+                            .push_back(Event::InspectorPointerMove(coords));
+                    }
+                    E::MouseButtonDown {
+                        x,
+                        y,
+                        mouse_btn: MouseButton::Left,
+                        ..
+                    } if self
+                        .event_pump
+                        .keyboard_state()
+                        .is_scancode_pressed(sdl2::keyboard::Scancode::LCtrl)
+                        || self
+                            .event_pump
+                            .keyboard_state()
+                            .is_scancode_pressed(sdl2::keyboard::Scancode::RCtrl) =>
+                    {
+                        let coords = transform_input_coords(self, (x as f32, y as f32), false);
+                        self.event_queue.push_back(Event::InspectElementAt(coords));
+                        continue;
+                    }
+                    _ => {}
+                }
             }
 
             self.event_queue.push_back(match event {
@@ -811,6 +850,29 @@ impl Window {
                         E::FingerDown { .. } => Event::TouchesDown(map),
                         _ => unreachable!(),
                     }
+                }
+                E::KeyDown {
+                    keycode: Some(sdl2::keyboard::Keycode::F10),
+                    ..
+                } => {
+                    self.element_inspector_enabled = !self.element_inspector_enabled;
+                    echo!(
+                        "F10 pressed, element inspector {}.",
+                        if self.element_inspector_enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    );
+                    Event::ToggleElementInspector
+                }
+                E::KeyDown {
+                    keycode: Some(sdl2::keyboard::Keycode::Escape),
+                    ..
+                } if self.element_inspector_enabled => {
+                    self.element_inspector_enabled = false;
+                    echo!("Escape pressed, element inspector disabled.");
+                    Event::ToggleElementInspector
                 }
                 E::KeyDown {
                     keycode: Some(sdl2::keyboard::Keycode::F11),
@@ -1271,6 +1333,17 @@ impl Window {
     /// presented.
     pub fn swap_window(&self) {
         self.window.gl_swap_window();
+    }
+
+    pub fn set_title(&mut self, title: &str) {
+        if self.title == title {
+            return;
+        }
+        if let Err(err) = self.window.set_title(title) {
+            log!("Warning: failed to set window title: {}", err);
+            return;
+        }
+        self.title = title.to_string();
     }
 
     /// Consider the emulated device to be rotated to a particular orientation.

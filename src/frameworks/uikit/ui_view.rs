@@ -30,11 +30,16 @@ use crate::frameworks::core_graphics::cg_geometry::CGRectZero;
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::frameworks::foundation::{ns_array, NSInteger, NSTimeInterval, NSUInteger};
+use crate::gles::gles11_raw as gles11;
+use crate::gles::gles11_raw::types::GLvoid;
+use crate::gles::GLES;
+use crate::matrix::Matrix;
 use crate::mem::{ConstPtr, ConstVoidPtr, MutVoidPtr, SafeRead};
 use crate::objc::{
     autorelease, id, msg, msg_class, msg_send, nil, objc_classes, release, retain,
     todo_objc_setter, Class, ClassExports, HostObject, NSZonePtr, ObjC, SEL,
 };
+use crate::window::Coords;
 use crate::Environment;
 use std::collections::HashSet;
 use std::io::Write;
@@ -45,6 +50,7 @@ pub struct State {
     pub ui_window: ui_window::State,
     pub animations_enabled: bool,
     animation: Option<UIViewAnimationState>,
+    debug_element_inspector: DebugElementInspectorState,
 }
 
 impl Default for State {
@@ -54,8 +60,61 @@ impl Default for State {
             ui_window: ui_window::State::default(),
             animations_enabled: true,
             animation: None,
+            debug_element_inspector: DebugElementInspectorState::default(),
         }
     }
+}
+
+struct DebugElementInspectorState {
+    enabled: bool,
+    cursor_point: Option<CGPoint>,
+    hovered_view: id,
+    hovered_cocos: Option<DebugCocosSelection>,
+    selected_view: id,
+    selected_cocos: Option<DebugCocosSelection>,
+    selected_point: Option<CGPoint>,
+}
+
+impl Default for DebugElementInspectorState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cursor_point: None,
+            hovered_view: nil,
+            hovered_cocos: None,
+            selected_view: nil,
+            selected_cocos: None,
+            selected_point: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct DebugInspectorOverlayRect {
+    rect: CGRect,
+    view: id,
+}
+
+#[derive(Clone)]
+struct DebugCocosSelection {
+    node: id,
+    class_name: String,
+    point_map: &'static str,
+    screen_rect: CGRect,
+    world_rect: CGRect,
+    world_point: CGPoint,
+    local_point: CGPoint,
+    depth: usize,
+    summary: String,
+}
+
+pub struct DebugInspectorOverlay {
+    screen_size: CGSize,
+    rects: Vec<DebugInspectorOverlayRect>,
+    hovered_view: id,
+    selected_view: id,
+    hovered_cocos_rect: Option<CGRect>,
+    selected_cocos_rect: Option<CGRect>,
 }
 
 struct UIViewAnimationState {
@@ -263,6 +322,729 @@ fn debug_class_name(env: &Environment, object: id) -> String {
         .try_get_class_name(class)
         .unwrap_or("<unknown class>")
         .to_string()
+}
+
+fn debug_view_title(env: &mut Environment, view: id, point: Option<CGPoint>) -> String {
+    if view == nil || env.objc.get_host_object(view).is_none() {
+        return "touchHLE inspector: no view".to_string();
+    }
+
+    let class_name = debug_class_name(env, view);
+    let frame: CGRect = msg![env; view frame];
+    let tag: NSInteger = msg![env; view tag];
+    let point = point
+        .map(|point| {
+            let point_x = point.x;
+            let point_y = point.y;
+            format!(" @ {:.0},{:.0}", point_x, point_y)
+        })
+        .unwrap_or_default();
+    let frame_origin = frame.origin;
+    let frame_size = frame.size;
+    let frame_x = frame_origin.x;
+    let frame_y = frame_origin.y;
+    let frame_width = frame_size.width;
+    let frame_height = frame_size.height;
+    format!(
+        "touchHLE inspector: {} 0x{:x} frame {:.0},{:.0} {:.0}x{:.0} tag {}{}",
+        class_name,
+        view.to_bits(),
+        frame_x,
+        frame_y,
+        frame_width,
+        frame_height,
+        tag,
+        point,
+    )
+}
+
+fn set_debug_window_title(env: &mut Environment, title: String) {
+    if env.window.is_some() {
+        env.window_mut().set_title(&title);
+    }
+}
+
+fn is_window(env: &mut Environment, view: id) -> bool {
+    let window_class = env.objc.get_known_class("UIWindow", &mut env.mem);
+    let class: Class = msg![env; view class];
+    env.objc.class_is_subclass_of(class, window_class)
+}
+
+fn is_fullscreen_eagl_leaf(env: &mut Environment, view: id) -> bool {
+    if view == nil || env.objc.get_host_object(view).is_none() {
+        return false;
+    }
+    if debug_class_name(env, view) != "EAGLView" {
+        return false;
+    }
+    let host = env.objc.borrow::<UIViewHostObject>(view);
+    host.subviews.is_empty()
+}
+
+#[derive(Copy, Clone)]
+enum CocosPointMap {
+    Identity,
+    FlipY { height: f32 },
+    Transpose,
+    LandscapeLeft { width: f32 },
+    LandscapeRight { height: f32 },
+}
+
+impl CocosPointMap {
+    fn name(self) -> &'static str {
+        match self {
+            CocosPointMap::Identity => "identity",
+            CocosPointMap::FlipY { .. } => "flip-y",
+            CocosPointMap::Transpose => "transpose",
+            CocosPointMap::LandscapeLeft { .. } => "landscape-left",
+            CocosPointMap::LandscapeRight { .. } => "landscape-right",
+        }
+    }
+
+    fn screen_to_world(self, point: CGPoint) -> CGPoint {
+        match self {
+            CocosPointMap::Identity => point,
+            CocosPointMap::FlipY { height } => CGPoint {
+                x: point.x,
+                y: height - point.y,
+            },
+            CocosPointMap::Transpose => CGPoint {
+                x: point.y,
+                y: point.x,
+            },
+            CocosPointMap::LandscapeLeft { width } => CGPoint {
+                x: point.y,
+                y: width - point.x,
+            },
+            CocosPointMap::LandscapeRight { height } => CGPoint {
+                x: height - point.y,
+                y: point.x,
+            },
+        }
+    }
+
+    fn world_to_screen(self, point: CGPoint) -> CGPoint {
+        match self {
+            CocosPointMap::Identity => point,
+            CocosPointMap::FlipY { height } => CGPoint {
+                x: point.x,
+                y: height - point.y,
+            },
+            CocosPointMap::Transpose => CGPoint {
+                x: point.y,
+                y: point.x,
+            },
+            CocosPointMap::LandscapeLeft { width } => CGPoint {
+                x: width - point.y,
+                y: point.x,
+            },
+            CocosPointMap::LandscapeRight { height } => CGPoint {
+                x: point.y,
+                y: height - point.x,
+            },
+        }
+    }
+
+    fn world_rect_to_screen(self, rect: CGRect) -> CGRect {
+        let min_x = rect.origin.x;
+        let min_y = rect.origin.y;
+        let max_x = rect.origin.x + rect.size.width;
+        let max_y = rect.origin.y + rect.size.height;
+        let corners = [
+            self.world_to_screen(CGPoint { x: min_x, y: min_y }),
+            self.world_to_screen(CGPoint { x: max_x, y: min_y }),
+            self.world_to_screen(CGPoint { x: min_x, y: max_y }),
+            self.world_to_screen(CGPoint { x: max_x, y: max_y }),
+        ];
+        let mut out_min_x = corners[0].x;
+        let mut out_max_x = corners[0].x;
+        let mut out_min_y = corners[0].y;
+        let mut out_max_y = corners[0].y;
+        for corner in corners.into_iter().skip(1) {
+            out_min_x = out_min_x.min(corner.x);
+            out_max_x = out_max_x.max(corner.x);
+            out_min_y = out_min_y.min(corner.y);
+            out_max_y = out_max_y.max(corner.y);
+        }
+        CGRect {
+            origin: CGPoint {
+                x: out_min_x,
+                y: out_min_y,
+            },
+            size: CGSize {
+                width: out_max_x - out_min_x,
+                height: out_max_y - out_min_y,
+            },
+        }
+    }
+}
+
+fn cocos_point_maps(env: &mut Environment) -> Vec<CocosPointMap> {
+    let screen: id = msg_class![env; UIScreen mainScreen];
+    let screen_bounds: CGRect = msg![env; screen bounds];
+    let width = screen_bounds.size.width;
+    let height = screen_bounds.size.height;
+    let scene_size = crate::zombie_farm_debug::running_scene_size(env);
+    let scene_is_landscape =
+        scene_size.is_some_and(|size| size.width > size.height) && height > width;
+    if scene_is_landscape {
+        vec![
+            CocosPointMap::Transpose,
+            CocosPointMap::LandscapeLeft { width },
+            CocosPointMap::LandscapeRight { height },
+        ]
+    } else {
+        vec![CocosPointMap::Identity, CocosPointMap::FlipY { height }]
+    }
+}
+
+fn inspect_cocos_at_screen_point(
+    env: &mut Environment,
+    screen_point: CGPoint,
+) -> Option<DebugCocosSelection> {
+    let mut best = None;
+    for map in cocos_point_maps(env) {
+        let world_point = map.screen_to_world(screen_point);
+        let Some(hit) = crate::zombie_farm_debug::inspect_cocos_node_at_points(env, &[world_point])
+        else {
+            continue;
+        };
+        let screen_rect = map.world_rect_to_screen(hit.world_rect);
+        let selection = DebugCocosSelection {
+            node: hit.node,
+            class_name: hit.class_name,
+            point_map: map.name(),
+            screen_rect,
+            world_rect: hit.world_rect,
+            world_point: hit.world_point,
+            local_point: hit.local_point,
+            depth: hit.depth,
+            summary: hit.summary,
+        };
+        let replace = best.as_ref().is_none_or(|old: &DebugCocosSelection| {
+            selection.depth > old.depth
+                || (selection.depth == old.depth
+                    && selection.screen_rect.size.width * selection.screen_rect.size.height
+                        < old.screen_rect.size.width * old.screen_rect.size.height)
+        });
+        if replace {
+            best = Some(selection);
+        }
+    }
+    best
+}
+
+fn debug_cocos_title(hit: &DebugCocosSelection) -> String {
+    format!(
+        "touchHLE inspector: Cocos {} 0x{:x} world {} local {}",
+        hit.class_name,
+        hit.node.to_bits(),
+        hit.world_point,
+        hit.local_point,
+    )
+}
+
+fn view_rect_in_screen(env: &mut Environment, view: id) -> Option<CGRect> {
+    if view == nil || env.objc.get_host_object(view).is_none() {
+        return None;
+    }
+
+    let bounds: CGRect = msg![env; view bounds];
+    if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+        return None;
+    }
+
+    if is_window(env, view) {
+        return Some(bounds);
+    }
+
+    let window: id = msg![env; view window];
+    if window == nil || env.objc.get_host_object(window).is_none() {
+        return None;
+    }
+
+    Some(msg![env; view convertRect:bounds toView:window])
+}
+
+fn inspectable_view_at_point(env: &mut Environment, point: CGPoint) -> id {
+    let event = nil;
+    let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
+    let mut fallback_window_hit = None;
+    for window in windows.into_iter().rev() {
+        if window == nil || env.objc.get_host_object(window).is_none() {
+            continue;
+        }
+        let location_in_window: CGPoint = msg![env; window convertPoint:point fromWindow:nil];
+        if !msg![env; window pointInside:location_in_window withEvent:event] {
+            continue;
+        }
+        let view: id = msg![env; window hitTest:location_in_window withEvent:event];
+        if view == nil {
+            continue;
+        }
+        if view == window {
+            fallback_window_hit.get_or_insert(view);
+            continue;
+        }
+        return view;
+    }
+    fallback_window_hit.unwrap_or(nil)
+}
+
+fn write_view_detail(
+    env: &mut Environment,
+    writer: &mut dyn Write,
+    view: id,
+    label: &str,
+) -> std::io::Result<()> {
+    if view == nil || env.objc.get_host_object(view).is_none() {
+        writeln!(writer, "{label}: nil")?;
+        return Ok(());
+    }
+
+    let class_name = debug_class_name(env, view);
+    let frame: CGRect = msg![env; view frame];
+    let bounds: CGRect = msg![env; view bounds];
+    let center: CGPoint = msg![env; view center];
+    let tag: NSInteger = msg![env; view tag];
+    let hidden: bool = msg![env; view isHidden];
+    let alpha: CGFloat = msg![env; view alpha];
+    let interaction: bool = msg![env; view isUserInteractionEnabled];
+    let (superview, subview_count, layer) = {
+        let host = env.objc.borrow::<UIViewHostObject>(view);
+        (host.superview, host.subviews.len(), host.layer)
+    };
+
+    writeln!(
+        writer,
+        "{label}: 0x{:x} {} tag={} frame={:?} bounds={:?} center={} hidden={} alpha={} userInteraction={} super=0x{:x} subviews={}",
+        view.to_bits(),
+        class_name,
+        tag,
+        frame,
+        bounds,
+        center,
+        hidden,
+        alpha,
+        interaction,
+        superview.to_bits(),
+        subview_count,
+    )?;
+
+    if layer != nil && env.objc.get_host_object(layer).is_some() {
+        let (_delegate, layer_bounds, position, anchor, sublayers) =
+            ca_layer::diagnostic_snapshot(&env.objc, layer);
+        let (
+            layer_hidden,
+            opaque,
+            opacity,
+            has_background,
+            has_contents,
+            has_presented_pixels,
+            has_cg_context,
+            has_gl_texture,
+        ) = ca_layer::diagnostic_render_snapshot(&env.objc, layer);
+        writeln!(
+            writer,
+            "  layer=0x{:x} bounds={:?} position={} anchor={} hidden={} opaque={} opacity={} bg={} contents={} presented_pixels={} cg_context={} gl_texture={} sublayers={}",
+            layer.to_bits(),
+            layer_bounds,
+            position,
+            anchor,
+            layer_hidden,
+            opaque,
+            opacity,
+            has_background,
+            has_contents,
+            has_presented_pixels,
+            has_cg_context,
+            has_gl_texture,
+            sublayers.len(),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn write_selected_debug_inspector(
+    env: &mut Environment,
+    point: CGPoint,
+    view: id,
+) -> std::io::Result<std::path::PathBuf> {
+    let path = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join("zombie_farm_selected_view.txt");
+    let mut file = std::fs::File::create(&path)?;
+    writeln!(file, "touchHLE selected element")?;
+    writeln!(file, "bundle: {}", env.bundle.bundle_identifier())?;
+    writeln!(file, "point: {}", point)?;
+    writeln!(file)?;
+    write_view_detail(env, &mut file, view, "selected")?;
+
+    writeln!(file)?;
+    writeln!(file, "== Superview Chain ==")?;
+    let mut current = view;
+    let mut depth = 0usize;
+    let mut visited = HashSet::new();
+    while current != nil && env.objc.get_host_object(current).is_some() {
+        if !visited.insert(current.to_bits()) {
+            writeln!(file, "cycle at 0x{:x}", current.to_bits())?;
+            break;
+        }
+        write_view_detail(env, &mut file, current, &format!("ancestor[{depth}]"))?;
+        current = env.objc.borrow::<UIViewHostObject>(current).superview;
+        depth += 1;
+    }
+
+    if view != nil && env.objc.get_host_object(view).is_some() {
+        writeln!(file)?;
+        writeln!(file, "== Immediate Subviews ==")?;
+        let subviews = env.objc.borrow::<UIViewHostObject>(view).subviews.clone();
+        if subviews.is_empty() {
+            writeln!(file, "(none)")?;
+        }
+        for (idx, subview) in subviews.into_iter().enumerate() {
+            write_view_detail(env, &mut file, subview, &format!("subview[{idx}]"))?;
+        }
+    }
+
+    Ok(path)
+}
+
+fn write_selected_cocos_debug_inspector(
+    env: &mut Environment,
+    point: CGPoint,
+    hit: &DebugCocosSelection,
+) -> std::io::Result<std::path::PathBuf> {
+    let path = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join("zombie_farm_selected_view.txt");
+    let mut file = std::fs::File::create(&path)?;
+    writeln!(file, "touchHLE selected Cocos element")?;
+    writeln!(file, "bundle: {}", env.bundle.bundle_identifier())?;
+    writeln!(file, "screen point: {}", point)?;
+    writeln!(file, "point map: {}", hit.point_map)?;
+    writeln!(file, "world point: {}", hit.world_point)?;
+    writeln!(file, "local point: {}", hit.local_point)?;
+    writeln!(file, "screen rect: {:?}", hit.screen_rect)?;
+    writeln!(file, "world rect: {:?}", hit.world_rect)?;
+    writeln!(file)?;
+    writeln!(
+        file,
+        "selected: 0x{:x} {} depth={} {}",
+        hit.node.to_bits(),
+        hit.class_name,
+        hit.depth,
+        hit.summary,
+    )?;
+    crate::zombie_farm_debug::write_cocos_node_detail(env, &mut file, hit.node, 1)?;
+    writeln!(file)?;
+    crate::zombie_farm_debug::write_nearby_cocos_text(env, &mut file, hit.world_rect, 1)?;
+    Ok(path)
+}
+
+pub fn toggle_debug_element_inspector(env: &mut Environment) {
+    let state = &mut env.framework_state.uikit.ui_view.debug_element_inspector;
+    state.enabled = !state.enabled;
+    if !state.enabled {
+        state.cursor_point = None;
+        state.hovered_view = nil;
+        state.hovered_cocos = None;
+        set_debug_window_title(env, "touchHLE inspector: off".to_string());
+        log!("Visual element inspector disabled.");
+        return;
+    }
+
+    set_debug_window_title(
+        env,
+        "touchHLE inspector: hover to highlight, Ctrl+click to select, F10/Esc to close"
+            .to_string(),
+    );
+    log!("Visual element inspector enabled. Hover highlights views; Ctrl+click selects.");
+}
+
+pub fn debug_element_inspector_pointer_move(env: &mut Environment, coords: Coords) {
+    let point = CGPoint {
+        x: coords.0,
+        y: coords.1,
+    };
+    let hit = inspectable_view_at_point(env, point);
+    let cocos_hit = is_fullscreen_eagl_leaf(env, hit)
+        .then(|| inspect_cocos_at_screen_point(env, point))
+        .flatten();
+    let old_hit = env
+        .framework_state
+        .uikit
+        .ui_view
+        .debug_element_inspector
+        .hovered_view;
+    {
+        let state = &mut env.framework_state.uikit.ui_view.debug_element_inspector;
+        state.cursor_point = Some(point);
+        state.hovered_view = hit;
+        state.hovered_cocos = cocos_hit.clone();
+    }
+    if let Some(cocos_hit) = &cocos_hit {
+        set_debug_window_title(env, debug_cocos_title(cocos_hit));
+    } else if hit != old_hit {
+        let title = debug_view_title(env, hit, Some(point));
+        set_debug_window_title(env, title);
+    }
+}
+
+pub fn debug_element_inspector_click(env: &mut Environment, coords: Coords) {
+    let point = CGPoint {
+        x: coords.0,
+        y: coords.1,
+    };
+    let hit = inspectable_view_at_point(env, point);
+    let cocos_hit = is_fullscreen_eagl_leaf(env, hit)
+        .then(|| inspect_cocos_at_screen_point(env, point))
+        .flatten();
+    {
+        let state = &mut env.framework_state.uikit.ui_view.debug_element_inspector;
+        state.cursor_point = Some(point);
+        state.hovered_view = hit;
+        state.hovered_cocos = cocos_hit.clone();
+        state.selected_view = hit;
+        state.selected_cocos = cocos_hit.clone();
+        state.selected_point = Some(point);
+    }
+
+    if let Some(cocos_hit) = cocos_hit {
+        set_debug_window_title(env, debug_cocos_title(&cocos_hit));
+        match write_selected_cocos_debug_inspector(env, point, &cocos_hit) {
+            Ok(path) => {
+                log!(
+                    "Visual element inspector selected Cocos 0x{:x} {} at {} via {}; wrote {}",
+                    cocos_hit.node.to_bits(),
+                    cocos_hit.class_name,
+                    point,
+                    cocos_hit.point_map,
+                    path.display(),
+                );
+            }
+            Err(err) => {
+                log!(
+                    "Visual element inspector selected Cocos 0x{:x}, but failed to write selection: {}",
+                    cocos_hit.node.to_bits(),
+                    err,
+                );
+            }
+        }
+        return;
+    }
+
+    let title = debug_view_title(env, hit, Some(point));
+    set_debug_window_title(env, title);
+
+    if hit == nil {
+        log!("Visual element inspector: no view at {}", point);
+        return;
+    }
+
+    match write_selected_debug_inspector(env, point, hit) {
+        Ok(path) => {
+            log!(
+                "Visual element inspector selected 0x{:x} {} at {}; wrote {}",
+                hit.to_bits(),
+                debug_class_name(env, hit),
+                point,
+                path.display(),
+            );
+        }
+        Err(err) => {
+            log!(
+                "Visual element inspector selected 0x{:x}, but failed to write selection: {}",
+                hit.to_bits(),
+                err,
+            );
+        }
+    }
+}
+
+fn collect_debug_overlay_rects(
+    env: &mut Environment,
+    view: id,
+    rects: &mut Vec<DebugInspectorOverlayRect>,
+    visited: &mut HashSet<u32>,
+) {
+    if view == nil || env.objc.get_host_object(view).is_none() || !visited.insert(view.to_bits()) {
+        return;
+    }
+
+    let hidden: bool = msg![env; view isHidden];
+    let alpha: CGFloat = msg![env; view alpha];
+    if hidden || alpha < 0.01 {
+        return;
+    }
+
+    if let Some(rect) = view_rect_in_screen(env, view) {
+        rects.push(DebugInspectorOverlayRect { rect, view });
+    }
+
+    let subviews = env.objc.borrow::<UIViewHostObject>(view).subviews.clone();
+    for subview in subviews {
+        collect_debug_overlay_rects(env, subview, rects, visited);
+    }
+}
+
+pub fn debug_inspector_overlay(env: &mut Environment) -> Option<DebugInspectorOverlay> {
+    if !env
+        .framework_state
+        .uikit
+        .ui_view
+        .debug_element_inspector
+        .enabled
+    {
+        return None;
+    }
+
+    let screen: id = msg_class![env; UIScreen mainScreen];
+    let screen_bounds: CGRect = msg![env; screen bounds];
+    let mut rects = Vec::new();
+    let mut visited = HashSet::new();
+    let windows = env.framework_state.uikit.ui_view.ui_window.windows.clone();
+    for window in windows {
+        collect_debug_overlay_rects(env, window, &mut rects, &mut visited);
+    }
+
+    let state = &env.framework_state.uikit.ui_view.debug_element_inspector;
+    Some(DebugInspectorOverlay {
+        screen_size: screen_bounds.size,
+        rects,
+        hovered_view: state.hovered_view,
+        selected_view: state.selected_view,
+        hovered_cocos_rect: state.hovered_cocos.as_ref().map(|hit| hit.screen_rect),
+        selected_cocos_rect: state.selected_cocos.as_ref().map(|hit| hit.screen_rect),
+    })
+}
+
+fn debug_overlay_vertex(
+    point: CGPoint,
+    screen_size: CGSize,
+    rotation_matrix: Matrix<2>,
+) -> [f32; 2] {
+    let x = point.x / screen_size.width - 0.5;
+    let y = point.y / screen_size.height - 0.5;
+    let [x, y] = rotation_matrix.transform([x, y]);
+    [x * 2.0, -y * 2.0]
+}
+
+unsafe fn draw_debug_overlay_rect(
+    gles: &mut dyn GLES,
+    overlay: &DebugInspectorOverlay,
+    rotation_matrix: Matrix<2>,
+    rect: CGRect,
+    rgba: (f32, f32, f32, f32),
+    line_width: f32,
+) {
+    let min_x = rect.origin.x;
+    let min_y = rect.origin.y;
+    let max_x = rect.origin.x + rect.size.width;
+    let max_y = rect.origin.y + rect.size.height;
+    let corners = [
+        CGPoint { x: min_x, y: min_y },
+        CGPoint { x: max_x, y: min_y },
+        CGPoint { x: max_x, y: max_y },
+        CGPoint { x: min_x, y: max_y },
+    ];
+    let mut vertices = [0.0f32; 8];
+    for (idx, corner) in corners.into_iter().enumerate() {
+        let [x, y] = debug_overlay_vertex(corner, overlay.screen_size, rotation_matrix);
+        vertices[idx * 2] = x;
+        vertices[idx * 2 + 1] = y;
+    }
+
+    gles.Color4f(rgba.0 * rgba.3, rgba.1 * rgba.3, rgba.2 * rgba.3, rgba.3);
+    gles.LineWidth(line_width);
+    gles.VertexPointer(2, gles11::FLOAT, 0, vertices.as_ptr() as *const GLvoid);
+    gles.DrawArrays(gles11::LINE_LOOP, 0, 4);
+}
+
+pub unsafe fn draw_debug_inspector_overlay(
+    gles: &mut dyn GLES,
+    viewport: (u32, u32, u32, u32),
+    rotation_matrix: Matrix<2>,
+    overlay: &DebugInspectorOverlay,
+) {
+    gles.Viewport(
+        viewport.0 as _,
+        viewport.1 as _,
+        viewport.2 as _,
+        viewport.3 as _,
+    );
+    gles.MatrixMode(gles11::PROJECTION);
+    gles.LoadIdentity();
+    gles.MatrixMode(gles11::MODELVIEW);
+    gles.LoadIdentity();
+    gles.MatrixMode(gles11::TEXTURE);
+    gles.LoadIdentity();
+    gles.BindBuffer(gles11::ARRAY_BUFFER, 0);
+    gles.DisableClientState(gles11::TEXTURE_COORD_ARRAY);
+    gles.EnableClientState(gles11::VERTEX_ARRAY);
+    gles.Disable(gles11::TEXTURE_2D);
+    gles.Enable(gles11::BLEND);
+    gles.BlendFunc(gles11::ONE, gles11::ONE_MINUS_SRC_ALPHA);
+
+    for item in &overlay.rects {
+        draw_debug_overlay_rect(
+            gles,
+            overlay,
+            rotation_matrix,
+            item.rect,
+            (0.0, 0.85, 1.0, 0.28),
+            1.0,
+        );
+    }
+    if let Some(item) = overlay
+        .rects
+        .iter()
+        .find(|item| item.view == overlay.hovered_view)
+    {
+        draw_debug_overlay_rect(
+            gles,
+            overlay,
+            rotation_matrix,
+            item.rect,
+            (1.0, 0.85, 0.0, 0.95),
+            3.0,
+        );
+    }
+    if let Some(rect) = overlay.hovered_cocos_rect {
+        draw_debug_overlay_rect(
+            gles,
+            overlay,
+            rotation_matrix,
+            rect,
+            (1.0, 0.85, 0.0, 0.95),
+            3.0,
+        );
+    }
+    if let Some(item) = overlay
+        .rects
+        .iter()
+        .find(|item| item.view == overlay.selected_view)
+    {
+        draw_debug_overlay_rect(
+            gles,
+            overlay,
+            rotation_matrix,
+            item.rect,
+            (1.0, 0.15, 0.05, 0.95),
+            4.0,
+        );
+    }
+    if let Some(rect) = overlay.selected_cocos_rect {
+        draw_debug_overlay_rect(
+            gles,
+            overlay,
+            rotation_matrix,
+            rect,
+            (1.0, 0.15, 0.05, 0.95),
+            4.0,
+        );
+    }
 }
 
 fn dump_view_tree_inner(
