@@ -1016,6 +1016,7 @@ fn zombie_farm_set_game_state_save_date(env: &mut Environment, game_state: id, s
         return;
     }
 
+    let regs = *env.cpu.regs();
     let Some(save_date_ivar) =
         env.objc
             .object_lookup_ivar(&env.mem, game_state, &"saveDate".to_string())
@@ -1028,6 +1029,7 @@ fn zombie_farm_set_game_state_save_date(env: &mut Environment, game_state: id, s
     if old_save_date != nil && old_save_date != retained_save_date {
         release(env, old_save_date);
     }
+    env.cpu.regs_mut().copy_from_slice(&regs);
 }
 
 fn zombie_farm_ensure_game_state_save_date(env: &mut Environment) -> bool {
@@ -1095,10 +1097,12 @@ fn zombie_farm_override_game_state_save_date_setter(
             "ZombieFarm status: ignoring GameState setSaveDate: invalid object {:?}",
             save_date
         );
+        env.cpu.regs_mut()[0] = receiver.to_bits();
         return true;
     }
 
     zombie_farm_set_game_state_save_date(env, receiver, save_date);
+    env.cpu.regs_mut()[0] = receiver.to_bits();
     log!(
         "ZombieFarm status: host-handled GameState setSaveDate:{:?}",
         save_date
@@ -3690,11 +3694,19 @@ fn objc_msgSend_inner(
         return;
     }
     if receiver.to_bits() < env.mem.null_segment_size() || receiver.to_bits() % 4 != 0 {
-        log!(
-            "Warning: ignoring {} sent to invalid low ObjC pointer {:?}",
-            selector.as_str(&env.mem),
-            receiver
-        );
+        let selector_name = selector.as_str(&env.mem);
+        if selector_name == "compare:" {
+            log_dbg!(
+                "Ignoring compare: sent to invalid low ObjC pointer {:?}",
+                receiver
+            );
+        } else {
+            log!(
+                "Warning: ignoring {} sent to invalid low ObjC pointer {:?}",
+                selector_name,
+                receiver
+            );
+        }
         env.cpu.regs_mut()[0..2].fill(0);
         return;
     }

@@ -774,8 +774,19 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())setObject:(id)object
          forKey:(id)key {
-    assert_ne!(object, nil);
-    assert_ne!(key, nil);
+    if object == nil {
+        if key == nil {
+            log!("Warning: ignoring [(NSDictionary*){:?} setObject:nil forKey:nil]", this);
+            return;
+        }
+        log_dbg!("Ignoring [(NSDictionary*){:?} setObject:nil forKey:{:?}], removing key", this, key);
+        () = msg![env; this removeObjectForKey:key];
+        return;
+    }
+    if key == nil {
+        log!("Warning: ignoring [(NSDictionary*){:?} setObject:{:?} forKey:nil]", this, object);
+        return;
+    }
     let mut host_obj: DictionaryHostObject = std::mem::take(env.objc.borrow_mut(this));
     host_obj.insert(env, key, object, /* copy_key: */ true);
     *env.objc.borrow_mut(this) = host_obj;
@@ -1019,9 +1030,20 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())setObject:(id)object
          forKey:(id)key {
     // TODO: raise NSInvalidArgumentException
-    assert_ne!(object, nil);
+    if object == nil {
+        if key == nil {
+            log!("Warning: ignoring [(NSMutableDictionary*){:?} setObject:nil forKey:nil]", this);
+            return;
+        }
+        log_dbg!("Ignoring [(NSMutableDictionary*){:?} setObject:nil forKey:{:?}], removing key", this, key);
+        () = msg![env; this removeObjectForKey:key];
+        return;
+    }
     // TODO: raise NSInvalidArgumentException
-    assert_ne!(key, nil);
+    if key == nil {
+        log!("Warning: ignoring [(NSMutableDictionary*){:?} setObject:{:?} forKey:nil]", this, object);
+        return;
+    }
     let mut host_obj: DictionaryHostObject = std::mem::take(env.objc.borrow_mut(this));
     host_obj.insert(env, key, object, /* copy_key: */ true);
     *env.objc.borrow_mut(this) = host_obj;
