@@ -5,7 +5,7 @@
  */
 //! `printf` function family. The implementation is also used by `NSLog` etc.
 
-use crate::abi::{DotDotDot, VaList};
+use crate::abi::{DotDotDot, GuestArg, VaList};
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::frameworks::foundation::{ns_string, unichar};
 use crate::libc::clocale::{setlocale, LC_CTYPE};
@@ -44,6 +44,7 @@ pub fn printf_inner<const NS_LOG: bool, F: Fn(&Mem, GuestUSize) -> u8>(
     mut args: VaList,
 ) -> Vec<u8> {
     let mut res = Vec::<u8>::new();
+    let args_start = args;
 
     let mut format_char_idx = 0;
 
@@ -58,6 +59,21 @@ pub fn printf_inner<const NS_LOG: bool, F: Fn(&Mem, GuestUSize) -> u8>(
             res.push(c);
             continue;
         }
+
+        let positional_arg = {
+            let mut idx = format_char_idx;
+            let mut position = 0usize;
+            while let c @ b'0'..=b'9' = get_format_char(&env.mem, idx) {
+                position = position * 10 + (c - b'0') as usize;
+                idx += 1;
+            }
+            if position > 0 && get_format_char(&env.mem, idx) == b'$' {
+                format_char_idx = idx + 1;
+                Some(position)
+            } else {
+                None
+            }
+        };
 
         let prepend_sign = if get_format_char(&env.mem, format_char_idx) == b'+' {
             format_char_idx += 1;
@@ -190,7 +206,7 @@ pub fn printf_inner<const NS_LOG: bool, F: Fn(&Mem, GuestUSize) -> u8>(
                 assert!(!left_justified);
                 // TODO: support length modifier
                 assert!(length_modifier.is_none());
-                let c: u8 = args.next(env);
+                let c: u8 = next_printf_arg(env, args_start, &mut args, positional_arg);
                 assert!(pad_char == ' ' && pad_width == 0); // TODO
                 res.push(c);
             }
@@ -199,7 +215,7 @@ pub fn printf_inner<const NS_LOG: bool, F: Fn(&Mem, GuestUSize) -> u8>(
                 assert!(!prepend_sign);
                 assert!(!left_justified);
                 assert!(length_modifier.is_none());
-                let c: unichar = args.next(env);
+                let c: unichar = next_printf_arg(env, args_start, &mut args, positional_arg);
                 // TODO
                 assert!(pad_char == ' ' && pad_width == 0);
                 // This will panic if it's a surrogate! This isn't good if
@@ -217,7 +233,8 @@ pub fn printf_inner<const NS_LOG: bool, F: Fn(&Mem, GuestUSize) -> u8>(
                     assert!(!left_justified);
                     let ctype_locale = setlocale(env, LC_CTYPE, Ptr::null());
                     assert_eq!(env.mem.read(ctype_locale), b'C');
-                    let w_string: ConstPtr<wchar_t> = args.next(env);
+                    let w_string: ConstPtr<wchar_t> =
+                        next_printf_arg(env, args_start, &mut args, positional_arg);
                     assert!(pad_char == ' ' && pad_width == 0); // TODO
                     if !w_string.is_null() {
                         res.extend_from_slice(env.mem.wcstr_at(w_string).as_bytes());
@@ -226,7 +243,8 @@ pub fn printf_inner<const NS_LOG: bool, F: Fn(&Mem, GuestUSize) -> u8>(
                     }
                 } else {
                     assert!(length_modifier.is_none()); // TODO
-                    let c_string: ConstPtr<u8> = args.next(env);
+                    let c_string: ConstPtr<u8> =
+                        next_printf_arg(env, args_start, &mut args, positional_arg);
                     assert!(pad_char == ' '); // TODO
                     if !c_string.is_null() {
                         if let Some(precision) = precision {
@@ -259,30 +277,30 @@ pub fn printf_inner<const NS_LOG: bool, F: Fn(&Mem, GuestUSize) -> u8>(
                 // so single length_modifier is ignored (but not double one!)
                 let int: i64 = if specifier == b'u' {
                     if length_modifier == Some("ll") {
-                        let uint: u64 = args.next(env);
+                        let uint: u64 = next_printf_arg(env, args_start, &mut args, positional_arg);
                         uint.try_into().unwrap()
                     } else if length_modifier == Some("hh") {
-                        let uint: u8 = args.next(env);
+                        let uint: u8 = next_printf_arg(env, args_start, &mut args, positional_arg);
                         uint.into()
                     } else if length_modifier == Some("h") {
-                        let uint: u16 = args.next(env);
+                        let uint: u16 = next_printf_arg(env, args_start, &mut args, positional_arg);
                         uint.into()
                     } else {
                         assert!(length_modifier.is_none() || length_modifier == Some("l"));
-                        let uint: u32 = args.next(env);
+                        let uint: u32 = next_printf_arg(env, args_start, &mut args, positional_arg);
                         uint.into()
                     }
                 } else if length_modifier == Some("ll") {
-                    args.next(env)
+                    next_printf_arg(env, args_start, &mut args, positional_arg)
                 } else if length_modifier == Some("hh") {
-                    let int: i8 = args.next(env);
+                    let int: i8 = next_printf_arg(env, args_start, &mut args, positional_arg);
                     int.into()
                 } else if length_modifier == Some("h") {
-                    let int: i16 = args.next(env);
+                    let int: i16 = next_printf_arg(env, args_start, &mut args, positional_arg);
                     int.into()
                 } else {
                     assert!(length_modifier.is_none() || length_modifier == Some("l"));
-                    let int: i32 = args.next(env);
+                    let int: i32 = next_printf_arg(env, args_start, &mut args, positional_arg);
                     int.into()
                 };
 
@@ -319,7 +337,7 @@ pub fn printf_inner<const NS_LOG: bool, F: Fn(&Mem, GuestUSize) -> u8>(
                 assert!(!prepend_sign);
                 assert!(!left_justified);
                 assert!(length_modifier.is_none());
-                let object: id = args.next(env);
+                let object: id = next_printf_arg(env, args_start, &mut args, positional_arg);
                 // TODO: use localized description if available?
                 let description: id = msg![env; object description];
                 if description != nil {
@@ -337,17 +355,17 @@ pub fn printf_inner<const NS_LOG: bool, F: Fn(&Mem, GuestUSize) -> u8>(
                 // Note: on 32-bit system unsigned int and unsigned long
                 // are u32, so length_modifier is ignored
                 let uint: u32 = if length_modifier == Some("ll") {
-                    let uint: u64 = args.next(env);
+                    let uint: u64 = next_printf_arg(env, args_start, &mut args, positional_arg);
                     uint.try_into().unwrap()
                 } else if length_modifier == Some("hh") {
-                    let uint: u8 = args.next(env);
+                    let uint: u8 = next_printf_arg(env, args_start, &mut args, positional_arg);
                     uint.into()
                 } else if length_modifier == Some("h") {
-                    let uint: u16 = args.next(env);
+                    let uint: u16 = next_printf_arg(env, args_start, &mut args, positional_arg);
                     uint.into()
                 } else {
                     assert!(length_modifier.is_none() || length_modifier == Some("l"));
-                    let uint: u32 = args.next(env);
+                    let uint: u32 = next_printf_arg(env, args_start, &mut args, positional_arg);
                     uint
                 };
                 if pad_width > 0 {
@@ -369,17 +387,17 @@ pub fn printf_inner<const NS_LOG: bool, F: Fn(&Mem, GuestUSize) -> u8>(
                 // Note: on 32-bit system unsigned int and unsigned long
                 // are u32, so length_modifier is ignored
                 let uint: u32 = if length_modifier == Some("ll") {
-                    let uint: u64 = args.next(env);
+                    let uint: u64 = next_printf_arg(env, args_start, &mut args, positional_arg);
                     uint.try_into().unwrap()
                 } else if length_modifier == Some("hh") {
-                    let uint: u8 = args.next(env);
+                    let uint: u8 = next_printf_arg(env, args_start, &mut args, positional_arg);
                     uint.into()
                 } else if length_modifier == Some("h") {
-                    let uint: u16 = args.next(env);
+                    let uint: u16 = next_printf_arg(env, args_start, &mut args, positional_arg);
                     uint.into()
                 } else {
                     assert!(length_modifier.is_none() || length_modifier == Some("l"));
-                    let uint: u32 = args.next(env);
+                    let uint: u32 = next_printf_arg(env, args_start, &mut args, positional_arg);
                     uint
                 };
                 if pad_width > 0 {
@@ -400,7 +418,7 @@ pub fn printf_inner<const NS_LOG: bool, F: Fn(&Mem, GuestUSize) -> u8>(
                 assert!(!prepend_sign);
                 assert!(!left_justified);
                 assert!(length_modifier.is_none());
-                let ptr: MutVoidPtr = args.next(env);
+                let ptr: MutVoidPtr = next_printf_arg(env, args_start, &mut args, positional_arg);
                 // '%p' is implementation defined,
                 // but this matches iOS simulator output
                 let tmp = format!("{:#x}", ptr.to_bits());
@@ -416,7 +434,7 @@ pub fn printf_inner<const NS_LOG: bool, F: Fn(&Mem, GuestUSize) -> u8>(
             b'f' => {
                 assert!(!prepend_sign);
                 assert!(!left_justified);
-                let float: f64 = args.next(env);
+                let float: f64 = next_printf_arg(env, args_start, &mut args, positional_arg);
                 let pad_width = pad_width as usize;
                 let precision = precision.unwrap_or(6);
 
@@ -426,7 +444,7 @@ pub fn printf_inner<const NS_LOG: bool, F: Fn(&Mem, GuestUSize) -> u8>(
             b'e' => {
                 assert!(!prepend_sign);
                 assert!(!left_justified);
-                let float: f64 = args.next(env);
+                let float: f64 = next_printf_arg(env, args_start, &mut args, positional_arg);
                 let pad_width = pad_width as usize;
                 let precision = precision.unwrap_or(6);
 
@@ -436,7 +454,7 @@ pub fn printf_inner<const NS_LOG: bool, F: Fn(&Mem, GuestUSize) -> u8>(
             b'g' => {
                 assert!(!prepend_sign);
                 assert!(!left_justified);
-                let float: f64 = args.next(env);
+                let float: f64 = next_printf_arg(env, args_start, &mut args, positional_arg);
                 let pad_width = pad_width as usize;
 
                 // Reference https://en.cppreference.com/w/c/io/vfprintf
@@ -504,6 +522,23 @@ pub fn printf_inner<const NS_LOG: bool, F: Fn(&Mem, GuestUSize) -> u8>(
     log_dbg!("=> {:?}", std::str::from_utf8(&res));
 
     res
+}
+
+fn next_printf_arg<T: GuestArg>(
+    env: &mut Environment,
+    args_start: VaList,
+    args: &mut VaList,
+    positional_arg: Option<usize>,
+) -> T {
+    let Some(position) = positional_arg else {
+        return args.next(env);
+    };
+
+    let mut positioned_args = args_start;
+    for _ in 1..position {
+        let _: u32 = positioned_args.next(env);
+    }
+    positioned_args.next(env)
 }
 
 fn f_format(float: f64, pad_width: usize, pad_char: char, precision: usize) -> String {
