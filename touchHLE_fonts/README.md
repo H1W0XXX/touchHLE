@@ -10,6 +10,6 @@ See `LICENSE.liberation` for the license details.
 
 These are taken from the Noto Sans CJK release that was current as of 2023-01-28: https://github.com/googlefonts/noto-cjk/tree/main/Sans
 
-Specifically these are "Region-specific Subset OTFs" for Japan.
+Specifically these are "Region-specific Subset OTFs" for Japan and Simplified Chinese.
 
 See `LICENSE.noto` for the license details.

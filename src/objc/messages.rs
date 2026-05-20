@@ -1070,35 +1070,44 @@ fn zombie_farm_prepare_game_state_save_date(
     }
 
     let regs = *env.cpu.regs();
-
-    if let Some(existing_save_date) = zombie_farm_game_state_save_date(env, receiver) {
-        env.cpu.regs_mut().copy_from_slice(&regs);
-        log_dbg!(
-            "ZombieFarm status: preserving existing GameState.saveDate {:?} for setSaveDate:nil",
-            existing_save_date
-        );
-        return;
-    }
-
-    let save_date = if let Some((oldest_eat_date, interval)) =
-        zombie_farm_oldest_zombie_eat_date(env)
-    {
-        log!(
-            "ZombieFarm status: replacing GameState setSaveDate:nil with oldest zombie eatDate {:?} ({:.3}s since Apple epoch)",
-            oldest_eat_date,
-            interval
-        );
-        oldest_eat_date
-    } else {
-        let now: id = msg_class![env; NSDate date];
-        log!(
-            "ZombieFarm status: replacing GameState setSaveDate:nil with local NSDate {:?}",
-            now
-        );
-        now
-    };
+    let save_date: id = msg_class![env; NSDate date];
     env.cpu.regs_mut().copy_from_slice(&regs);
     env.cpu.regs_mut()[2] = save_date.to_bits();
+    log!(
+        "ZombieFarm status: replacing GameState setSaveDate:nil with local NSDate {:?}",
+        save_date
+    );
+}
+
+fn zombie_farm_override_game_state_save_date_setter(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if !zombie_farm_uses_playforge_bundle(env)
+        || selector_name != "setSaveDate:"
+        || zombie_farm_object_class_name(env, receiver) != Some("GameState")
+    {
+        return false;
+    }
+
+    let save_date = id::from_bits(env.cpu.regs()[2]);
+    if !zombie_farm_object_pointer_looks_valid(env, save_date) {
+        log!(
+            "ZombieFarm status: ignoring GameState setSaveDate: invalid object {:?}",
+            save_date
+        );
+        env.cpu.regs_mut()[0] = receiver.to_bits();
+        return true;
+    }
+
+    zombie_farm_set_game_state_save_date(env, receiver, save_date);
+    env.cpu.regs_mut()[0] = receiver.to_bits();
+    log!(
+        "ZombieFarm status: host-handled GameState setSaveDate:{:?}",
+        save_date
+    );
+    true
 }
 
 fn zombie_farm_skip_epic_event_with_missing_remote_data(
@@ -3754,6 +3763,9 @@ fn objc_msgSend_inner(
         return;
     }
     zombie_farm_prepare_game_state_save_date(env, receiver, &selector_name);
+    if zombie_farm_override_game_state_save_date_setter(env, receiver, &selector_name) {
+        return;
+    }
     if zombie_farm_skip_epic_event_with_missing_remote_data(env, receiver, &selector_name) {
         return;
     }
