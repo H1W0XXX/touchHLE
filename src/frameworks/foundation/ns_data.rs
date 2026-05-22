@@ -9,6 +9,7 @@ use super::ns_property_list_serialization;
 use super::ns_string::{from_rust_string, to_rust_string};
 use super::{NSRange, NSUInteger};
 use crate::frameworks::foundation::ns_keyed_unarchiver::decode_current_data;
+use crate::frameworks::foundation::ns_object::zombie_farm_preserve_object_on_release;
 use crate::fs::GuestPath;
 use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::{
@@ -129,7 +130,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)initWithContentsOfURL:(id)url { // NSURL *
     if url == nil {
-        release(env, this);
         return nil;
     }
 
@@ -147,13 +147,14 @@ pub const CLASSES: ClassExports = objc_classes! {
             this,
             path,
         );
-        release(env, this);
         return nil;
     }
 
     log!("TODO: ignoring [(NSData*){:?} initWithContentsOfURL:{:?}]", this, path);
     // TODO: actually load data once we have proper network support
-    release(env, this);
+    if env.bundle.bundle_identifier().starts_with("com.playforge.Z") {
+        zombie_farm_preserve_object_on_release(this);
+    }
     nil
 }
 

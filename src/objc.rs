@@ -22,6 +22,7 @@ use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant,
 use crate::objc::messages::ThreadInitializer;
 use crate::MutexId;
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 mod classes;
 mod messages;
@@ -88,6 +89,16 @@ pub struct ObjC {
     /// Type information isn't part of the `objc_msgSend` ABI, so an alternative
     /// channel is needed.
     message_type_info: Option<(std::any::TypeId, &'static str)>,
+
+    /// Debug info for the most recently dispatched Objective-C message.
+    last_message_debug: Option<ObjCMessageDebug>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ObjCMessageDebug {
+    pub receiver: id,
+    pub selector_name: String,
+    pub receiver_class_name: Option<String>,
 }
 
 impl ObjC {
@@ -99,8 +110,23 @@ impl ObjC {
             sync_mutexes: HashMap::new(),
             initializer_threads: HashMap::new(),
             message_type_info: None,
+            last_message_debug: None,
         }
     }
+}
+
+static LAST_MESSAGE_DEBUG_GLOBAL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+fn last_message_debug_global() -> &'static Mutex<Option<String>> {
+    LAST_MESSAGE_DEBUG_GLOBAL.get_or_init(|| Mutex::new(None))
+}
+
+pub(crate) fn set_global_last_message_debug(debug: String) {
+    *last_message_debug_global().lock().unwrap() = Some(debug);
+}
+
+pub(crate) fn global_last_message_debug() -> Option<String> {
+    last_message_debug_global().lock().unwrap().clone()
 }
 
 pub const DYLIB: HostDylib = HostDylib {

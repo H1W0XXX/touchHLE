@@ -152,6 +152,9 @@ impl HostObject for TrivialHostObject {}
 impl super::ObjC {
     /// Read the all-important `isa`.
     pub fn read_isa(object: id, mem: &Mem) -> Class {
+        if object.is_null() || object.to_bits() < mem.null_segment_size() {
+            return nil;
+        }
         mem.read(object).isa
     }
 
@@ -242,8 +245,16 @@ impl super::ObjC {
     /// Get a reference to a host object and downcast it. Panics if there is
     /// no such object, or if downcasting fails.
     pub fn borrow<T: AnyHostObject + 'static>(&self, object: id) -> &T {
+        let Some(entry) = self.objects.get(&object) else {
+            panic!(
+                "No host object entry for {:?} while borrowing type {:?}. Last ObjC message: {}",
+                object,
+                std::any::type_name::<T>(),
+                self.describe_last_message_debug(),
+            );
+        };
         let mut host_object: &(dyn AnyHostObject + 'static) =
-            &*self.objects.get(&object).unwrap().host_object;
+            &*entry.host_object;
         loop {
             if let Some(res) = host_object.as_any().downcast_ref() {
                 return res;
@@ -266,7 +277,15 @@ impl super::ObjC {
         // through a data structure with a mutable borrow. The unsafe code is
         // used to bypass the borrow checker.
         type Aho = dyn AnyHostObject + 'static;
-        let mut host_object: &mut Aho = &mut *self.objects.get_mut(&object).unwrap().host_object;
+        let Some(entry) = self.objects.get_mut(&object) else {
+            panic!(
+                "No host object entry for {:?} while mutably borrowing type {:?}. Last ObjC message: {}",
+                object,
+                std::any::type_name::<T>(),
+                self.describe_last_message_debug(),
+            );
+        };
+        let mut host_object: &mut Aho = &mut *entry.host_object;
         loop {
             if let Some(res) = unsafe { &mut *(host_object as *mut Aho) }
                 .as_any_mut()
@@ -304,6 +323,22 @@ impl super::ObjC {
     /// nil, missing, or static-lifetime objects.
     pub fn try_get_refcount(&self, object: id) -> Option<NonZeroU32> {
         self.objects.get(&object)?.refcount
+    }
+
+    fn describe_last_message_debug(&self) -> String {
+        let Some(last) = &self.last_message_debug else {
+            return "none".to_string();
+        };
+        format!(
+            "receiver={:?}, selector={}, receiver_class={}",
+            last.receiver,
+            last.selector_name,
+            last.receiver_class_name.as_deref().unwrap_or("unknown"),
+        )
+    }
+
+    pub(crate) fn last_message_debug_string(&self) -> String {
+        self.describe_last_message_debug()
     }
 
     /// Increase the refcount of a reference-counted object. Do not call this

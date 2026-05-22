@@ -361,7 +361,12 @@ impl Mem {
     // seems like a good idea to help the compiler optimise for the fast path
     #[cold]
     fn null_check_fail(at: VAddr, size: GuestUSize) {
-        panic!("Attempted null-page access at {at:#x} ({size:#x} bytes)")
+        let objc_context = crate::objc::global_last_message_debug()
+            .unwrap_or_else(|| "none".to_string());
+        panic!(
+            "Attempted null-page access at {at:#x} ({size:#x} bytes). Last ObjC message: {}",
+            objc_context
+        )
     }
 
     /// Special version of [Self::bytes_at] that returns [None] rather than

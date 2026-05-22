@@ -1801,9 +1801,12 @@ pub fn from_u16_vec(env: &mut Environment, from: Vec<u16>) -> id {
 ///
 /// TODO: Try to avoid converting from UTF-16 in more cases.
 pub fn to_rust_string(env: &mut Environment, string: id) -> Cow<'static, str> {
+    if string == nil {
+        return Cow::Borrowed("");
+    }
     // TODO: handle foreign subclasses of NSString
     env.objc
-        .borrow_mut::<StringHostObject>(string)
+        .borrow::<StringHostObject>(string)
         .to_utf8()
         .unwrap()
 }
@@ -1815,6 +1818,9 @@ pub fn for_each_code_unit<F>(env: &mut Environment, string: id, mut f: F)
 where
     F: FnMut(NSUInteger, u16),
 {
+    if string == nil {
+        return;
+    }
     // TODO: handle foreign subclasses of NSString
     let mut idx: NSUInteger = 0;
     env.objc

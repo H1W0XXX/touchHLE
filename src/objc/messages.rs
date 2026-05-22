@@ -17,7 +17,7 @@ use crate::cpu::Cpu;
 use crate::environment::ThreadId;
 use crate::frameworks::core_graphics::{CGPoint, CGSize};
 use crate::frameworks::foundation::{
-    ns_date, ns_property_list_serialization, ns_string, NSUInteger,
+    ns_date, ns_dictionary, ns_property_list_serialization, ns_string, NSUInteger,
 };
 use crate::libc::pthread::cond::{
     pthread_cond_broadcast, pthread_cond_destroy, pthread_cond_init, pthread_cond_t,
@@ -173,24 +173,47 @@ fn trace_zombie_farm_status_message(class_name: &str, selector_name: &str) -> bo
         class_name,
         "ZFGuiLayer" | "ZFActorManager" | "GameState" | "GameData"
     );
-    let interesting_selector = matches!(
+    let daily_selector = matches!(
         selector_name,
         "checkDailyEvent"
-            | "getServerTime"
-            | "handleTimeResponse:"
-            | "handleResponse:forAction:"
-            | "applyZombieHunger"
-            | "statusCheckDone"
-            | "startUpChecksComplete"
-            | "fixZombieHunger"
-            | "makeAllZombiesHungry"
-            | "makeAllZombiesFull"
-            | "saveGame"
-            | "setSaveDate:"
-            | "saveDate"
-            | "getBeginningOfTheDayFromDate:"
+            | "checkDailySalesmanRewards"
+            | "displayAlertDailyBonus"
+            | "dailyRewardWindow"
+            | "showDailyEvents"
+            | "showDailyBonusRewardInterface"
+            | "canShowDailySalesmanOffer"
+            | "showDailySalesmanOffer"
+            | "inputDailyBonusReward:alert:"
+            | "incrementDailyBonusRewardDay"
+            | "applyReward"
+            | "createLabelWithDay:"
+            | "goldAmountForDayCount:"
+            | "brainChanceForDayCount:"
+            | "dailyBonusRewardDisplayDate"
+            | "setDailyBonusRewardDisplayDate:"
+            | "dailyBonusRewardRedeemedDate"
+            | "setDailyBonusRewardRedeemedDate:"
+            | "dailyBonusRewardDayCount"
+            | "setDailyBonusRewardDayCount:"
     );
-    interesting_class && interesting_selector
+    let interesting_selector = daily_selector
+        || matches!(
+            selector_name,
+            "getServerTime"
+                | "handleTimeResponse:"
+                | "handleResponse:forAction:"
+                | "applyZombieHunger"
+                | "statusCheckDone"
+                | "startUpChecksComplete"
+                | "fixZombieHunger"
+                | "makeAllZombiesHungry"
+                | "makeAllZombiesFull"
+                | "saveGame"
+                | "setSaveDate:"
+                | "saveDate"
+                | "getBeginningOfTheDayFromDate:"
+        );
+    daily_selector || interesting_class && interesting_selector
 }
 
 fn trace_zombie_farm_layout_message(class_name: &str, selector_name: &str) -> bool {
@@ -360,9 +383,22 @@ fn zombie_farm_layout_arg_details(selector_name: &str, regs: &[u32]) -> Option<S
 fn zombie_farm_status_arg_details(selector_name: &str, regs: &[u32]) -> Option<String> {
     match selector_name {
         "setHunger:" => Some(format!("arg hunger={:.3}", f32::from_bits(regs[2]))),
-        "setEatDate:" | "setSaveDate:" | "handleTimeResponse:" => {
+        "setEatDate:"
+        | "setSaveDate:"
+        | "handleTimeResponse:"
+        | "setDailyBonusRewardDisplayDate:"
+        | "setDailyBonusRewardRedeemedDate:" => {
             Some(format!("arg object={:?}", id::from_bits(regs[2])))
         }
+        "createLabelWithDay:" | "goldAmountForDayCount:" | "brainChanceForDayCount:" => {
+            Some(format!("arg day={}", regs[2]))
+        }
+        "setDailyBonusRewardDayCount:" => Some(format!("arg count={}", regs[2])),
+        "inputDailyBonusReward:alert:" => Some(format!(
+            "arg reward={:?} alert={:?}",
+            id::from_bits(regs[2]),
+            id::from_bits(regs[3])
+        )),
         "timeIntervalSinceDate:" | "getBeginningOfTheDayFromDate:" => {
             Some(format!("arg date={:?}", id::from_bits(regs[2])))
         }
@@ -432,6 +468,7 @@ fn zombie_farm_set_gui_layer_server_date_to_now(env: &mut Environment, receiver:
 }
 
 static ZOMBIE_FARM_APPLIED_LOCAL_HUNGER: AtomicBool = AtomicBool::new(false);
+static ZOMBIE_FARM_CHECKED_LOCAL_DAILY_EVENT: AtomicBool = AtomicBool::new(false);
 static ZOMBIE_FARM_APPLY_TRACE_DEPTH: AtomicUsize = AtomicUsize::new(0);
 static ZOMBIE_FARM_LAST_MAIN_MENU: AtomicUsize = AtomicUsize::new(0);
 
@@ -481,12 +518,96 @@ fn zombie_farm_send_noarg_if_responds(
 
     let regs = *env.cpu.regs();
     log!(
-        "ZombieFarm2 workaround: sending [{} {}] during skipped startup sync",
+        "ZombieFarm workaround: sending [{} {}]",
         zombie_farm_object_class_name(env, receiver).unwrap_or("unknown"),
         selector_name
     );
     let _: () = msg_send_no_type_checking(env, (receiver, selector));
     env.cpu.regs_mut().copy_from_slice(&regs);
+    true
+}
+
+fn zombie_farm_send_id_arg_if_responds(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+    arg: id,
+) -> bool {
+    if receiver == nil {
+        return false;
+    }
+    let Some(selector) = env.objc.lookup_selector(selector_name) else {
+        return false;
+    };
+    if !env.objc.object_has_method(&env.mem, receiver, selector) {
+        return false;
+    }
+
+    let regs = *env.cpu.regs();
+    log!(
+        "ZombieFarm workaround: sending [{} {}] arg {:?}",
+        zombie_farm_object_class_name(env, receiver).unwrap_or("unknown"),
+        selector_name,
+        arg
+    );
+    let _: () = msg_send_no_type_checking(env, (receiver, selector, arg));
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    true
+}
+
+fn zombie_farm_local_time_response(env: &mut Environment) -> id {
+    let now: id = msg_class![env; NSDate date];
+    let unix_time: f64 = msg![env; now timeIntervalSince1970];
+    let utc_time: id = msg_class![env; NSNumber numberWithDouble:unix_time];
+    let utc_time_key = ns_string::from_rust_string(env, "utcTime".to_string());
+    let action_key = ns_string::from_rust_string(env, "action".to_string());
+    let action = ns_string::from_rust_string(env, "time".to_string());
+    let operation_key = ns_string::from_rust_string(env, "operation".to_string());
+    let operation_class = env
+        .objc
+        .get_known_class("BrainClientOperation", &mut env.mem);
+    let operation_alloc_selector = env.objc.lookup_selector("alloc").unwrap();
+    let allocated_operation: id =
+        msg_send_no_type_checking(env, (operation_class, operation_alloc_selector));
+    let operation = if let Some(init_selector) = env.objc.lookup_selector("init") {
+        if env
+            .objc
+            .object_has_method(&env.mem, allocated_operation, init_selector)
+        {
+            msg_send_no_type_checking(env, (allocated_operation, init_selector))
+        } else {
+            allocated_operation
+        }
+    } else {
+        allocated_operation
+    };
+
+    let mut entries = vec![(utc_time_key, utc_time), (action_key, action)];
+    entries.push((operation_key, operation));
+    ns_dictionary::dict_from_keys_and_objects(env, &entries)
+}
+
+fn zombie_farm_ignore_spurious_operation_done(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if !zombie_farm_uses_playforge_bundle(env) || selector_name != "operationDone" {
+        return false;
+    }
+
+    let Some(class_name) = zombie_farm_object_class_name(env, receiver).map(str::to_string) else {
+        return false;
+    };
+    if !matches!(class_name.as_str(), "NSString" | "_touchHLE_NSString") {
+        return false;
+    }
+
+    env.cpu.regs_mut()[0] = 0;
+    log!(
+        "ZombieFarm workaround: ignoring spurious [{} operationDone]",
+        class_name
+    );
     true
 }
 
@@ -1070,44 +1191,35 @@ fn zombie_farm_prepare_game_state_save_date(
     }
 
     let regs = *env.cpu.regs();
-    let save_date: id = msg_class![env; NSDate date];
+
+    if let Some(existing_save_date) = zombie_farm_game_state_save_date(env, receiver) {
+        env.cpu.regs_mut().copy_from_slice(&regs);
+        log_dbg!(
+            "ZombieFarm status: preserving existing GameState.saveDate {:?} for setSaveDate:nil",
+            existing_save_date
+        );
+        return;
+    }
+
+    let save_date = if let Some((oldest_eat_date, interval)) =
+        zombie_farm_oldest_zombie_eat_date(env)
+    {
+        log!(
+            "ZombieFarm status: replacing GameState setSaveDate:nil with oldest zombie eatDate {:?} ({:.3}s since Apple epoch)",
+            oldest_eat_date,
+            interval
+        );
+        oldest_eat_date
+    } else {
+        let now: id = msg_class![env; NSDate date];
+        log!(
+            "ZombieFarm status: replacing GameState setSaveDate:nil with local NSDate {:?}",
+            now
+        );
+        now
+    };
     env.cpu.regs_mut().copy_from_slice(&regs);
     env.cpu.regs_mut()[2] = save_date.to_bits();
-    log!(
-        "ZombieFarm status: replacing GameState setSaveDate:nil with local NSDate {:?}",
-        save_date
-    );
-}
-
-fn zombie_farm_override_game_state_save_date_setter(
-    env: &mut Environment,
-    receiver: id,
-    selector_name: &str,
-) -> bool {
-    if !zombie_farm_uses_playforge_bundle(env)
-        || selector_name != "setSaveDate:"
-        || zombie_farm_object_class_name(env, receiver) != Some("GameState")
-    {
-        return false;
-    }
-
-    let save_date = id::from_bits(env.cpu.regs()[2]);
-    if !zombie_farm_object_pointer_looks_valid(env, save_date) {
-        log!(
-            "ZombieFarm status: ignoring GameState setSaveDate: invalid object {:?}",
-            save_date
-        );
-        env.cpu.regs_mut()[0] = receiver.to_bits();
-        return true;
-    }
-
-    zombie_farm_set_game_state_save_date(env, receiver, save_date);
-    env.cpu.regs_mut()[0] = receiver.to_bits();
-    log!(
-        "ZombieFarm status: host-handled GameState setSaveDate:{:?}",
-        save_date
-    );
-    true
 }
 
 fn zombie_farm_skip_epic_event_with_missing_remote_data(
@@ -3229,6 +3341,40 @@ fn zombie_farm_apply_local_hunger_update(env: &mut Environment, receiver: id, se
     env.cpu.regs_mut().copy_from_slice(&regs);
 }
 
+fn zombie_farm_check_local_daily_event(env: &mut Environment, receiver: id, selector_name: &str) {
+    if !zombie_farm_uses_playforge_bundle(env)
+        || !matches!(selector_name, "statusCheckDone" | "startUpChecksComplete")
+        || ZOMBIE_FARM_CHECKED_LOCAL_DAILY_EVENT.load(Ordering::Relaxed)
+    {
+        return;
+    }
+
+    let regs = *env.cpu.regs();
+    let gui_layer = if zombie_farm_object_class_name(env, receiver) == Some("ZFGuiLayer") {
+        Some(receiver)
+    } else {
+        zombie_farm_get_gui_layer(env)
+    };
+
+    let Some(gui_layer) = gui_layer else {
+        env.cpu.regs_mut().copy_from_slice(&regs);
+        return;
+    };
+
+    zombie_farm_set_gui_layer_server_date_to_now(env, gui_layer);
+    let time_response = zombie_farm_local_time_response(env);
+    ZOMBIE_FARM_CHECKED_LOCAL_DAILY_EVENT.store(true, Ordering::Relaxed);
+    if zombie_farm_send_id_arg_if_responds(env, gui_layer, "handleTimeResponse:", time_response) {
+        log!(
+            "ZombieFarm status: completed local daily event time response after {}",
+            selector_name
+        );
+    } else {
+        ZOMBIE_FARM_CHECKED_LOCAL_DAILY_EVENT.store(false, Ordering::Relaxed);
+    }
+    env.cpu.regs_mut().copy_from_slice(&regs);
+}
+
 fn zombie_farm_prepare_local_hunger_update(env: &mut Environment, selector_name: &str) {
     if !matches!(
         selector_name,
@@ -3470,13 +3616,30 @@ fn trace_zombie_farm_status_normal_return(env: &mut Environment, receiver: id, s
                 value
             );
         }
-        "saveDate" | "addTimeInterval:" | "getBeginningOfTheDayFromDate:" => {
+        "saveDate"
+        | "addTimeInterval:"
+        | "getBeginningOfTheDayFromDate:"
+        | "dailyRewardWindow"
+        | "dailyBonusRewardDisplayDate"
+        | "dailyBonusRewardRedeemedDate" => {
             log!(
                 "ZombieFarm status: [{} {}] receiver {:?} return object {:?}",
                 class_name,
                 selector_name,
                 receiver,
                 id::from_bits(env.cpu.regs()[0])
+            );
+        }
+        "dailyBonusRewardDayCount"
+        | "goldAmountForDayCount:"
+        | "brainChanceForDayCount:"
+        | "canShowDailySalesmanOffer" => {
+            log!(
+                "ZombieFarm status: [{} {}] receiver {:?} return value={}",
+                class_name,
+                selector_name,
+                receiver,
+                env.cpu.regs()[0]
             );
         }
         _ => {}
@@ -3685,6 +3848,22 @@ fn objc_msgSend_inner(
         selector.as_str(&env.mem),
         receiver
     );
+    let receiver_class_name = if receiver != nil {
+        let class = super2.unwrap_or_else(|| ObjC::read_isa(receiver, &env.mem));
+        if class == nil {
+            None
+        } else {
+            env.objc.try_get_class_name(class).map(str::to_string)
+        }
+    } else {
+        None
+    };
+    env.objc.last_message_debug = Some(crate::objc::ObjCMessageDebug {
+        receiver,
+        selector_name: selector.as_str(&env.mem).to_string(),
+        receiver_class_name,
+    });
+    crate::objc::set_global_last_message_debug(env.objc.last_message_debug_string());
     let message_type_info = env.objc.message_type_info.take();
 
     if receiver == nil {
@@ -3733,6 +3912,9 @@ fn objc_msgSend_inner(
     trace_zombie_farm_sprite_message(env, receiver, &selector_name);
     zombie_farm_trace_game_interaction_message(env, receiver, &selector_name);
     zombie_farm_force_status_bar_timeout(env, receiver, &selector_name);
+    if zombie_farm_ignore_spurious_operation_done(env, receiver, &selector_name) {
+        return;
+    }
     if zombie_farm_forward_backing_array_fast_enumeration(env, receiver, selector, &selector_name) {
         return;
     }
@@ -3763,9 +3945,6 @@ fn objc_msgSend_inner(
         return;
     }
     zombie_farm_prepare_game_state_save_date(env, receiver, &selector_name);
-    if zombie_farm_override_game_state_save_date_setter(env, receiver, &selector_name) {
-        return;
-    }
     if zombie_farm_skip_epic_event_with_missing_remote_data(env, receiver, &selector_name) {
         return;
     }
@@ -4130,6 +4309,7 @@ Type mismatch when sending message {} to {:?}!
                 }
                 zombie_farm_trace_game_interaction_return(env, receiver, &selector_name_for_after);
                 zombie_farm_apply_local_hunger_update(env, receiver, &selector_name_for_after);
+                zombie_farm_check_local_daily_event(env, receiver, &selector_name_for_after);
                 return;
             } else {
                 class = superclass;

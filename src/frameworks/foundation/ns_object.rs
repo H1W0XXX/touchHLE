@@ -24,6 +24,8 @@ use crate::objc::{
     autorelease, id, msg, msg_class, msg_send, msg_send_no_type_checking, nil, objc_classes,
     retain, Class, ClassExports, NSZonePtr, ObjC, TrivialHostObject, IMP, SEL,
 };
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 
 fn method_imp_for_class(env: &mut crate::Environment, class: Class, selector: SEL) -> ConstVoidPtr {
     match env.objc.class_get_method_imp(class, selector) {
@@ -61,6 +63,52 @@ fn zombie_farm_pressed_target_to_preserve(env: &crate::Environment, object: id) 
         return None;
     }
 
+    if env.objc.try_get_refcount(object)?.get() == 1 {
+        Some(class_name)
+    } else {
+        None
+    }
+}
+
+static ZOMBIE_FARM_RELEASE_PRESERVE_OBJECTS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+
+fn zombie_farm_release_preserve_objects() -> &'static Mutex<HashSet<u32>> {
+    ZOMBIE_FARM_RELEASE_PRESERVE_OBJECTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+pub(crate) fn zombie_farm_preserve_object_on_release(object: id) {
+    zombie_farm_release_preserve_objects()
+        .lock()
+        .unwrap()
+        .insert(object.to_bits());
+}
+
+fn zombie_farm_failed_remote_object_to_preserve(
+    env: &crate::Environment,
+    object: id,
+) -> Option<String> {
+    if !env
+        .bundle
+        .bundle_identifier()
+        .starts_with("com.playforge.Z")
+    {
+        return None;
+    }
+
+    if !zombie_farm_release_preserve_objects()
+        .lock()
+        .unwrap()
+        .contains(&object.to_bits())
+    {
+        return None;
+    }
+
+    let class = ObjC::read_isa(object, &env.mem);
+    if class == nil {
+        return None;
+    }
+
+    let class_name = env.objc.try_get_class_name(class)?.to_string();
     if env.objc.try_get_refcount(object)?.get() == 1 {
         Some(class_name)
     } else {
@@ -200,6 +248,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (())release {
     log_dbg!("[{:?} release]", this);
+    if let Some(class_name) = zombie_farm_failed_remote_object_to_preserve(env, this) {
+        log_dbg!(
+            "ZombieFarm workaround: preserving {:?} ({}) after failed remote load because the game can keep using it",
+            this,
+            class_name
+        );
+        return;
+    }
     if let Some(class_name) = zombie_farm_pressed_target_to_preserve(env, this) {
         log_dbg!(
             "ZombieFarm workaround: preserving {:?} ({}) because the game can send pressed: after release",
