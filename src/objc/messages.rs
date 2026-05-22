@@ -19,6 +19,7 @@ use crate::frameworks::core_graphics::{CGPoint, CGSize};
 use crate::frameworks::foundation::{
     ns_date, ns_dictionary, ns_property_list_serialization, ns_string, NSUInteger,
 };
+use crate::fs::GuestPath;
 use crate::libc::pthread::cond::{
     pthread_cond_broadcast, pthread_cond_destroy, pthread_cond_init, pthread_cond_t,
     pthread_cond_wait,
@@ -30,8 +31,10 @@ use crate::libc::pthread::mutex::{
 use crate::mem::{guest_size_of, ConstPtr, MutPtr, MutVoidPtr, SafeRead};
 use crate::objc::classes::InitializationStatus;
 use crate::Environment;
+use plist::Value;
 use std::any::TypeId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::Cursor;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Mutex, OnceLock,
@@ -169,10 +172,21 @@ fn maybe_initialize_class(env: &mut Environment, receiver: id) {
 }
 
 fn trace_zombie_farm_status_message(class_name: &str, selector_name: &str) -> bool {
+    let lower_class = class_name.to_ascii_lowercase();
     let interesting_class = matches!(
         class_name,
-        "ZFGuiLayer" | "ZFActorManager" | "GameState" | "GameData"
+        "ZFGuiLayer"
+            | "ZFActorManager"
+            | "GameState"
+            | "GameData"
+            | "PlayerProfile"
+            | "PlayerProfileManager"
+            | "ActiveProfileStatus"
+            | "ZFQuestNotification"
     );
+    let statusish_class = lower_class.contains("status")
+        || lower_class.contains("profile")
+        || lower_class.contains("notification");
     let daily_selector = matches!(
         selector_name,
         "checkDailyEvent"
@@ -212,8 +226,61 @@ fn trace_zombie_farm_status_message(class_name: &str, selector_name: &str) -> bo
                 | "setSaveDate:"
                 | "saveDate"
                 | "getBeginningOfTheDayFromDate:"
+                | "getActivePlayer"
+                | "latestStatus"
+                | "status"
+                | "notification"
+                | "notifications"
+                | "clear"
+                | "clearStatus"
+                | "clearForPlayer:"
+                | "loadGame"
+                | "setGameData:"
+                | "setZfGameData:"
+                | "zfGameData"
         );
-    daily_selector || interesting_class && interesting_selector
+    let statusish_selector = selector_name.eq_ignore_ascii_case("init")
+        || selector_name.eq_ignore_ascii_case("dealloc")
+        || selector_name.contains("Status")
+        || selector_name.contains("status")
+        || selector_name.contains("Profile")
+        || selector_name.contains("profile")
+        || selector_name.contains("Notification")
+        || selector_name.contains("notification");
+    daily_selector
+        || (interesting_class && interesting_selector)
+        || (statusish_class && statusish_selector)
+}
+
+fn trace_zombie_farm_quest_message(class_name: &str, selector_name: &str) -> bool {
+    let lower_class = class_name.to_ascii_lowercase();
+
+    let interesting_class = lower_class.contains("quest")
+        || lower_class.contains("mission")
+        || lower_class.contains("task")
+        || lower_class.contains("objective")
+        || lower_class.contains("journal");
+    let interesting_selector = matches!(
+        selector_name,
+        "reset"
+            | "enable:"
+            | "saveGame"
+            | "loadGame"
+            | "init"
+            | "dealloc"
+            | "questMan"
+            | "questArray"
+            | "questQueue"
+            | "questPressed:"
+            | "openMenuWithQuest:"
+            | "displayQuestTable"
+            | "setQuest:"
+            | "setQuestID:"
+            | "quest"
+            | "questID"
+    );
+
+    interesting_class && interesting_selector
 }
 
 fn trace_zombie_farm_layout_message(class_name: &str, selector_name: &str) -> bool {
@@ -281,6 +348,16 @@ fn trace_zombie_farm_layout_to_console(selector_name: &str) -> bool {
 fn zombie_farm_sprite_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("TOUCHHLE_ZF_SPRITE_TRACE").ok().as_deref() == Some("1"))
+}
+
+fn zombie_farm_quest_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("TOUCHHLE_ZF_QUEST_TRACE").ok().as_deref() == Some("1"))
+}
+
+fn zombie_farm_status_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("TOUCHHLE_ZF_STATUS_TRACE").ok().as_deref() == Some("1"))
 }
 
 fn zombie_farm_touch_trace_enabled() -> bool {
@@ -416,7 +493,237 @@ fn zombie_farm_status_arg_details(selector_name: &str, regs: &[u32]) -> Option<S
             id::from_bits(regs[2]),
             id::from_bits(regs[3])
         )),
+        "setStatus:" | "setLatestStatus:" | "setActivePlayer:" | "setCurrentPlayer:"
+        | "setPlayerProfile:" | "setNotification:" | "setNotifications:" | "setGameData:"
+        | "setZfGameData:" => Some(format!("arg object={:?}", id::from_bits(regs[2]))),
         _ => None,
+    }
+}
+
+fn zombie_farm_quest_arg_details(selector_name: &str, regs: &[u32]) -> Option<String> {
+    match selector_name {
+        "enable:" | "setEnabled:" => Some(format!("arg enabled={}", regs[2] != 0)),
+        "setProgress:" | "setValue:" | "setCount:" | "setCurrentCount:" => {
+            Some(format!("arg value={}", regs[2]))
+        }
+        "handleResponse:forAction:" => Some(format!(
+            "arg response={:?} action={:?}",
+            id::from_bits(regs[2]),
+            id::from_bits(regs[3])
+        )),
+        _ => {
+            let arg0 = regs[2];
+            let arg1 = regs[3];
+            if arg0 == 0 && arg1 == 0 {
+                None
+            } else {
+                Some(format!("arg r2=0x{arg0:x} r3=0x{arg1:x}"))
+            }
+        }
+    }
+}
+
+fn zombie_farm_log_quest_getter(env: &mut Environment, quest: id, selector_name: &str) {
+    let Some(selector) = env.objc.lookup_selector(selector_name) else {
+        return;
+    };
+    if !env.objc.object_has_method(&env.mem, quest, selector) {
+        return;
+    }
+
+    let regs = *env.cpu.regs();
+    let value: u32 = msg_send_no_type_checking(env, (quest, selector));
+    env.cpu.regs_mut().copy_from_slice(&regs);
+
+    let value_id = id::from_bits(value);
+    let value_class = ObjC::read_isa(value_id, &env.mem);
+    let string_class = env.objc.get_known_class("NSString", &mut env.mem);
+    if value_class != nil && env.objc.class_is_subclass_of(value_class, string_class) {
+        log!(
+            "ZombieFarm quest state: [{:?} {}] -> {:?} {:?}",
+            quest,
+            selector_name,
+            value_id,
+            ns_string::to_rust_string(env, value_id),
+        );
+    } else {
+        let value_class_name = if value_class == nil {
+            None
+        } else {
+            env.objc.try_get_class_name(value_class)
+        };
+        log!(
+            "ZombieFarm quest state: [{:?} {}] -> r0=0x{:x} ({:?}) class {:?}",
+            quest,
+            selector_name,
+            value,
+            value_id,
+            value_class_name,
+        );
+    }
+}
+
+fn zombie_farm_log_quest_object_state(env: &mut Environment, quest: id, context: &str) {
+    if !zombie_farm_quest_trace_enabled() || !zombie_farm_object_pointer_looks_valid(env, quest) {
+        return;
+    }
+    let Some(class_name) = zombie_farm_object_class_name(env, quest) else {
+        return;
+    };
+
+    log!(
+        "ZombieFarm quest state: {} object {:?} class {}",
+        context,
+        quest,
+        class_name
+    );
+    if class_name == "ZFQuestRequirement" {
+        zombie_farm_log_quest_getter(env, quest, "description");
+        return;
+    }
+    for selector_name in [
+        "questID",
+        "quest",
+        "questArray",
+        "questQueue",
+        "notification",
+        "requirements",
+        "requirement",
+        "count",
+        "value",
+        "currentCount",
+        "requiredCount",
+        "goalCount",
+        "progress",
+        "completed",
+        "isCompleted",
+        "status",
+        "title",
+        "description",
+    ] {
+        zombie_farm_log_quest_getter(env, quest, selector_name);
+    }
+}
+
+fn zombie_farm_log_array_elements_as_quest_objects(
+    env: &mut Environment,
+    array: id,
+    context: &str,
+    limit: NSUInteger,
+) {
+    if !zombie_farm_quest_trace_enabled() || !zombie_farm_object_pointer_looks_valid(env, array) {
+        return;
+    }
+    let Some(count_selector) = env.objc.lookup_selector("count") else {
+        return;
+    };
+    let Some(object_at_index_selector) = env.objc.lookup_selector("objectAtIndex:") else {
+        return;
+    };
+    if !env.objc.object_has_method(&env.mem, array, count_selector)
+        || !env
+            .objc
+            .object_has_method(&env.mem, array, object_at_index_selector)
+    {
+        return;
+    }
+
+    let regs = *env.cpu.regs();
+    let count: NSUInteger = msg_send_no_type_checking(env, (array, count_selector));
+    env.cpu.regs_mut().copy_from_slice(&regs);
+
+    for idx in 0..count.min(limit) {
+        let regs = *env.cpu.regs();
+        let object: id = msg_send_no_type_checking(env, (array, object_at_index_selector, idx));
+        env.cpu.regs_mut().copy_from_slice(&regs);
+        zombie_farm_log_quest_object_state(env, object, &format!("{}[{}]", context, idx));
+    }
+}
+
+fn zombie_farm_log_status_getter(env: &mut Environment, object: id, selector_name: &str) {
+    let Some(selector) = env.objc.lookup_selector(selector_name) else {
+        return;
+    };
+    if !env.objc.object_has_method(&env.mem, object, selector) {
+        return;
+    }
+
+    let regs = *env.cpu.regs();
+    let value: u32 = msg_send_no_type_checking(env, (object, selector));
+    env.cpu.regs_mut().copy_from_slice(&regs);
+
+    let value_id = id::from_bits(value);
+    let value_class = ObjC::read_isa(value_id, &env.mem);
+    let string_class = env.objc.get_known_class("NSString", &mut env.mem);
+    if value_class != nil && env.objc.class_is_subclass_of(value_class, string_class) {
+        log!(
+            "ZombieFarm status state: [{:?} {}] -> {:?} {:?}",
+            object,
+            selector_name,
+            value_id,
+            ns_string::to_rust_string(env, value_id),
+        );
+    } else {
+        let value_class_name = if value_class == nil {
+            None
+        } else {
+            env.objc.try_get_class_name(value_class)
+        };
+        log!(
+            "ZombieFarm status state: [{:?} {}] -> r0=0x{:x} ({:?}) class {:?}",
+            object,
+            selector_name,
+            value,
+            value_id,
+            value_class_name,
+        );
+    }
+}
+
+fn zombie_farm_log_status_object_state(env: &mut Environment, object: id, context: &str) {
+    if !zombie_farm_status_trace_enabled() || !zombie_farm_object_pointer_looks_valid(env, object) {
+        return;
+    }
+    let Some(class_name) = zombie_farm_object_class_name(env, object) else {
+        return;
+    };
+
+    log!(
+        "ZombieFarm status state: {} object {:?} class {}",
+        context,
+        object,
+        class_name
+    );
+    if class_name == "ZFQuestRequirement" {
+        zombie_farm_log_status_getter(env, object, "description");
+        return;
+    }
+    for selector_name in [
+        "latestStatus",
+        "status",
+        "notification",
+        "notifications",
+        "requirements",
+        "requirement",
+        "count",
+        "value",
+        "currentCount",
+        "requiredCount",
+        "goalCount",
+        "progress",
+        "completed",
+        "isCompleted",
+        "title",
+        "description",
+        "profileID",
+        "getActivePlayer",
+        "activePlayer",
+        "currentPlayer",
+        "gameData",
+        "zfGameData",
+        "saveDate",
+    ] {
+        zombie_farm_log_status_getter(env, object, selector_name);
     }
 }
 
@@ -527,6 +834,27 @@ fn zombie_farm_send_noarg_if_responds(
     true
 }
 
+fn zombie_farm_get_id_if_responds(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> Option<id> {
+    if receiver == nil {
+        return None;
+    }
+    let Some(selector) = env.objc.lookup_selector(selector_name) else {
+        return None;
+    };
+    if !env.objc.object_has_method(&env.mem, receiver, selector) {
+        return None;
+    }
+
+    let regs = *env.cpu.regs();
+    let value: id = msg_send_no_type_checking(env, (receiver, selector));
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    (value != nil).then_some(value)
+}
+
 fn zombie_farm_send_id_arg_if_responds(
     env: &mut Environment,
     receiver: id,
@@ -553,6 +881,241 @@ fn zombie_farm_send_id_arg_if_responds(
     let _: () = msg_send_no_type_checking(env, (receiver, selector, arg));
     env.cpu.regs_mut().copy_from_slice(&regs);
     true
+}
+
+fn zombie_farm_get_id_arg_result_if_responds(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+    arg: id,
+) -> Option<id> {
+    if receiver == nil {
+        return None;
+    }
+    let Some(selector) = env.objc.lookup_selector(selector_name) else {
+        return None;
+    };
+    if !env.objc.object_has_method(&env.mem, receiver, selector) {
+        return None;
+    }
+
+    let regs = *env.cpu.regs();
+    let value: id = msg_send_no_type_checking(env, (receiver, selector, arg));
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    (value != nil).then_some(value)
+}
+
+fn zombie_farm_get_i32_arg_result_if_responds(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+    arg: id,
+) -> Option<i32> {
+    if receiver == nil {
+        return None;
+    }
+    let Some(selector) = env.objc.lookup_selector(selector_name) else {
+        return None;
+    };
+    if !env.objc.object_has_method(&env.mem, receiver, selector) {
+        return None;
+    }
+
+    let regs = *env.cpu.regs();
+    let value: i32 = msg_send_no_type_checking(env, (receiver, selector, arg));
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    Some(value)
+}
+
+fn zombie_farm_get_array_count(env: &mut Environment, array: id) -> Option<NSUInteger> {
+    let Some(selector) = env.objc.lookup_selector("count") else {
+        return None;
+    };
+    if array == nil || !env.objc.object_has_method(&env.mem, array, selector) {
+        return None;
+    }
+
+    let regs = *env.cpu.regs();
+    let count: NSUInteger = msg_send_no_type_checking(env, (array, selector));
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    Some(count)
+}
+
+fn zombie_farm_get_array_object_at_index(
+    env: &mut Environment,
+    array: id,
+    idx: NSUInteger,
+) -> Option<id> {
+    let Some(selector) = env.objc.lookup_selector("objectAtIndex:") else {
+        return None;
+    };
+    if array == nil || !env.objc.object_has_method(&env.mem, array, selector) {
+        return None;
+    }
+
+    let regs = *env.cpu.regs();
+    let value: id = msg_send_no_type_checking(env, (array, selector, idx));
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    (value != nil).then_some(value)
+}
+
+fn zombie_farm_get_value_for_key(env: &mut Environment, receiver: id, key: &str) -> Option<id> {
+    let key = ns_string::from_rust_string(env, key.to_string());
+    zombie_farm_get_id_arg_result_if_responds(env, receiver, "valueForKey:", key)
+}
+
+fn zombie_farm_get_property_object(
+    env: &mut Environment,
+    receiver: id,
+    property_name: &str,
+) -> Option<id> {
+    zombie_farm_get_id_if_responds(env, receiver, property_name)
+        .or_else(|| zombie_farm_get_value_for_key(env, receiver, property_name))
+}
+
+fn zombie_farm_get_string_property(
+    env: &mut Environment,
+    receiver: id,
+    property_name: &str,
+) -> Option<String> {
+    let value = zombie_farm_get_property_object(env, receiver, property_name)?;
+    Some(ns_string::to_rust_string(env, value).to_string())
+}
+
+fn zombie_farm_get_i32_property(
+    env: &mut Environment,
+    receiver: id,
+    property_name: &str,
+) -> Option<i32> {
+    if let Some(value) = zombie_farm_get_value_for_key(env, receiver, property_name) {
+        if let Some(int_value_selector) = env.objc.lookup_selector("intValue") {
+            if env
+                .objc
+                .object_has_method(&env.mem, value, int_value_selector)
+            {
+                let regs = *env.cpu.regs();
+                let int_value: i32 = msg_send_no_type_checking(env, (value, int_value_selector));
+                env.cpu.regs_mut().copy_from_slice(&regs);
+                return Some(int_value);
+            }
+        }
+    }
+    None
+}
+
+fn zombie_farm_get_bool_property(
+    env: &mut Environment,
+    receiver: id,
+    property_name: &str,
+) -> Option<bool> {
+    if receiver == nil {
+        return None;
+    }
+    let selector = env.objc.lookup_selector(property_name)?;
+    if !env.objc.object_has_method(&env.mem, receiver, selector) {
+        return None;
+    }
+    let regs = *env.cpu.regs();
+    let bool_value: bool = msg_send_no_type_checking(env, (receiver, selector));
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    Some(bool_value)
+}
+
+pub fn zombie_farm_complete_all_quests_cheat(env: &mut Environment) {
+    if !zombie_farm_uses_playforge_bundle(env) {
+        return;
+    }
+
+    static ALREADY_RAN: AtomicBool = AtomicBool::new(false);
+    if ALREADY_RAN.swap(true, Ordering::Relaxed) {
+        log!("ZombieFarm cheat: F9 complete-all-quests already executed for this run.");
+        return;
+    }
+
+    let Some(quest_man) = zombie_farm_get_quest_man(env) else {
+        log!("ZombieFarm cheat: F9 ignored because ZFQuestMan is unavailable.");
+        return;
+    };
+    let Some(quest_queue) = zombie_farm_get_id_if_responds(env, quest_man, "questQueue") else {
+        log!("ZombieFarm cheat: F9 ignored because questQueue is unavailable.");
+        return;
+    };
+    let Some(mut quest_count) = zombie_farm_get_array_count(env, quest_queue) else {
+        log!("ZombieFarm cheat: F9 ignored because questQueue count is unavailable.");
+        return;
+    };
+
+    let Some(complete_selector) = env.objc.lookup_selector("completeQuest:") else {
+        log!("ZombieFarm cheat: F9 ignored because completeQuest: selector is unavailable.");
+        return;
+    };
+    if !env
+        .objc
+        .object_has_method(&env.mem, quest_man, complete_selector)
+    {
+        log!("ZombieFarm cheat: F9 ignored because ZFQuestMan does not respond to completeQuest:.");
+        return;
+    }
+
+    let mut completed = 0usize;
+    let mut skipped = 0usize;
+    let mut seen_queue_heads = HashSet::new();
+
+    let mut guard = 0usize;
+    while quest_count > 0 && guard < 512 {
+        guard += 1;
+        let Some(quest_object) = zombie_farm_get_array_object_at_index(env, quest_queue, 0) else {
+            skipped += 1;
+            break;
+        };
+        if !seen_queue_heads.insert(quest_object.to_bits()) {
+            log!(
+                "ZombieFarm cheat: stopping because questQueue head 0x{:x} repeated without advancing.",
+                quest_object.to_bits()
+            );
+            skipped += 1;
+            break;
+        }
+
+        let already_completed = zombie_farm_get_bool_property(env, quest_object, "completed")
+            .or_else(|| zombie_farm_get_bool_property(env, quest_object, "isCompleted"))
+            .unwrap_or(false);
+        if already_completed {
+            skipped += 1;
+            break;
+        }
+
+        let title = zombie_farm_get_string_property(env, quest_object, "title")
+            .or_else(|| {
+                zombie_farm_get_property_object(env, quest_object, "quest")
+                    .and_then(|quest| zombie_farm_get_string_property(env, quest, "title"))
+            })
+            .unwrap_or_else(|| "queued quest".to_string());
+
+        let regs = *env.cpu.regs();
+        let _: () = msg_send_no_type_checking(env, (quest_man, complete_selector, quest_object));
+        env.cpu.regs_mut().copy_from_slice(&regs);
+        completed += 1;
+        log!(
+            "ZombieFarm cheat: completed quest {} via [ZFQuestMan completeQuest:]",
+            title
+        );
+
+        let _ = zombie_farm_send_noarg_if_responds(env, quest_man, "reorderQuests");
+        quest_count = zombie_farm_get_array_count(env, quest_queue).unwrap_or(0);
+    }
+
+    let _ = zombie_farm_send_noarg_if_responds(env, quest_man, "reorderQuests");
+    let _ = zombie_farm_send_noarg_if_responds(env, quest_man, "updateStats");
+    if let Some(gui_layer) = zombie_farm_get_gui_layer(env) {
+        let _ = zombie_farm_send_noarg_if_responds(env, gui_layer, "updateStats");
+    }
+
+    log!(
+        "ZombieFarm cheat: F9 complete-all-quests finished, completed {}, skipped {}",
+        completed,
+        skipped
+    );
 }
 
 fn zombie_farm_local_time_response(env: &mut Environment) -> id {
@@ -824,6 +1387,132 @@ fn zombie_farm_get_gui_layer(env: &mut Environment) -> Option<id> {
     (gui_layer != nil).then_some(gui_layer)
 }
 
+fn zombie_farm_get_quest_man(env: &mut Environment) -> Option<id> {
+    let quest_man_class = env.objc.get_known_class("ZFQuestMan", &mut env.mem);
+    let quest_man_selector = env.objc.lookup_selector("questMan")?;
+    if !env
+        .objc
+        .object_has_method(&env.mem, quest_man_class, quest_man_selector)
+    {
+        return None;
+    }
+    let quest_man: id = msg_send_no_type_checking(env, (quest_man_class, quest_man_selector));
+    (quest_man != nil).then_some(quest_man)
+}
+
+fn zombie_farm_get_active_player(env: &mut Environment) -> Option<id> {
+    let manager_class = env
+        .objc
+        .get_known_class("PlayerProfileManager", &mut env.mem);
+    let manager_selector = env.objc.lookup_selector("playerProfileManager")?;
+    if !env
+        .objc
+        .object_has_method(&env.mem, manager_class, manager_selector)
+    {
+        return None;
+    }
+    let manager: id = msg_send_no_type_checking(env, (manager_class, manager_selector));
+    if manager == nil {
+        return None;
+    }
+
+    for selector_name in ["getActivePlayer", "activePlayer", "currentPlayer"] {
+        if let Some(player) = zombie_farm_get_id_if_responds(env, manager, selector_name) {
+            return Some(player);
+        }
+    }
+    None
+}
+
+fn zombie_farm_log_local_quest_restore_snapshot(
+    env: &mut Environment,
+    context: &str,
+    gui_layer: Option<id>,
+    quest_man: Option<id>,
+) {
+    log!(
+        "ZombieFarm workaround: quest restore snapshot ({})",
+        context
+    );
+
+    if let Some(gui_layer) = gui_layer {
+        zombie_farm_log_status_object_state(env, gui_layer, "quest restore guiLayer");
+    }
+
+    if let Some(quest_man) = quest_man {
+        zombie_farm_log_quest_object_state(env, quest_man, "quest restore questMan");
+        if let Some(quest_queue) = zombie_farm_get_id_if_responds(env, quest_man, "questQueue") {
+            zombie_farm_log_quest_object_state(env, quest_queue, "quest restore questQueue");
+            if zombie_farm_quest_trace_enabled() {
+                let count_selector = env.objc.lookup_selector("count");
+                let object_at_index_selector = env.objc.lookup_selector("objectAtIndex:");
+                if let (Some(count_selector), Some(object_at_index_selector)) =
+                    (count_selector, object_at_index_selector)
+                {
+                    if env
+                        .objc
+                        .object_has_method(&env.mem, quest_queue, count_selector)
+                        && env.objc.object_has_method(
+                            &env.mem,
+                            quest_queue,
+                            object_at_index_selector,
+                        )
+                    {
+                        let regs = *env.cpu.regs();
+                        let count: NSUInteger =
+                            msg_send_no_type_checking(env, (quest_queue, count_selector));
+                        env.cpu.regs_mut().copy_from_slice(&regs);
+                        for idx in 0..count.min(16) {
+                            let regs = *env.cpu.regs();
+                            let quest_notification: id = msg_send_no_type_checking(
+                                env,
+                                (quest_queue, object_at_index_selector, idx),
+                            );
+                            env.cpu.regs_mut().copy_from_slice(&regs);
+                            if let Some(requirements) = zombie_farm_get_id_if_responds(
+                                env,
+                                quest_notification,
+                                "requirements",
+                            ) {
+                                zombie_farm_log_array_elements_as_quest_objects(
+                                    env,
+                                    requirements,
+                                    &format!("quest restore questQueue[{}].requirements", idx),
+                                    8,
+                                );
+                            }
+                            zombie_farm_log_quest_object_state(
+                                env,
+                                quest_notification,
+                                &format!("quest restore questQueue[{}]", idx),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(quest_array) = zombie_farm_get_id_if_responds(env, quest_man, "questArray") {
+            zombie_farm_log_quest_object_state(env, quest_array, "quest restore questArray");
+        }
+    }
+
+    if let Some(active_player) = zombie_farm_get_active_player(env) {
+        zombie_farm_log_status_object_state(env, active_player, "quest restore activePlayer");
+        if let Some(latest_status) =
+            zombie_farm_get_id_if_responds(env, active_player, "latestStatus")
+        {
+            zombie_farm_log_status_object_state(
+                env,
+                latest_status,
+                "quest restore activePlayer.latestStatus",
+            );
+        }
+        if let Some(status) = zombie_farm_get_id_if_responds(env, active_player, "status") {
+            zombie_farm_log_status_object_state(env, status, "quest restore activePlayer.status");
+        }
+    }
+}
+
 fn zombie_farm_get_game_state(env: &mut Environment) -> Option<id> {
     let game_state_class = env.objc.get_known_class("GameState", &mut env.mem);
     let game_state_selector = env.objc.lookup_selector("gameState")?;
@@ -962,6 +1651,221 @@ fn zombie_farm_get_game_data(env: &mut Environment) -> Option<id> {
     }
     let game_data: id = msg_send_no_type_checking(env, (game_state, zf_game_data_selector));
     (game_data != nil).then_some(game_data)
+}
+
+fn zombie_farm_post_notification_name_object(
+    env: &mut Environment,
+    name: &str,
+    object: id,
+) -> bool {
+    let center: id = msg_class![env; NSNotificationCenter defaultCenter];
+    if center == nil {
+        return false;
+    }
+    let notification_name = ns_string::from_rust_string(env, name.to_string());
+    let regs = *env.cpu.regs();
+    let _: () = msg![env; center postNotificationName:notification_name object:object];
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    true
+}
+
+fn zombie_farm_parse_assignment_line(line: &str, key: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let prefix = format!("{key} = ");
+    let value = trimmed.strip_prefix(&prefix)?.strip_suffix(';')?;
+    Some(value.trim().to_string())
+}
+
+fn zombie_farm_collect_loot_item_requirement_names_from_description(
+    description: &str,
+) -> Vec<String> {
+    let mut items = Vec::new();
+    let mut in_requirement = false;
+    let mut notification_id: Option<String> = None;
+    let mut notification_object: Option<String> = None;
+
+    for line in description.lines() {
+        let trimmed = line.trim();
+        if trimmed == "{" {
+            in_requirement = true;
+            notification_id = None;
+            notification_object = None;
+            continue;
+        }
+        if !in_requirement {
+            continue;
+        }
+        if trimmed == "}," || trimmed == "}" {
+            if notification_id.as_deref() == Some("kLootItemWonNotification") {
+                if let Some(item_name) = notification_object.take() {
+                    if !item_name.is_empty() {
+                        items.push(item_name);
+                    }
+                }
+            }
+            in_requirement = false;
+            notification_id = None;
+            notification_object = None;
+            continue;
+        }
+
+        if let Some(value) = zombie_farm_parse_assignment_line(trimmed, "notificationID") {
+            notification_id = Some(value);
+        } else if let Some(value) = zombie_farm_parse_assignment_line(trimmed, "notificationObject")
+        {
+            notification_object = Some(value);
+        }
+    }
+
+    items
+}
+
+fn zombie_farm_storage_key_for_display_name(
+    env: &mut Environment,
+    display_name: &str,
+) -> Option<String> {
+    let tile_properties_path = env
+        .fs
+        .home_directory()
+        .join("Documents/remoteAssets_1.0/TileProperties.plist");
+    let bytes = env
+        .fs
+        .read(GuestPath::new(tile_properties_path.as_str()))
+        .ok()?;
+    let root = Value::from_reader(Cursor::new(bytes)).ok()?;
+    let dict = root.as_dictionary()?;
+
+    for (storage_key, value) in dict {
+        let Some(entry) = value.as_dictionary() else {
+            continue;
+        };
+        let Some(name) = entry.get("name").and_then(Value::as_string) else {
+            continue;
+        };
+        if name == display_name {
+            return Some(storage_key.clone());
+        }
+    }
+
+    None
+}
+
+fn zombie_farm_replay_loot_item_notifications_from_inventory(
+    env: &mut Environment,
+    quest_man: id,
+) -> usize {
+    let Some(game_data) = zombie_farm_get_game_data(env) else {
+        log!(
+            "ZombieFarm workaround: quest inventory replay skipped because GameData is unavailable"
+        );
+        return 0;
+    };
+
+    let Some(quest_array) = zombie_farm_get_id_if_responds(env, quest_man, "questArray") else {
+        log!(
+            "ZombieFarm workaround: quest inventory replay skipped because questArray is unavailable"
+        );
+        return 0;
+    };
+
+    let Some(quest_count) = zombie_farm_get_array_count(env, quest_array) else {
+        return 0;
+    };
+
+    let mut replayed = 0usize;
+    let mut loot_item_candidates = 0usize;
+    let mut replayed_items = HashSet::<String>::new();
+
+    for quest_idx in 0..quest_count {
+        let Some(quest_definition) =
+            zombie_farm_get_array_object_at_index(env, quest_array, quest_idx)
+        else {
+            continue;
+        };
+        let Some(description) =
+            zombie_farm_get_string_property(env, quest_definition, "description")
+        else {
+            continue;
+        };
+
+        let item_names =
+            zombie_farm_collect_loot_item_requirement_names_from_description(&description);
+        if item_names.iter().any(|item_name| item_name.contains("Circus Flag")) {
+            log!(
+                "ZombieFarm workaround: quest inventory replay parsed circus loot items from quest {}: {:?}",
+                quest_idx,
+                item_names
+            );
+        }
+
+        for item_name in item_names {
+            loot_item_candidates += 1;
+            if item_name.is_empty() || !replayed_items.insert(item_name.clone()) {
+                continue;
+            }
+
+            let item_name_ns = ns_string::from_rust_string(env, item_name.clone());
+            let owned_count_display_name_raw = zombie_farm_get_i32_arg_result_if_responds(
+                env,
+                game_data,
+                "numberOfItemInStorageWithKey:",
+                item_name_ns,
+            );
+            let storage_key = zombie_farm_storage_key_for_display_name(env, &item_name);
+            let owned_count_storage_key_raw = storage_key
+                .as_ref()
+                .and_then(|storage_key| {
+                    let storage_key_ns = ns_string::from_rust_string(env, storage_key.clone());
+                    zombie_farm_get_i32_arg_result_if_responds(
+                        env,
+                        game_data,
+                        "numberOfItemInStorageWithKey:",
+                        storage_key_ns,
+                    )
+                });
+            let owned_count_display_name = owned_count_display_name_raw.unwrap_or(0);
+            let owned_count_storage_key = owned_count_storage_key_raw.unwrap_or(0);
+            let owned_count = owned_count_display_name.max(owned_count_storage_key);
+
+            if item_name.contains("Circus Flag") {
+                log!(
+                    "ZombieFarm workaround: quest inventory replay item {:?}, storage key {:?}, owned display {:?}, owned key {:?}, effective {}",
+                    item_name,
+                    storage_key,
+                    owned_count_display_name_raw,
+                    owned_count_storage_key_raw,
+                    owned_count
+                );
+            }
+
+            if owned_count < 1 {
+                continue;
+            }
+
+            if zombie_farm_post_notification_name_object(
+                env,
+                "kLootItemWonNotification",
+                item_name_ns,
+            ) {
+                replayed += 1;
+                log!(
+                    "ZombieFarm workaround: replayed kLootItemWonNotification for {:?} (owned display={}, owned key={}, storage key {:?})",
+                    item_name,
+                    owned_count_display_name,
+                    owned_count_storage_key,
+                    storage_key
+                );
+            }
+        }
+    }
+
+    log!(
+        "ZombieFarm workaround: quest inventory replay finished with {} replay(s) from {} loot item candidate(s)",
+        replayed,
+        loot_item_candidates
+    );
+
+    replayed
 }
 
 fn zombie_farm_get_live_actor_list(env: &mut Environment) -> Option<id> {
@@ -1848,6 +2752,121 @@ fn zombie_farm_skip_quest_manager_reset(
         selector_name
     );
     true
+}
+
+fn zombie_farm_restore_local_quest_progress(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) {
+    if !zombie_farm_uses_playforge_bundle(env)
+        || !matches!(selector_name, "statusCheckDone" | "startUpChecksComplete")
+    {
+        return;
+    }
+
+    static RESTORED: AtomicBool = AtomicBool::new(false);
+    if RESTORED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    let regs = *env.cpu.regs();
+    let gui_layer = if zombie_farm_object_class_name(env, receiver) == Some("ZFGuiLayer") {
+        Some(receiver)
+    } else {
+        zombie_farm_get_gui_layer(env)
+    };
+    let quest_man = zombie_farm_get_quest_man(env);
+    if gui_layer.is_none() && quest_man.is_none() {
+        log!(
+            "ZombieFarm workaround: quest restore skipped after {} because guiLayer and questMan are both unavailable",
+            selector_name
+        );
+        env.cpu.regs_mut().copy_from_slice(&regs);
+        RESTORED.store(false, Ordering::Relaxed);
+        return;
+    }
+
+    zombie_farm_log_local_quest_restore_snapshot(
+        env,
+        "before local quest restore",
+        gui_layer,
+        quest_man,
+    );
+
+    let mut restored_any = false;
+    if let Some(gui_layer) = gui_layer {
+        if zombie_farm_send_noarg_if_responds(env, gui_layer, "restoreQuestsFromSave") {
+            log!(
+                "ZombieFarm workaround: invoked [ZFGuiLayer restoreQuestsFromSave] after {}",
+                selector_name
+            );
+            restored_any = true;
+        }
+        if zombie_farm_send_noarg_if_responds(env, gui_layer, "updateStats") {
+            log!(
+                "ZombieFarm workaround: invoked [ZFGuiLayer updateStats] after {}",
+                selector_name
+            );
+            restored_any = true;
+        }
+        if zombie_farm_send_noarg_if_responds(env, gui_layer, "getActiveProfileStatus") {
+            log!(
+                "ZombieFarm workaround: invoked [ZFGuiLayer getActiveProfileStatus] after {}",
+                selector_name
+            );
+            restored_any = true;
+        }
+    }
+
+    if let Some(quest_man) = quest_man {
+        if zombie_farm_send_noarg_if_responds(env, quest_man, "restoreQuestsFromSave") {
+            log!(
+                "ZombieFarm workaround: invoked [ZFQuestMan restoreQuestsFromSave] after {}",
+                selector_name
+            );
+            restored_any = true;
+        }
+        let replayed = zombie_farm_replay_loot_item_notifications_from_inventory(env, quest_man);
+        if replayed > 0 {
+            restored_any = true;
+            log!(
+                "ZombieFarm workaround: replayed {} offline loot quest notification(s) after {}",
+                replayed,
+                selector_name
+            );
+        }
+        if zombie_farm_send_noarg_if_responds(env, quest_man, "updateStats") {
+            log!(
+                "ZombieFarm workaround: invoked [ZFQuestMan updateStats] after {}",
+                selector_name
+            );
+            restored_any = true;
+        }
+        if zombie_farm_send_noarg_if_responds(env, quest_man, "getActiveProfileStatus") {
+            log!(
+                "ZombieFarm workaround: invoked [ZFQuestMan getActiveProfileStatus] after {}",
+                selector_name
+            );
+            restored_any = true;
+        }
+    }
+
+    zombie_farm_log_local_quest_restore_snapshot(
+        env,
+        "after local quest restore",
+        gui_layer,
+        quest_man,
+    );
+
+    if !restored_any {
+        log!(
+            "ZombieFarm workaround: no local quest restore selector matched after {}",
+            selector_name
+        );
+        RESTORED.store(false, Ordering::Relaxed);
+    }
+    env.cpu.regs_mut().copy_from_slice(&regs);
 }
 
 fn zombie_farm_skip_unsafe_toolbar_build(
@@ -3642,8 +4661,49 @@ fn trace_zombie_farm_status_normal_return(env: &mut Environment, receiver: id, s
                 env.cpu.regs()[0]
             );
         }
+        _ if zombie_farm_status_trace_enabled() => {
+            let value_id = id::from_bits(env.cpu.regs()[0]);
+            log!(
+                "ZombieFarm status: [{} {}] receiver {:?} return r0=0x{:x} ({:?}) class {:?}",
+                class_name,
+                selector_name,
+                receiver,
+                env.cpu.regs()[0],
+                value_id,
+                zombie_farm_object_class_name(env, value_id),
+            );
+        }
         _ => {}
     }
+}
+
+fn trace_zombie_farm_quest_normal_return(env: &mut Environment, receiver: id, selector: SEL) {
+    if !zombie_farm_uses_playforge_bundle(env)
+        || !zombie_farm_quest_trace_enabled()
+        || receiver == nil
+    {
+        return;
+    }
+    let selector_name = selector.as_str(&env.mem);
+    let class = ObjC::read_isa(receiver, &env.mem);
+    if class == nil {
+        return;
+    }
+    let Some(class_name) = env.objc.try_get_class_name(class) else {
+        return;
+    };
+    if !trace_zombie_farm_quest_message(class_name, selector_name) {
+        return;
+    }
+
+    log!(
+        "ZombieFarm quest: [{} {}] receiver {:?} return r0=0x{:x} ({:?})",
+        class_name,
+        selector_name,
+        receiver,
+        env.cpu.regs()[0],
+        id::from_bits(env.cpu.regs()[0]),
+    );
 }
 
 fn zombie_farm_disable_cctable_cell_reuse(
@@ -4124,9 +5184,14 @@ fn objc_msgSend_inner(
                 let trace_zombie_farm_layout = zombie_farm_debug_enabled
                     && (trace_zombie_farm_layout_message(receiver_class_name, selector_name)
                         || trace_zombie_farm_layout_message(name, selector_name));
-                let trace_zombie_farm_status = zombie_farm_debug_enabled
+                let trace_zombie_farm_status = zombie_farm_uses_playforge_bundle(env)
+                    && (zombie_farm_debug_enabled || zombie_farm_status_trace_enabled())
                     && (trace_zombie_farm_status_message(receiver_class_name, selector_name)
                         || trace_zombie_farm_status_message(name, selector_name));
+                let trace_zombie_farm_quest = zombie_farm_uses_playforge_bundle(env)
+                    && zombie_farm_quest_trace_enabled()
+                    && (trace_zombie_farm_quest_message(receiver_class_name, selector_name)
+                        || trace_zombie_farm_quest_message(name, selector_name));
                 let record_zombie_farm_hunger = zombie_farm_debug_enabled
                     && (crate::zombie_farm_debug::should_record_hunger_message(
                         receiver_class_name,
@@ -4155,13 +5220,15 @@ fn objc_msgSend_inner(
                         name,
                         selector_name,
                     ));
-                if trace_zombie_farm_status || trace_zombie_farm_layout {
+                if trace_zombie_farm_status || trace_zombie_farm_layout || trace_zombie_farm_quest {
                     let imp_description = match imp {
                         IMP::Host(_) => "host".to_string(),
                         IMP::Guest(guest_imp) => format!("{:?}", guest_imp),
                     };
                     let arg_description = if trace_zombie_farm_status {
                         zombie_farm_status_arg_details(selector_name, env.cpu.regs())
+                    } else if trace_zombie_farm_quest {
+                        zombie_farm_quest_arg_details(selector_name, env.cpu.regs())
                     } else {
                         zombie_farm_layout_arg_details(selector_name, env.cpu.regs())
                     }
@@ -4203,6 +5270,17 @@ fn objc_msgSend_inner(
                                 arg_description,
                             );
                         }
+                    }
+                    if trace_zombie_farm_quest {
+                        log!(
+                            "ZombieFarm quest: [{} {}] receiver {:?}, implementation class {}, imp {}{}",
+                            receiver_class_name,
+                            selector_name,
+                            receiver,
+                            name,
+                            imp_description,
+                            arg_description,
+                        );
                     }
                 }
                 let regs_before_zombie_farm_record = if record_zombie_farm_hunger
@@ -4281,6 +5359,60 @@ Type mismatch when sending message {} to {:?}!
                 }
                 if trace_zombie_farm_status {
                     trace_zombie_farm_status_normal_return(env, receiver, selector);
+                    if zombie_farm_status_trace_enabled() {
+                        let regs_before = *regs_before_zombie_farm_record
+                            .as_ref()
+                            .unwrap_or(&regs_before_zombie_farm_prepare);
+                        match selector_name {
+                            "latestStatus" | "status" | "getActivePlayer" | "notification" => {
+                                zombie_farm_log_status_object_state(
+                                    env,
+                                    id::from_bits(env.cpu.regs()[0]),
+                                    selector_name,
+                                );
+                            }
+                            "setStatus:" | "setLatestStatus:" | "setActivePlayer:"
+                            | "setCurrentPlayer:" | "setPlayerProfile:" | "setNotification:"
+                            | "setNotifications:" | "setGameData:" | "setZfGameData:" => {
+                                zombie_farm_log_status_object_state(
+                                    env,
+                                    id::from_bits(regs_before[2]),
+                                    selector_name,
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if trace_zombie_farm_quest {
+                    trace_zombie_farm_quest_normal_return(env, receiver, selector);
+                    let regs_before = *regs_before_zombie_farm_record
+                        .as_ref()
+                        .unwrap_or(&regs_before_zombie_farm_prepare);
+                    match selector_name {
+                        "setQuest:" => {
+                            zombie_farm_log_quest_object_state(
+                                env,
+                                id::from_bits(regs_before[2]),
+                                "ZFQuestCell setQuest:",
+                            );
+                        }
+                        "quest" => {
+                            zombie_farm_log_quest_object_state(
+                                env,
+                                id::from_bits(env.cpu.regs()[0]),
+                                "ZFQuestCell quest",
+                            );
+                        }
+                        "questPressed:" | "openMenuWithQuest:" => {
+                            zombie_farm_log_quest_object_state(
+                                env,
+                                id::from_bits(regs_before[2]),
+                                selector_name,
+                            );
+                        }
+                        _ => {}
+                    }
                 }
                 if record_zombie_farm_hunger {
                     crate::zombie_farm_debug::record_hunger_return(
@@ -4310,6 +5442,7 @@ Type mismatch when sending message {} to {:?}!
                 zombie_farm_trace_game_interaction_return(env, receiver, &selector_name_for_after);
                 zombie_farm_apply_local_hunger_update(env, receiver, &selector_name_for_after);
                 zombie_farm_check_local_daily_event(env, receiver, &selector_name_for_after);
+                zombie_farm_restore_local_quest_progress(env, receiver, &selector_name_for_after);
                 return;
             } else {
                 class = superclass;

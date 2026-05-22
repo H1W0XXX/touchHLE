@@ -253,8 +253,7 @@ impl super::ObjC {
                 self.describe_last_message_debug(),
             );
         };
-        let mut host_object: &(dyn AnyHostObject + 'static) =
-            &*entry.host_object;
+        let mut host_object: &(dyn AnyHostObject + 'static) = &*entry.host_object;
         loop {
             if let Some(res) = host_object.as_any().downcast_ref() {
                 return res;

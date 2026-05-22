@@ -35,7 +35,7 @@ mod synchronization;
 pub use classes::{objc_classes, Class, ClassExports, ClassTemplate};
 pub use messages::{
     autorelease, msg, msg_class, msg_send, msg_send_no_type_checking, msg_send_super2, msg_super,
-    objc_super, release, retain,
+    objc_super, release, retain, zombie_farm_complete_all_quests_cheat,
 };
 pub use methods::{HostIMP, IMP};
 pub use objects::{

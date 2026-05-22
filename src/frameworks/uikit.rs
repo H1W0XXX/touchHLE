@@ -152,6 +152,9 @@ pub fn handle_events(env: &mut Environment) -> Option<Instant> {
             Event::DumpInspector => {
                 ui_view::dump_debug_inspector(env);
             }
+            Event::ZombieFarmCompleteAllQuests => {
+                crate::objc::zombie_farm_complete_all_quests_cheat(env);
+            }
             Event::ToggleElementInspector => {
                 ui_view::toggle_debug_element_inspector(env);
             }

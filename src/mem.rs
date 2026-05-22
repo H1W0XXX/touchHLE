@@ -361,8 +361,8 @@ impl Mem {
     // seems like a good idea to help the compiler optimise for the fast path
     #[cold]
     fn null_check_fail(at: VAddr, size: GuestUSize) {
-        let objc_context = crate::objc::global_last_message_debug()
-            .unwrap_or_else(|| "none".to_string());
+        let objc_context =
+            crate::objc::global_last_message_debug().unwrap_or_else(|| "none".to_string());
         panic!(
             "Attempted null-page access at {at:#x} ({size:#x} bytes). Last ObjC message: {}",
             objc_context

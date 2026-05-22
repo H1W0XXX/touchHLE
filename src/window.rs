@@ -160,6 +160,8 @@ pub enum Event {
     EnterDebugger,
     /// User pressed F11, requesting a UI/table inspector dump.
     DumpInspector,
+    /// User pressed F9, requesting a one-shot Zombie Farm quest completion cheat.
+    ZombieFarmCompleteAllQuests,
     /// User toggled the visual UIKit element inspector.
     ToggleElementInspector,
     /// User moved the pointer while the visual inspector is active.
@@ -850,6 +852,13 @@ impl Window {
                         E::FingerDown { .. } => Event::TouchesDown(map),
                         _ => unreachable!(),
                     }
+                }
+                E::KeyDown {
+                    keycode: Some(sdl2::keyboard::Keycode::F9),
+                    ..
+                } => {
+                    echo!("F9 pressed, Zombie Farm complete-all-quests cheat queued.");
+                    Event::ZombieFarmCompleteAllQuests
                 }
                 E::KeyDown {
                     keycode: Some(sdl2::keyboard::Keycode::F10),
