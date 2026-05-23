@@ -26,9 +26,6 @@ jobs:
           fetch-depth: 0
           submodules: true
 
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
-
       - name: Set up JDK
         uses: actions/setup-java@v4
         with:
@@ -114,9 +111,6 @@ jobs:
           rm -rf "$ANDROID_SDK_ROOT/ndk/${ANDROID_NDK_VERSION}"
           mkdir -p "$ANDROID_SDK_ROOT/ndk"
           ln -s "$PWD/android-ndk/android-ndk-r25c" "$ANDROID_SDK_ROOT/ndk/${ANDROID_NDK_VERSION}"
-
-      - name: Force SDL2 shared library rebuild
-        run: cargo clean -p sdl2-sys --target aarch64-linux-android
 
       - name: Generate local.properties
         run: echo "sdk.dir=$ANDROID_SDK_ROOT" > android/local.properties
