@@ -1160,6 +1160,25 @@ fn zombie_farm_ignore_spurious_operation_done(
     }
 
     let Some(class_name) = zombie_farm_object_class_name(env, receiver).map(str::to_string) else {
+        if zombie_farm_object_pointer_looks_valid(env, receiver) {
+            let class = ObjC::read_isa(receiver, &env.mem);
+            env.cpu.regs_mut()[0] = 0;
+            if class == nil {
+                log!(
+                    "ZombieFarm workaround: ignoring spurious [deallocated {:?} operationDone]",
+                    receiver
+                );
+                return true;
+            }
+            if env.objc.try_get_class_name(class).is_none() {
+                log!(
+                    "ZombieFarm workaround: ignoring spurious [stale {:?} operationDone] with unregistered class {:?}",
+                    receiver,
+                    class
+                );
+                return true;
+            }
+        }
         return false;
     };
     if !matches!(class_name.as_str(), "NSString" | "_touchHLE_NSString") {
@@ -4952,13 +4971,19 @@ fn objc_msgSend_inner(
 
     let orig_class = super2.unwrap_or_else(|| ObjC::read_isa(receiver, &env.mem));
     if orig_class == nil {
-        let selector_name = selector.as_str(&env.mem);
-        if matches!(selector_name, "release" | "retain" | "autorelease") {
+        let selector_name = selector.as_str(&env.mem).to_string();
+        if matches!(
+            selector_name.as_str(),
+            "release" | "retain" | "autorelease"
+        ) {
             log!(
                 "Warning: ignoring {} sent to object {:?} with nil isa",
                 selector_name,
                 receiver
             );
+            return;
+        }
+        if zombie_farm_ignore_spurious_operation_done(env, receiver, &selector_name) {
             return;
         }
         panic!(
