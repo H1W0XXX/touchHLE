@@ -7,7 +7,9 @@ use crate::objc::{id, msg_send_no_type_checking, nil, ObjC};
 use crate::Environment;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Result as IoResult, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const RECENT_LIMIT: usize = 160;
 const HUNGER_RECENT_LIMIT: usize = 2048;
@@ -36,6 +38,160 @@ struct State {
 
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DebugMode {
+    Off,
+    Full,
+    Profile,
+}
+
+#[derive(Clone, Copy)]
+#[repr(usize)]
+pub enum ScrollProfileBucket {
+    UiTouchMoveInput = 0,
+    UiTouchMoveDispatch,
+    ObjcTouchMove,
+    SetContentOffset,
+    ContentOffset,
+    ScrollViewDidScroll,
+    TableCellAtIndex,
+    NumberOfCellsInTable,
+    CellClassForTable,
+    DequeueCell,
+    CellWithIndex,
+    AddCellIfNecessary,
+    MoveCellOutOfSight,
+    EvictCell,
+    IndexFromOffset,
+    OffsetFromIndex,
+    SetIndexForCell,
+    TableSizeQuery,
+}
+
+const SCROLL_PROFILE_BUCKET_COUNT: usize = ScrollProfileBucket::TableSizeQuery as usize + 1;
+
+struct ScrollProfileCounter {
+    calls: AtomicU64,
+    nanos: AtomicU64,
+}
+
+impl Default for ScrollProfileCounter {
+    fn default() -> Self {
+        Self {
+            calls: AtomicU64::new(0),
+            nanos: AtomicU64::new(0),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ScrollOffsetStats {
+    seen: u64,
+    first_x: f32,
+    first_y: f32,
+    last_x: f32,
+    last_y: f32,
+    min_x: f32,
+    max_x: f32,
+    min_y: f32,
+    max_y: f32,
+    total_abs_dx: f32,
+    total_abs_dy: f32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct IntervalCounter {
+    calls: u64,
+    nanos: u64,
+}
+
+#[derive(Default)]
+struct IndexProfileDetail {
+    total: IntervalCounter,
+    nil_returns: u64,
+    returned_cells: BTreeMap<u32, u64>,
+}
+
+#[derive(Default)]
+struct SetIndexProfileDetail {
+    total: IntervalCounter,
+    cells: BTreeMap<u32, u64>,
+}
+
+#[derive(Default)]
+struct CellBuildDetail {
+    total: IntervalCounter,
+    messages: BTreeMap<String, IntervalCounter>,
+}
+
+struct ScrollProfileTableDetail {
+    class_name: String,
+    selectors: Vec<IntervalCounter>,
+    cell_at_index: BTreeMap<u32, IndexProfileDetail>,
+    cell_with_index: BTreeMap<u32, IntervalCounter>,
+    set_index: BTreeMap<u32, SetIndexProfileDetail>,
+    cell_build: BTreeMap<u32, CellBuildDetail>,
+}
+
+impl Default for ScrollProfileTableDetail {
+    fn default() -> Self {
+        Self {
+            class_name: String::new(),
+            selectors: vec![IntervalCounter::default(); SCROLL_PROFILE_BUCKET_COUNT],
+            cell_at_index: BTreeMap::new(),
+            cell_with_index: BTreeMap::new(),
+            set_index: BTreeMap::new(),
+            cell_build: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ScrollProfileDetailState {
+    tables: BTreeMap<u32, ScrollProfileTableDetail>,
+}
+
+#[derive(Clone, Copy)]
+struct CellBuildScope {
+    table_receiver: u32,
+    index: u32,
+}
+
+#[derive(Clone, Copy)]
+pub struct ScrollProfileCall {
+    bucket: ScrollProfileBucket,
+    table_receiver: u32,
+    index: Option<u32>,
+    cell: Option<u32>,
+}
+
+static SCROLL_PROFILE_LAST_REPORT_MS: AtomicU64 = AtomicU64::new(0);
+static SCROLL_PROFILE_COUNTERS: OnceLock<Vec<ScrollProfileCounter>> = OnceLock::new();
+static SCROLL_PROFILE_OFFSETS: OnceLock<Mutex<ScrollOffsetStats>> = OnceLock::new();
+static SCROLL_PROFILE_DETAILS: OnceLock<Mutex<ScrollProfileDetailState>> = OnceLock::new();
+static CELL_BUILD_SCOPE_STACK: OnceLock<Mutex<Vec<CellBuildScope>>> = OnceLock::new();
+
+const SCROLL_PROFILE_BUCKETS: &[(ScrollProfileBucket, &str)] = &[
+    (ScrollProfileBucket::UiTouchMoveInput, "ui_move_in"),
+    (ScrollProfileBucket::UiTouchMoveDispatch, "ui_move_dispatch"),
+    (ScrollProfileBucket::ObjcTouchMove, "objc_touch_move"),
+    (ScrollProfileBucket::SetContentOffset, "set_offset"),
+    (ScrollProfileBucket::ContentOffset, "get_offset"),
+    (ScrollProfileBucket::ScrollViewDidScroll, "did_scroll"),
+    (ScrollProfileBucket::TableCellAtIndex, "cell_at_index"),
+    (ScrollProfileBucket::NumberOfCellsInTable, "cell_count"),
+    (ScrollProfileBucket::CellClassForTable, "cell_class"),
+    (ScrollProfileBucket::DequeueCell, "dequeue"),
+    (ScrollProfileBucket::CellWithIndex, "cell_with_index"),
+    (ScrollProfileBucket::AddCellIfNecessary, "add_cell"),
+    (ScrollProfileBucket::MoveCellOutOfSight, "move_cell_out"),
+    (ScrollProfileBucket::EvictCell, "evict_cell"),
+    (ScrollProfileBucket::IndexFromOffset, "index_from_offset"),
+    (ScrollProfileBucket::OffsetFromIndex, "offset_from_index"),
+    (ScrollProfileBucket::SetIndexForCell, "set_index"),
+    (ScrollProfileBucket::TableSizeQuery, "size_query"),
+];
+
 pub struct CocosNodeHit {
     pub node: id,
     pub class_name: String,
@@ -55,10 +211,609 @@ fn state() -> &'static Mutex<State> {
     STATE.get_or_init(|| Mutex::new(State::default()))
 }
 
+fn debug_mode() -> DebugMode {
+    static MODE: OnceLock<DebugMode> = OnceLock::new();
+    *MODE.get_or_init(
+        || match std::env::var("TOUCHHLE_ZOMBIE_FARM_DEBUG").ok().as_deref() {
+            Some("1") | Some("full") => DebugMode::Full,
+            Some("profile") => DebugMode::Profile,
+            _ => DebugMode::Off,
+        },
+    )
+}
+
 pub fn enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED
-        .get_or_init(|| std::env::var("TOUCHHLE_ZOMBIE_FARM_DEBUG").ok().as_deref() == Some("1"))
+    debug_mode() == DebugMode::Full
+}
+
+pub fn scroll_profile_enabled() -> bool {
+    matches!(debug_mode(), DebugMode::Full | DebugMode::Profile)
+}
+
+pub fn scroll_profile_enabled_for_bundle(env: &Environment) -> bool {
+    scroll_profile_enabled()
+        && env
+            .bundle
+            .bundle_identifier()
+            .starts_with("com.playforge.Z")
+}
+
+fn scroll_profile_counters() -> &'static [ScrollProfileCounter] {
+    SCROLL_PROFILE_COUNTERS.get_or_init(|| {
+        (0..SCROLL_PROFILE_BUCKET_COUNT)
+            .map(|_| ScrollProfileCounter::default())
+            .collect()
+    })
+}
+
+fn scroll_profile_offsets() -> &'static Mutex<ScrollOffsetStats> {
+    SCROLL_PROFILE_OFFSETS.get_or_init(|| Mutex::new(ScrollOffsetStats::default()))
+}
+
+fn scroll_profile_details() -> &'static Mutex<ScrollProfileDetailState> {
+    SCROLL_PROFILE_DETAILS.get_or_init(|| Mutex::new(ScrollProfileDetailState::default()))
+}
+
+fn cell_build_scope_stack() -> &'static Mutex<Vec<CellBuildScope>> {
+    CELL_BUILD_SCOPE_STACK.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+pub fn scroll_profile_bucket(class_name: &str, selector_name: &str) -> Option<ScrollProfileBucket> {
+    if matches!(
+        selector_name,
+        "touchesMoved:withEvent:" | "ccTouchMoved:withEvent:" | "ccTouchesMoved:withEvent:"
+    ) {
+        return Some(ScrollProfileBucket::ObjcTouchMove);
+    }
+
+    let table_delegate_selector = matches!(
+        selector_name,
+        "table:cellAtIndex:" | "numberOfCellsInTable:" | "cellClassForTable:"
+    );
+    let table_class = class_name.contains("TableView")
+        || class_name == "CCScrollView"
+        || class_name.ends_with("Cell");
+    if !table_class && !table_delegate_selector {
+        return None;
+    }
+
+    match selector_name {
+        "setContentOffset:" => Some(ScrollProfileBucket::SetContentOffset),
+        "contentOffset" => Some(ScrollProfileBucket::ContentOffset),
+        "scrollViewDidScroll:" => Some(ScrollProfileBucket::ScrollViewDidScroll),
+        "table:cellAtIndex:" => Some(ScrollProfileBucket::TableCellAtIndex),
+        "numberOfCellsInTable:" => Some(ScrollProfileBucket::NumberOfCellsInTable),
+        "cellClassForTable:" => Some(ScrollProfileBucket::CellClassForTable),
+        "dequeueCell" => Some(ScrollProfileBucket::DequeueCell),
+        "cellWithIndex:" => Some(ScrollProfileBucket::CellWithIndex),
+        "_addCellIfNecessary:" => Some(ScrollProfileBucket::AddCellIfNecessary),
+        "_moveCellOutOfSight:" => Some(ScrollProfileBucket::MoveCellOutOfSight),
+        "_evictCell" => Some(ScrollProfileBucket::EvictCell),
+        "_indexFromOffset:" => Some(ScrollProfileBucket::IndexFromOffset),
+        "_offsetFromIndex:" => Some(ScrollProfileBucket::OffsetFromIndex),
+        "_setIndex:forCell:" => Some(ScrollProfileBucket::SetIndexForCell),
+        "setContentSize:" | "setViewSize:" | "contentSize" | "viewSize" | "cellSize" => {
+            Some(ScrollProfileBucket::TableSizeQuery)
+        }
+        _ => None,
+    }
+}
+
+pub fn begin_scroll_profile_call(
+    bucket: ScrollProfileBucket,
+    receiver: id,
+    class_name: &str,
+    selector_name: &str,
+    regs: &[u32; 16],
+) -> ScrollProfileCall {
+    let table_receiver = match selector_name {
+        "table:cellAtIndex:" | "numberOfCellsInTable:" | "cellClassForTable:" => regs[2],
+        _ => receiver.to_bits(),
+    };
+    let index = match selector_name {
+        "table:cellAtIndex:" => Some(regs[3]),
+        "cellWithIndex:" => Some(regs[2]),
+        "_offsetFromIndex:" => Some(regs[3]),
+        "_setIndex:forCell:" => Some(regs[2]),
+        _ => None,
+    };
+    let cell = match selector_name {
+        "_setIndex:forCell:" => Some(regs[3]),
+        "_addCellIfNecessary:" | "_moveCellOutOfSight:" => Some(regs[2]),
+        _ => None,
+    };
+
+    if table_receiver != 0 {
+        let mut details = scroll_profile_details().lock().unwrap();
+        let table = details.tables.entry(table_receiver).or_default();
+        if table.class_name.is_empty() {
+            table.class_name = class_name.to_string();
+        }
+    }
+
+    if !matches!(bucket, ScrollProfileBucket::SetContentOffset) {
+        return ScrollProfileCall {
+            bucket,
+            table_receiver,
+            index,
+            cell,
+        };
+    }
+
+    let point = CGPoint {
+        x: f32::from_bits(regs[2]),
+        y: f32::from_bits(regs[3]),
+    };
+    let mut stats = scroll_profile_offsets().lock().unwrap();
+    if stats.seen == 0 {
+        stats.first_x = point.x;
+        stats.first_y = point.y;
+        stats.min_x = point.x;
+        stats.max_x = point.x;
+        stats.min_y = point.y;
+        stats.max_y = point.y;
+    } else {
+        stats.total_abs_dx += (point.x - stats.last_x).abs();
+        stats.total_abs_dy += (point.y - stats.last_y).abs();
+        stats.min_x = stats.min_x.min(point.x);
+        stats.max_x = stats.max_x.max(point.x);
+        stats.min_y = stats.min_y.min(point.y);
+        stats.max_y = stats.max_y.max(point.y);
+    }
+    stats.last_x = point.x;
+    stats.last_y = point.y;
+    stats.seen += 1;
+
+    ScrollProfileCall {
+        bucket,
+        table_receiver,
+        index,
+        cell,
+    }
+}
+
+pub fn record_scroll_profile(bucket: ScrollProfileBucket, elapsed: Duration) {
+    record_scroll_profile_count(bucket, elapsed, 1);
+}
+
+pub fn record_scroll_profile_count(bucket: ScrollProfileBucket, elapsed: Duration, count: u64) {
+    if count > 0 {
+        let counter = &scroll_profile_counters()[bucket as usize];
+        let nanos = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
+        counter.calls.fetch_add(count, Ordering::Relaxed);
+        counter.nanos.fetch_add(nanos, Ordering::Relaxed);
+    }
+    maybe_log_scroll_profile();
+}
+
+fn should_record_cell_build_message(selector_name: &str) -> bool {
+    !matches!(
+        selector_name,
+        "retain"
+            | "release"
+            | "autorelease"
+            | "class"
+            | "superclass"
+            | "isKindOfClass:"
+            | "respondsToSelector:"
+            | "conformsToProtocol:"
+            | "hash"
+    )
+}
+
+fn should_record_zombie_relayout_candidate(class_name: &str, selector_name: &str) -> bool {
+    let interesting_class = class_name.starts_with("ZombieActor")
+        || class_name == "ActorAttachment"
+        || class_name == "CCSprite"
+        || class_name == "CCSpriteSheet";
+    if !interesting_class {
+        return false;
+    }
+
+    let lower = selector_name.to_ascii_lowercase();
+    [
+        "init",
+        "sprite",
+        "frame",
+        "attach",
+        "update",
+        "layout",
+        "refresh",
+        "display",
+        "position",
+        "scale",
+        "rotation",
+        "anchor",
+        "visible",
+    ]
+    .iter()
+    .any(|keyword| lower.contains(keyword))
+}
+
+pub fn begin_cell_build_scope(selector_name: &str, regs: &[u32; 16]) -> bool {
+    if selector_name != "table:cellAtIndex:" {
+        return false;
+    }
+
+    let mut stack = cell_build_scope_stack().lock().unwrap();
+    stack.push(CellBuildScope {
+        table_receiver: regs[2],
+        index: regs[3],
+    });
+    true
+}
+
+pub fn cell_build_scope_active() -> bool {
+    !cell_build_scope_stack().lock().unwrap().is_empty()
+}
+
+pub fn record_cell_build_message(class_name: &str, selector_name: &str, elapsed: Duration) {
+    if selector_name == "table:cellAtIndex:" || !should_record_cell_build_message(selector_name) {
+        return;
+    }
+
+    let scope = {
+        let stack = cell_build_scope_stack().lock().unwrap();
+        stack.last().copied()
+    };
+    let Some(scope) = scope else {
+        return;
+    };
+
+    let nanos = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
+    let mut details = scroll_profile_details().lock().unwrap();
+    let table = details.tables.entry(scope.table_receiver).or_default();
+    let build = table.cell_build.entry(scope.index).or_default();
+    build.total.calls += 1;
+    build.total.nanos += nanos;
+    let key = format!("{class_name} {selector_name}");
+    let entry = build.messages.entry(key).or_default();
+    entry.calls += 1;
+    entry.nanos += nanos;
+
+    if should_record_zombie_relayout_candidate(class_name, selector_name) {
+        let trace_key = format!("{class_name} {selector_name}");
+        let trace = build.messages.entry(format!("RELAYOUT {trace_key}")).or_default();
+        trace.calls += 1;
+        trace.nanos += nanos;
+    }
+}
+
+pub fn end_cell_build_scope(started: bool) {
+    if !started {
+        return;
+    }
+    let mut stack = cell_build_scope_stack().lock().unwrap();
+    let _ = stack.pop();
+}
+
+pub fn finish_scroll_profile_call(
+    call: ScrollProfileCall,
+    elapsed: Duration,
+    return_value: Option<u32>,
+) {
+    record_scroll_profile(call.bucket, elapsed);
+
+    if call.table_receiver == 0 {
+        return;
+    }
+
+    let nanos = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
+    let mut details = scroll_profile_details().lock().unwrap();
+    let table = details.tables.entry(call.table_receiver).or_default();
+    let selector_total = &mut table.selectors[call.bucket as usize];
+    selector_total.calls += 1;
+    selector_total.nanos += nanos;
+
+    match call.bucket {
+        ScrollProfileBucket::TableCellAtIndex => {
+            let Some(index) = call.index else {
+                return;
+            };
+            let entry = table.cell_at_index.entry(index).or_default();
+            entry.total.calls += 1;
+            entry.total.nanos += nanos;
+            match return_value {
+                Some(0) | None => entry.nil_returns += 1,
+                Some(cell) => {
+                    *entry.returned_cells.entry(cell).or_insert(0) += 1;
+                }
+            }
+        }
+        ScrollProfileBucket::CellWithIndex => {
+            let Some(index) = call.index else {
+                return;
+            };
+            let entry = table.cell_with_index.entry(index).or_default();
+            entry.calls += 1;
+            entry.nanos += nanos;
+        }
+        ScrollProfileBucket::SetIndexForCell => {
+            let Some(index) = call.index else {
+                return;
+            };
+            let entry = table.set_index.entry(index).or_default();
+            entry.total.calls += 1;
+            entry.total.nanos += nanos;
+            if let Some(cell) = call.cell {
+                *entry.cells.entry(cell).or_insert(0) += 1;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn current_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn take_scroll_offset_summary() -> Option<ScrollOffsetStats> {
+    let mut stats = scroll_profile_offsets().lock().unwrap();
+    if stats.seen == 0 {
+        return None;
+    }
+    Some(std::mem::take(&mut *stats))
+}
+
+fn take_scroll_profile_detail_state() -> ScrollProfileDetailState {
+    let mut details = scroll_profile_details().lock().unwrap();
+    std::mem::take(&mut *details)
+}
+
+fn format_millis(nanos: u64) -> String {
+    format!("{:.1}ms", nanos as f64 / 1_000_000.0)
+}
+
+fn format_top_cell_at_index(table: &ScrollProfileTableDetail) -> Option<String> {
+    let mut rows: Vec<_> = table.cell_at_index.iter().collect();
+    rows.sort_by_key(|(_, detail)| std::cmp::Reverse(detail.total.nanos));
+    let parts: Vec<_> = rows
+        .into_iter()
+        .take(5)
+        .map(|(index, detail)| {
+            format!(
+                "{}:{}/{} cells={} nil={}",
+                index,
+                detail.total.calls,
+                format_millis(detail.total.nanos),
+                detail.returned_cells.len(),
+                detail.nil_returns
+            )
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+fn format_top_interval_map(map: &BTreeMap<u32, IntervalCounter>) -> Option<String> {
+    let mut rows: Vec<_> = map.iter().collect();
+    rows.sort_by_key(|(_, detail)| std::cmp::Reverse(detail.nanos));
+    let parts: Vec<_> = rows
+        .into_iter()
+        .take(5)
+        .map(|(index, detail)| {
+            format!("{}:{}/{}", index, detail.calls, format_millis(detail.nanos))
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+fn format_top_set_index(table: &ScrollProfileTableDetail) -> Option<String> {
+    let mut rows: Vec<_> = table.set_index.iter().collect();
+    rows.sort_by_key(|(_, detail)| std::cmp::Reverse(detail.total.nanos));
+    let parts: Vec<_> = rows
+        .into_iter()
+        .take(5)
+        .map(|(index, detail)| {
+            format!(
+                "{}:{}/{} cells={}",
+                index,
+                detail.total.calls,
+                format_millis(detail.total.nanos),
+                detail.cells.len()
+            )
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+fn format_top_cell_build_messages(detail: &CellBuildDetail) -> Option<String> {
+    let mut rows: Vec<_> = detail.messages.iter().collect();
+    rows.sort_by_key(|(_, counter)| std::cmp::Reverse(counter.nanos));
+    let parts: Vec<_> = rows
+        .into_iter()
+        .take(5)
+        .map(|(key, counter)| format!("{}:{}/{}", key, counter.calls, format_millis(counter.nanos)))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+fn format_top_cell_relayout_messages(detail: &CellBuildDetail) -> Option<String> {
+    let mut rows: Vec<_> = detail
+        .messages
+        .iter()
+        .filter(|(key, _)| key.starts_with("RELAYOUT "))
+        .collect();
+    rows.sort_by_key(|(_, counter)| std::cmp::Reverse(counter.nanos));
+    let parts: Vec<_> = rows
+        .into_iter()
+        .take(8)
+        .map(|(key, counter)| {
+            format!(
+                "{}:{}/{}",
+                key.trim_start_matches("RELAYOUT "),
+                counter.calls,
+                format_millis(counter.nanos)
+            )
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+fn format_top_cell_build(table: &ScrollProfileTableDetail) -> Vec<String> {
+    let mut rows: Vec<_> = table.cell_build.iter().collect();
+    rows.sort_by_key(|(_, detail)| std::cmp::Reverse(detail.total.nanos));
+    rows.into_iter()
+        .take(3)
+        .filter_map(|(index, detail)| {
+            let top = format_top_cell_build_messages(detail)?;
+            Some(format!(
+                "{}:{}/{} {}",
+                index,
+                detail.total.calls,
+                format_millis(detail.total.nanos),
+                top
+            ))
+        })
+        .collect()
+}
+
+fn format_top_cell_relayout(table: &ScrollProfileTableDetail) -> Vec<String> {
+    let mut rows: Vec<_> = table.cell_build.iter().collect();
+    rows.sort_by_key(|(_, detail)| std::cmp::Reverse(detail.total.nanos));
+    rows.into_iter()
+        .take(3)
+        .filter_map(|(index, detail)| {
+            let top = format_top_cell_relayout_messages(detail)?;
+            Some(format!("{index} {top}"))
+        })
+        .collect()
+}
+
+fn maybe_log_scroll_profile() {
+    let now = current_time_millis();
+    let last = SCROLL_PROFILE_LAST_REPORT_MS.load(Ordering::Relaxed);
+    if last == 0 {
+        let _ = SCROLL_PROFILE_LAST_REPORT_MS.compare_exchange(
+            0,
+            now,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        return;
+    }
+    let elapsed_ms = now.saturating_sub(last);
+    if elapsed_ms < 1000 {
+        return;
+    }
+    if SCROLL_PROFILE_LAST_REPORT_MS
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+
+    let counters = scroll_profile_counters();
+    let mut total_calls = 0u64;
+    let mut total_nanos = 0u64;
+    let mut parts = Vec::new();
+    for (bucket, name) in SCROLL_PROFILE_BUCKETS {
+        let counter = &counters[*bucket as usize];
+        let calls = counter.calls.swap(0, Ordering::Relaxed);
+        let nanos = counter.nanos.swap(0, Ordering::Relaxed);
+        if calls == 0 {
+            continue;
+        }
+        total_calls = total_calls.saturating_add(calls);
+        total_nanos = total_nanos.saturating_add(nanos);
+        let avg_us = nanos / calls / 1_000;
+        parts.push(format!("{name}={calls} avg_us={avg_us}"));
+    }
+    if total_calls == 0 {
+        return;
+    }
+
+    log!(
+        "ZombieFarm scroll profile: {:.2}s total={} total_ms={:.2} {}",
+        elapsed_ms as f64 / 1000.0,
+        total_calls,
+        total_nanos as f64 / 1_000_000.0,
+        parts.join(" ")
+    );
+
+    let details = take_scroll_profile_detail_state();
+    for (receiver, table) in details.tables {
+        let cell_at_index = table.selectors[ScrollProfileBucket::TableCellAtIndex as usize];
+        let cell_with_index = table.selectors[ScrollProfileBucket::CellWithIndex as usize];
+        let set_index = table.selectors[ScrollProfileBucket::SetIndexForCell as usize];
+        let did_scroll = table.selectors[ScrollProfileBucket::ScrollViewDidScroll as usize];
+        if cell_at_index.calls == 0
+            && cell_with_index.calls == 0
+            && set_index.calls == 0
+            && did_scroll.calls == 0
+        {
+            continue;
+        }
+
+        log!(
+            "ZombieFarm scroll table 0x{:x} {}: did_scroll={}/{} cell_at_index={}/{} cell_with_index={}/{} set_index={}/{}",
+            receiver,
+            table.class_name,
+            did_scroll.calls,
+            format_millis(did_scroll.nanos),
+            cell_at_index.calls,
+            format_millis(cell_at_index.nanos),
+            cell_with_index.calls,
+            format_millis(cell_with_index.nanos),
+            set_index.calls,
+            format_millis(set_index.nanos),
+        );
+
+        if let Some(top) = format_top_cell_at_index(&table) {
+            log!(
+                "ZombieFarm scroll table 0x{:x} top cell_at_index {}",
+                receiver,
+                top
+            );
+        }
+        if let Some(top) = format_top_interval_map(&table.cell_with_index) {
+            log!(
+                "ZombieFarm scroll table 0x{:x} top cell_with_index {}",
+                receiver,
+                top
+            );
+        }
+        if let Some(top) = format_top_set_index(&table) {
+            log!(
+                "ZombieFarm scroll table 0x{:x} top set_index {}",
+                receiver,
+                top
+            );
+        }
+        for detail in format_top_cell_build(&table) {
+            log!(
+                "ZombieFarm scroll table 0x{:x} cell_build {}",
+                receiver,
+                detail
+            );
+        }
+        for detail in format_top_cell_relayout(&table) {
+            log!(
+                "ZombieFarm scroll table 0x{:x} relayout_build {}",
+                receiver,
+                detail
+            );
+        }
+    }
+
+    if let Some(offsets) = take_scroll_offset_summary() {
+        log!(
+            "ZombieFarm scroll offsets: set_offset={} first=({:.1},{:.1}) last=({:.1},{:.1}) range_x={:.1}..{:.1} range_y={:.1}..{:.1} abs_delta=({:.1},{:.1})",
+            offsets.seen,
+            offsets.first_x,
+            offsets.first_y,
+            offsets.last_x,
+            offsets.last_y,
+            offsets.min_x,
+            offsets.max_x,
+            offsets.min_y,
+            offsets.max_y,
+            offsets.total_abs_dx,
+            offsets.total_abs_dy
+        );
+    }
 }
 
 fn push_recent(recent: &mut VecDeque<String>, line: String) {
@@ -1078,9 +1833,84 @@ pub fn write_cocos_node_detail(
         cocos_node_summary(env, node)
     )?;
     dump_texture_debug_ivars(env, writer, node, depth + 1)?;
+    writeln!(writer, "{indent}Parent chain:")?;
+    dump_cocos_parent_chain(env, writer, node, depth + 1)?;
+    if let Some(container) = nearest_cocos_cell_container(env, node) {
+        writeln!(writer, "{indent}Nearest cell container subtree:")?;
+        let mut subtree_visited = Vec::new();
+        dump_cocos_node(env, writer, container, depth + 1, &mut subtree_visited)?;
+    }
+    writeln!(writer, "{indent}Children:")?;
+    let mut child_visited = Vec::new();
+    dump_cocos_node(env, writer, node, depth + 1, &mut child_visited)?;
     writeln!(writer, "{indent}Text scan:")?;
     let mut visited = Vec::new();
     dump_cocos_text_scan(env, writer, node, depth + 1, 4, &mut visited)
+}
+
+fn dump_cocos_parent_chain(
+    env: &mut Environment,
+    writer: &mut dyn Write,
+    node: id,
+    depth: usize,
+) -> IoResult<()> {
+    let mut current = node;
+    let mut visited = Vec::new();
+    for level in 0..12 {
+        if current == nil || debug_object_class(env, current).is_none() {
+            break;
+        }
+        let current_bits = current.to_bits();
+        let indent = "  ".repeat(depth);
+        if visited.contains(&current_bits) {
+            writeln!(writer, "{indent}[{level}] 0x{current_bits:x} <cycle>")?;
+            break;
+        }
+        visited.push(current_bits);
+        writeln!(
+            writer,
+            "{indent}[{level}] 0x{current_bits:x} {} {}",
+            debug_class_name(env, current),
+            cocos_node_summary(env, current)
+        )?;
+
+        let Some(parent) = read_object_ivar(env, current, "parent_") else {
+            break;
+        };
+        if parent == nil {
+            break;
+        }
+        current = parent;
+    }
+    Ok(())
+}
+
+fn nearest_cocos_cell_container(env: &Environment, node: id) -> Option<id> {
+    let mut current = node;
+    let mut visited = Vec::new();
+    for _ in 0..16 {
+        if current == nil || debug_object_class(env, current).is_none() {
+            return None;
+        }
+        let bits = current.to_bits();
+        if visited.contains(&bits) {
+            return None;
+        }
+        visited.push(bits);
+
+        if debug_class_name(env, current) == "CCColorLayer" {
+            return Some(current);
+        }
+
+        let Some(parent) = read_object_ivar(env, current, "parent_") else {
+            return None;
+        };
+        if parent == nil {
+            return None;
+        }
+        current = parent;
+    }
+    None
 }
 
 pub fn write_nearby_cocos_text(

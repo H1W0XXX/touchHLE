@@ -808,6 +808,470 @@ fn zombie_farm_sync_operations() -> &'static Mutex<HashMap<u32, ZombieFarmSyncOp
     ZOMBIE_FARM_SYNC_OPERATIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[derive(Default)]
+struct ZombieFarmMultiColumnReuseTable {
+    cell_to_index: HashMap<u32, u32>,
+    reusable_by_index: HashMap<u32, u32>,
+}
+
+#[derive(Default)]
+struct ZombieFarmMultiColumnReuseState {
+    current_requests: Vec<(u32, u32)>,
+    tables: HashMap<u32, ZombieFarmMultiColumnReuseTable>,
+}
+
+#[derive(Default)]
+struct ZombieFarmZombieCellState {
+    current_assignments: Vec<(u32, u32)>,
+    last_zombie_by_cell: HashMap<u32, u32>,
+    last_zombie_key_by_cell: HashMap<u32, String>,
+}
+
+static ZOMBIE_FARM_MULTICOLUMN_REUSE: OnceLock<Mutex<ZombieFarmMultiColumnReuseState>> =
+    OnceLock::new();
+static ZOMBIE_FARM_ZOMBIE_CELL_STATE: OnceLock<Mutex<ZombieFarmZombieCellState>> = OnceLock::new();
+static ZOMBIE_FARM_SELECTOR_DUMPS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static ZOMBIE_FARM_SELECTION_MENU_PRELOADED: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+static ZOMBIE_FARM_SELECTION_MENU_PRELOAD_IN_PROGRESS: OnceLock<Mutex<HashSet<u32>>> =
+    OnceLock::new();
+
+fn zombie_farm_multicolumn_reuse_state() -> &'static Mutex<ZombieFarmMultiColumnReuseState> {
+    ZOMBIE_FARM_MULTICOLUMN_REUSE
+        .get_or_init(|| Mutex::new(ZombieFarmMultiColumnReuseState::default()))
+}
+
+fn zombie_farm_zombie_cell_state() -> &'static Mutex<ZombieFarmZombieCellState> {
+    ZOMBIE_FARM_ZOMBIE_CELL_STATE.get_or_init(|| Mutex::new(ZombieFarmZombieCellState::default()))
+}
+
+fn zombie_farm_selector_dumps() -> &'static Mutex<HashSet<String>> {
+    ZOMBIE_FARM_SELECTOR_DUMPS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn zombie_farm_selection_menu_preloaded() -> &'static Mutex<HashSet<u32>> {
+    ZOMBIE_FARM_SELECTION_MENU_PRELOADED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn zombie_farm_selection_menu_preload_in_progress() -> &'static Mutex<HashSet<u32>> {
+    ZOMBIE_FARM_SELECTION_MENU_PRELOAD_IN_PROGRESS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn zombie_farm_supports_index_cached_reuse(env: &Environment, table: id) -> bool {
+    if table == nil {
+        return false;
+    }
+    let class = ObjC::read_isa(table, &env.mem);
+    class != nil
+        && matches!(
+            env.objc.try_get_class_name(class),
+            Some("CCTableView" | "CCMultiColumnTableView")
+        )
+}
+
+fn zombie_farm_is_selection_menu_table(env: &Environment, table: id) -> bool {
+    if table == nil {
+        return false;
+    }
+    let Some(parent) = zombie_farm_read_object_ivar(env, table, "parent_") else {
+        return false;
+    };
+    zombie_farm_object_class_name(env, parent) == Some("ZFZombieSelectionMenu")
+}
+
+fn zombie_farm_clear_selection_menu_preload_state(table_bits: u32) {
+    zombie_farm_selection_menu_preloaded()
+        .lock()
+        .unwrap()
+        .remove(&table_bits);
+    zombie_farm_selection_menu_preload_in_progress()
+        .lock()
+        .unwrap()
+        .remove(&table_bits);
+}
+
+fn zombie_farm_begin_multicolumn_cell_request(
+    env: &Environment,
+    selector_name: &str,
+    regs: &[u32; 16],
+) -> bool {
+    if selector_name != "table:cellAtIndex:" {
+        return false;
+    }
+    let table = id::from_bits(regs[2]);
+    if !zombie_farm_supports_index_cached_reuse(env, table) {
+        return false;
+    }
+    zombie_farm_multicolumn_reuse_state()
+        .lock()
+        .unwrap()
+        .current_requests
+        .push((table.to_bits(), regs[3]));
+    log!(
+        "ZombieFarm cache trace: begin request table=0x{:x} index={}",
+        table.to_bits(),
+        regs[3]
+    );
+    true
+}
+
+fn zombie_farm_end_multicolumn_cell_request(started: bool) {
+    if !started {
+        return;
+    }
+    let mut state = zombie_farm_multicolumn_reuse_state().lock().unwrap();
+    let popped = state.current_requests.pop();
+    log!("ZombieFarm cache trace: end request popped={popped:?}");
+}
+
+fn zombie_farm_current_multicolumn_request(table_bits: u32) -> Option<u32> {
+    let state = zombie_farm_multicolumn_reuse_state().lock().unwrap();
+    state
+        .current_requests
+        .iter()
+        .rev()
+        .find_map(|&(table, index)| (table == table_bits).then_some(index))
+}
+
+fn zombie_farm_clear_multicolumn_table_cache(table_bits: u32) {
+    let mut state = zombie_farm_multicolumn_reuse_state().lock().unwrap();
+    state.tables.remove(&table_bits);
+    state
+        .current_requests
+        .retain(|&(table, _)| table != table_bits);
+    zombie_farm_clear_selection_menu_preload_state(table_bits);
+}
+
+fn zombie_farm_note_multicolumn_cell_assignment(table_bits: u32, index: u32, cell_bits: u32) {
+    let mut state = zombie_farm_multicolumn_reuse_state().lock().unwrap();
+    let table = state.tables.entry(table_bits).or_default();
+    table.cell_to_index.insert(cell_bits, index);
+    table
+        .reusable_by_index
+        .retain(|_, cached_cell| *cached_cell != cell_bits);
+    log!(
+        "ZombieFarm cache trace: assign table=0x{:x} index={} cell=0x{:x}",
+        table_bits,
+        index,
+        cell_bits
+    );
+}
+
+fn zombie_farm_note_multicolumn_cell_offscreen(table_bits: u32, cell_bits: u32) {
+    let mut state = zombie_farm_multicolumn_reuse_state().lock().unwrap();
+    let Some(table) = state.tables.get_mut(&table_bits) else {
+        log!(
+            "ZombieFarm cache trace: offscreen table=0x{:x} cell=0x{:x} missing table state",
+            table_bits,
+            cell_bits
+        );
+        return;
+    };
+    let Some(&index) = table.cell_to_index.get(&cell_bits) else {
+        log!(
+            "ZombieFarm cache trace: offscreen table=0x{:x} cell=0x{:x} missing index mapping",
+            table_bits,
+            cell_bits
+        );
+        return;
+    };
+    table.reusable_by_index.insert(index, cell_bits);
+    log!(
+        "ZombieFarm cache trace: offscreen table=0x{:x} index={} cached_cell=0x{:x}",
+        table_bits,
+        index,
+        cell_bits
+    );
+}
+
+fn zombie_farm_take_multicolumn_cached_cell(table_bits: u32, index: u32) -> Option<id> {
+    let mut state = zombie_farm_multicolumn_reuse_state().lock().unwrap();
+    let Some(table) = state.tables.get_mut(&table_bits) else {
+        log!(
+            "ZombieFarm cache trace: take table=0x{:x} index={} no table state",
+            table_bits,
+            index
+        );
+        return None;
+    };
+    let Some(cell_bits) = table.reusable_by_index.remove(&index) else {
+        log!(
+            "ZombieFarm cache trace: take table=0x{:x} index={} no cached cell",
+            table_bits,
+            index
+        );
+        return None;
+    };
+    let matches = table.cell_to_index.get(&cell_bits).copied() == Some(index);
+    log!(
+        "ZombieFarm cache trace: take table=0x{:x} index={} cell=0x{:x} matches={}",
+        table_bits,
+        index,
+        cell_bits,
+        matches
+    );
+    matches.then(|| id::from_bits(cell_bits))
+}
+
+fn zombie_farm_preload_selection_menu_table(env: &mut Environment, table: id) {
+    if !zombie_farm_is_selection_menu_table(env, table) {
+        return;
+    }
+
+    let table_bits = table.to_bits();
+    if zombie_farm_selection_menu_preloaded()
+        .lock()
+        .unwrap()
+        .contains(&table_bits)
+    {
+        return;
+    }
+    {
+        let mut in_progress = zombie_farm_selection_menu_preload_in_progress()
+            .lock()
+            .unwrap();
+        if !in_progress.insert(table_bits) {
+            return;
+        }
+    }
+
+    let regs = *env.cpu.regs();
+    let result = (|| {
+        let data_source = zombie_farm_get_id_if_responds(env, table, "dataSource")?;
+        let number_selector = env.objc.lookup_selector("numberOfCellsInTable:")?;
+        let cell_selector = env.objc.lookup_selector("table:cellAtIndex:")?;
+        let set_index_selector = env.objc.lookup_selector("_setIndex:forCell:")?;
+        let add_selector = env.objc.lookup_selector("_addCellIfNecessary:")?;
+        let existing_selector = env.objc.lookup_selector("cellWithIndex:")?;
+
+        if !env
+            .objc
+            .object_has_method(&env.mem, data_source, number_selector)
+            || !env
+                .objc
+                .object_has_method(&env.mem, data_source, cell_selector)
+            || !env.objc.object_has_method(&env.mem, table, set_index_selector)
+            || !env.objc.object_has_method(&env.mem, table, add_selector)
+            || !env.objc.object_has_method(&env.mem, table, existing_selector)
+        {
+            return None;
+        }
+
+        let count: NSUInteger = msg_send_no_type_checking(env, (data_source, number_selector, table));
+        let mut built = 0usize;
+        let mut reused = 0usize;
+        for index in 0..count {
+            let existing: id = msg_send_no_type_checking(env, (table, existing_selector, index));
+            if existing != nil {
+                reused += 1;
+                continue;
+            }
+            let cell: id = msg_send_no_type_checking(env, (data_source, cell_selector, table, index));
+            if cell == nil {
+                continue;
+            }
+            let _: () = msg_send_no_type_checking(env, (table, set_index_selector, index, cell));
+            let _: () = msg_send_no_type_checking(env, (table, add_selector, cell));
+            built += 1;
+        }
+        Some((count, built, reused))
+    })();
+    env.cpu.regs_mut().copy_from_slice(&regs);
+
+    zombie_farm_selection_menu_preload_in_progress()
+        .lock()
+        .unwrap()
+        .remove(&table_bits);
+    if let Some((count, built, reused)) = result {
+        zombie_farm_selection_menu_preloaded()
+            .lock()
+            .unwrap()
+            .insert(table_bits);
+        log!(
+            "ZombieFarm preload trace: preloaded selection menu table=0x{:x} count={} built={} existing={}",
+            table_bits,
+            count,
+            built,
+            reused
+        );
+    }
+}
+
+fn zombie_farm_find_cell_zombie_actor(env: &mut Environment, cell: id) -> Option<id> {
+    ["cellActor", "actor", "zombieActor"]
+        .into_iter()
+        .find_map(|selector_name| zombie_farm_get_id_if_responds(env, cell, selector_name))
+        .or_else(|| {
+            ["node", "cellLayer", "cellLayer2"]
+                .into_iter()
+                .find_map(|selector_name| zombie_farm_get_id_if_responds(env, cell, selector_name))
+                .and_then(|container| {
+                    let children = zombie_farm_read_object_ivar(env, container, "children_")
+                        .or_else(|| zombie_farm_get_id_if_responds(env, container, "children"))?;
+                    let count = zombie_farm_get_array_count(env, children)?;
+                    (0..count).find_map(|idx| {
+                        let child = zombie_farm_get_array_object_at_index(env, children, idx)?;
+                        zombie_farm_actor_is_zombie(env, child).then_some(child)
+                    })
+                })
+        })
+}
+
+fn zombie_farm_should_dump_selectors_for_class(class_name: &str) -> bool {
+    let lower = class_name.to_ascii_lowercase();
+    class_name.starts_with("ZombieActor")
+        || class_name == "ActorAttachment"
+        || zombie_farm_is_zombie_cell_class_name(class_name)
+        || lower.contains("attachment")
+}
+
+fn zombie_farm_log_class_selectors_once(env: &Environment, object: id, reason: &str) {
+    if !zombie_farm_object_pointer_looks_valid(env, object) {
+        return;
+    }
+    let class = ObjC::read_isa(object, &env.mem);
+    if class == nil {
+        return;
+    }
+    let Some(class_name) = env.objc.try_get_class_name(class) else {
+        return;
+    };
+    if !zombie_farm_should_dump_selectors_for_class(class_name) {
+        return;
+    }
+
+    let dump_key = format!("{class_name}::{reason}");
+    {
+        let mut dumped = zombie_farm_selector_dumps().lock().unwrap();
+        if !dumped.insert(dump_key) {
+            return;
+        }
+    }
+
+    let mut selectors = env.objc.debug_all_class_selectors_as_strings(&env.mem, class);
+    selectors.sort();
+    selectors.dedup();
+
+    let interesting_keywords = [
+        "attach",
+        "sprite",
+        "frame",
+        "anim",
+        "update",
+        "layout",
+        "refresh",
+        "display",
+        "offset",
+        "point",
+        "position",
+        "scale",
+        "rotation",
+        "cell",
+        "zombie",
+    ];
+    let interesting: Vec<_> = selectors
+        .iter()
+        .filter(|selector| {
+            let lower = selector.to_ascii_lowercase();
+            interesting_keywords
+                .iter()
+                .any(|keyword| lower.contains(keyword))
+        })
+        .cloned()
+        .collect();
+
+    log!(
+        "ZombieFarm selector dump [{}] class={} object={:?} selector_count={} interesting={}",
+        reason,
+        class_name,
+        object,
+        selectors.len(),
+        if interesting.is_empty() {
+            "<none>".to_string()
+        } else {
+            interesting.join(" ")
+        }
+    );
+    for chunk in selectors.chunks(24) {
+        log!(
+            "ZombieFarm selector dump [{}] class={} selectors {}",
+            reason,
+            class_name,
+            chunk.join(" ")
+        );
+    }
+}
+
+fn zombie_farm_is_zombie_cell_class_name(class_name: &str) -> bool {
+    class_name == "ZFZombieCell" || class_name.ends_with("ZombieCell")
+}
+
+fn zombie_farm_begin_zombie_cell_assignment(
+    env: &Environment,
+    receiver: id,
+    selector_name: &str,
+    regs: &[u32; 16],
+) -> bool {
+    if selector_name != "setZombie:" || receiver == nil {
+        return false;
+    }
+    let class = ObjC::read_isa(receiver, &env.mem);
+    let Some(class_name) = env.objc.try_get_class_name(class) else {
+        return false;
+    };
+    let class_name = class_name.to_string();
+    if !zombie_farm_is_zombie_cell_class_name(&class_name) {
+        return false;
+    }
+    zombie_farm_zombie_cell_state()
+        .lock()
+        .unwrap()
+        .current_assignments
+        .push((receiver.to_bits(), regs[2]));
+    true
+}
+
+fn zombie_farm_finish_zombie_cell_assignment(env: &mut Environment, started: bool, receiver: id) {
+    if !started || receiver == nil {
+        return;
+    }
+    let assignment = {
+        let mut state = zombie_farm_zombie_cell_state().lock().unwrap();
+        state.current_assignments.pop()
+    };
+    let Some((cell_bits, zombie_bits)) = assignment else {
+        return;
+    };
+    if cell_bits != receiver.to_bits() {
+        return;
+    }
+    let zombie_key = zombie_farm_zombie_identity_key(env, id::from_bits(zombie_bits));
+    let mut state = zombie_farm_zombie_cell_state().lock().unwrap();
+    if zombie_bits == 0 {
+        state.last_zombie_by_cell.remove(&cell_bits);
+        state.last_zombie_key_by_cell.remove(&cell_bits);
+    } else {
+        state.last_zombie_by_cell.insert(cell_bits, zombie_bits);
+        if let Some(zombie_key) = zombie_key {
+            state.last_zombie_key_by_cell.insert(cell_bits, zombie_key);
+        } else {
+            state.last_zombie_key_by_cell.remove(&cell_bits);
+        }
+    }
+}
+
+fn zombie_farm_clear_zombie_cell_assignment(receiver: id) {
+    if receiver == nil {
+        return;
+    }
+    let mut state = zombie_farm_zombie_cell_state().lock().unwrap();
+    let cell_bits = receiver.to_bits();
+    state.last_zombie_by_cell.remove(&cell_bits);
+    state.last_zombie_key_by_cell.remove(&cell_bits);
+    state
+        .current_assignments
+        .retain(|&(cell, _)| cell != cell_bits);
+}
+
 fn zombie_farm_send_noarg_if_responds(
     env: &mut Environment,
     receiver: id,
@@ -1001,6 +1465,57 @@ fn zombie_farm_get_i32_property(
         }
     }
     None
+}
+
+fn zombie_farm_get_string_if_responds(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> Option<String> {
+    let value = zombie_farm_get_id_if_responds(env, receiver, selector_name)?;
+    Some(ns_string::to_rust_string(env, value).to_string())
+}
+
+fn zombie_farm_get_u32_if_responds(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> Option<u32> {
+    if receiver == nil {
+        return None;
+    }
+    let selector = env.objc.lookup_selector(selector_name)?;
+    if !env.objc.object_has_method(&env.mem, receiver, selector) {
+        return None;
+    }
+    let regs = *env.cpu.regs();
+    let value: u32 = msg_send_no_type_checking(env, (receiver, selector));
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    Some(value)
+}
+
+fn zombie_farm_zombie_identity_key(env: &mut Environment, zombie: id) -> Option<String> {
+    if zombie == nil {
+        return None;
+    }
+    let class = ObjC::read_isa(zombie, &env.mem);
+    let class_name = env.objc.try_get_class_name(class).unwrap_or("unknown");
+    let mut parts = vec![class_name.to_string()];
+
+    if let Some(name) = zombie_farm_get_string_if_responds(env, zombie, "name") {
+        parts.push(format!("name={name}"));
+    }
+    if let Some(idx) = zombie_farm_get_u32_if_responds(env, zombie, "idx") {
+        parts.push(format!("idx={idx}"));
+    }
+    if let Some(number) = zombie_farm_get_u32_if_responds(env, zombie, "number") {
+        parts.push(format!("number={number}"));
+    }
+    if let Some(place) = zombie_farm_get_u32_if_responds(env, zombie, "place") {
+        parts.push(format!("place={place}"));
+    }
+
+    (parts.len() > 1).then(|| parts.join("|"))
 }
 
 fn zombie_farm_get_bool_property(
@@ -1809,7 +2324,10 @@ fn zombie_farm_replay_loot_item_notifications_from_inventory(
 
         let item_names =
             zombie_farm_collect_loot_item_requirement_names_from_description(&description);
-        if item_names.iter().any(|item_name| item_name.contains("Circus Flag")) {
+        if item_names
+            .iter()
+            .any(|item_name| item_name.contains("Circus Flag"))
+        {
             log!(
                 "ZombieFarm workaround: quest inventory replay parsed circus loot items from quest {}: {:?}",
                 quest_idx,
@@ -1831,17 +2349,15 @@ fn zombie_farm_replay_loot_item_notifications_from_inventory(
                 item_name_ns,
             );
             let storage_key = zombie_farm_storage_key_for_display_name(env, &item_name);
-            let owned_count_storage_key_raw = storage_key
-                .as_ref()
-                .and_then(|storage_key| {
-                    let storage_key_ns = ns_string::from_rust_string(env, storage_key.clone());
-                    zombie_farm_get_i32_arg_result_if_responds(
-                        env,
-                        game_data,
-                        "numberOfItemInStorageWithKey:",
-                        storage_key_ns,
-                    )
-                });
+            let owned_count_storage_key_raw = storage_key.as_ref().and_then(|storage_key| {
+                let storage_key_ns = ns_string::from_rust_string(env, storage_key.clone());
+                zombie_farm_get_i32_arg_result_if_responds(
+                    env,
+                    game_data,
+                    "numberOfItemInStorageWithKey:",
+                    storage_key_ns,
+                )
+            });
             let owned_count_display_name = owned_count_display_name_raw.unwrap_or(0);
             let owned_count_storage_key = owned_count_storage_key_raw.unwrap_or(0);
             let owned_count = owned_count_display_name.max(owned_count_storage_key);
@@ -4744,13 +5260,54 @@ fn zombie_farm_disable_cctable_cell_reuse(
     let Some(class_name) = env.objc.try_get_class_name(class) else {
         return false;
     };
+    let class_name = class_name.to_string();
     if !class_name.contains("TableView") {
         return false;
     }
 
+    if zombie_farm_is_selection_menu_table(env, receiver) {
+        crate::zombie_farm_debug::record_table_object_return(
+            receiver,
+            &class_name,
+            selector_name,
+            nil,
+            None,
+        );
+        env.cpu.regs_mut()[0] = nil.to_bits();
+        return true;
+    }
+
+    if matches!(class_name.as_str(), "CCTableView" | "CCMultiColumnTableView") {
+        let table_bits = receiver.to_bits();
+        if let Some(index) = zombie_farm_current_multicolumn_request(table_bits) {
+            if let Some(cell) = zombie_farm_take_multicolumn_cached_cell(table_bits, index) {
+                zombie_farm_log_cached_cell_reuse_candidates(
+                    env,
+                    receiver,
+                    index,
+                    cell,
+                    "dequeueCell",
+                );
+                crate::zombie_farm_debug::record_table_object_return(
+                    receiver,
+                    &class_name,
+                    selector_name,
+                    cell,
+                    zombie_farm_object_class_name(env, cell),
+                );
+                crate::zombie_farm_debug::record_layout_event(format!(
+                    "[0x{:x} {} dequeueCell] reused cached row index {} cell {:?}",
+                    table_bits, class_name, index, cell
+                ));
+                env.cpu.regs_mut()[0] = cell.to_bits();
+                return true;
+            }
+        }
+    }
+
     crate::zombie_farm_debug::record_table_object_return(
         receiver,
-        class_name,
+        &class_name,
         selector_name,
         nil,
         None,
@@ -4761,6 +5318,22 @@ fn zombie_farm_disable_cctable_cell_reuse(
         class_name
     ));
     env.cpu.regs_mut()[0] = nil.to_bits();
+    true
+}
+
+fn zombie_farm_skip_selection_menu_cell_recycle(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if selector_name != "_moveCellOutOfSight:"
+        || receiver == nil
+        || !zombie_farm_uses_playforge_bundle(env)
+        || !zombie_farm_is_selection_menu_table(env, receiver)
+    {
+        return false;
+    }
+    env.cpu.regs_mut()[0] = 0;
     true
 }
 
@@ -4794,17 +5367,9 @@ fn zombie_farm_cell_content_size_override(
     }
     let class_name = class_name.to_string();
 
-    let Some(cell_size_selector) = env.objc.lookup_selector("cellSize") else {
+    let Some(cell_size) = zombie_farm_cell_size(env, receiver) else {
         return false;
     };
-    if !env
-        .objc
-        .object_has_method(&env.mem, class, cell_size_selector)
-    {
-        return false;
-    }
-
-    let cell_size: CGSize = msg_send_no_type_checking(env, (class, cell_size_selector));
     env.mem.write(stret.cast(), cell_size);
     log_dbg!(
         "ZombieFarm workaround: [{} contentSize] -> class cellSize {}",
@@ -4829,6 +5394,7 @@ fn zombie_farm_prepare_cctable_cell(env: &mut Environment, receiver: id, selecto
     let Some(table_class_name) = env.objc.try_get_class_name(table_class) else {
         return;
     };
+    let table_class_name = table_class_name.to_string();
     if !table_class_name.contains("TableView") {
         return;
     }
@@ -4849,57 +5415,307 @@ fn zombie_farm_prepare_cctable_cell(env: &mut Environment, receiver: id, selecto
     };
     let cell_class_name = cell_class_name.to_string();
 
-    let Some(cell_size_selector) = env.objc.lookup_selector("cellSize") else {
-        return;
-    };
-    if !env
-        .objc
-        .object_has_method(&env.mem, cell_class, cell_size_selector)
-    {
-        return;
-    }
     let Some(set_content_size_selector) = env.objc.lookup_selector("setContentSize:") else {
         return;
     };
 
-    let cell_size: CGSize = msg_send_no_type_checking(env, (cell_class, cell_size_selector));
+    let Some(cell_size) = zombie_farm_cell_size(env, cell) else {
+        return;
+    };
 
-    if env
-        .objc
-        .object_has_method(&env.mem, cell_class, set_content_size_selector)
-    {
-        let _: () = msg_send_no_type_checking(env, (cell, set_content_size_selector, cell_size));
+    let mut synced_objects = Vec::new();
+    zombie_farm_sync_cell_container_size(
+        env,
+        cell,
+        set_content_size_selector,
+        cell_size,
+        &mut synced_objects,
+    );
+
+    let mut primary_node = nil;
+    for selector_name in ["node", "cellLayer", "cellLayer2"] {
+        let Some(container) = zombie_farm_get_id_if_responds(env, cell, selector_name) else {
+            continue;
+        };
+        if container == nil {
+            continue;
+        }
+        if selector_name == "node" {
+            primary_node = container;
+        }
+        if synced_objects
+            .iter()
+            .copied()
+            .any(|bits| bits == container.to_bits())
+        {
+            continue;
+        }
+        zombie_farm_sync_cell_container_size(
+            env,
+            container,
+            set_content_size_selector,
+            cell_size,
+            &mut synced_objects,
+        );
+        if selector_name != "node" {
+            zombie_farm_reset_cell_container_position(env, container);
+        }
     }
 
-    let node = if let Some(node_selector) = env.objc.lookup_selector("node") {
-        if env.objc.object_has_method(&env.mem, cell, node_selector) {
-            msg_send_no_type_checking(env, (cell, node_selector))
-        } else {
-            nil
-        }
-    } else {
-        nil
-    };
-    if node != nil {
-        let node_class = ObjC::read_isa(node, &env.mem);
-        if node_class != nil
-            && env
-                .objc
-                .object_has_method(&env.mem, node_class, set_content_size_selector)
-        {
-            let _: () =
-                msg_send_no_type_checking(env, (node, set_content_size_selector, cell_size));
-        }
+    if matches!(
+        table_class_name.as_str(),
+        "CCTableView" | "CCMultiColumnTableView"
+    ) {
+        zombie_farm_note_multicolumn_cell_assignment(receiver.to_bits(), index, cell.to_bits());
+        zombie_farm_log_cached_cell_reuse_candidates(
+            env,
+            receiver,
+            index,
+            cell,
+            "_setIndex:forCell:",
+        );
     }
 
     log_dbg!(
-        "ZombieFarm workaround: prepared {} index {} cell {:?} node {:?} contentSize={}",
+        "ZombieFarm workaround: prepared {} index {} cell {:?} node {:?} contentSize={} synced={:?}",
         cell_class_name,
         index,
         cell,
-        node,
+        primary_node,
         cell_size
+        ,
+        synced_objects
     );
+}
+
+fn zombie_farm_sync_cell_container_size(
+    env: &mut Environment,
+    object: id,
+    set_content_size_selector: SEL,
+    cell_size: CGSize,
+    synced_objects: &mut Vec<u32>,
+) {
+    if object == nil {
+        return;
+    }
+    let object_class = ObjC::read_isa(object, &env.mem);
+    if object_class == nil
+        || !env
+            .objc
+            .object_has_method(&env.mem, object_class, set_content_size_selector)
+    {
+        return;
+    }
+    let _: () = msg_send_no_type_checking(env, (object, set_content_size_selector, cell_size));
+    synced_objects.push(object.to_bits());
+}
+
+fn zombie_farm_reset_cell_container_position(env: &mut Environment, object: id) {
+    if object == nil {
+        return;
+    }
+    let Some(position_selector) = env.objc.lookup_selector("position") else {
+        return;
+    };
+    let Some(set_position_selector) = env.objc.lookup_selector("setPosition:") else {
+        return;
+    };
+    if !env.objc.object_has_method(&env.mem, object, position_selector)
+        || !env
+            .objc
+            .object_has_method(&env.mem, object, set_position_selector)
+    {
+        return;
+    }
+
+    let position: CGPoint = msg_send_no_type_checking(env, (object, position_selector));
+    if position.x.abs() <= 0.5 && position.y.abs() <= 0.5 {
+        return;
+    }
+
+    let _: () = msg_send_no_type_checking(env, (object, set_position_selector, CGPoint::default()));
+}
+
+fn zombie_farm_cell_size(env: &mut Environment, cell: id) -> Option<CGSize> {
+    if cell == nil {
+        return None;
+    }
+    let cell_size_selector = env.objc.lookup_selector("cellSize")?;
+
+    if env.objc.object_has_method(&env.mem, cell, cell_size_selector) {
+        return Some(msg_send_no_type_checking(env, (cell, cell_size_selector)));
+    }
+
+    let cell_class = ObjC::read_isa(cell, &env.mem);
+    if cell_class != nil && env.objc.object_has_method(&env.mem, cell_class, cell_size_selector) {
+        return Some(msg_send_no_type_checking(env, (cell_class, cell_size_selector)));
+    }
+
+    None
+}
+
+fn zombie_farm_prepare_multicolumn_table_reuse(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) {
+    if !env
+        .bundle
+        .bundle_identifier()
+        .starts_with("com.playforge.Z")
+        || receiver == nil
+        || !zombie_farm_supports_index_cached_reuse(env, receiver)
+    {
+        return;
+    }
+
+    if zombie_farm_is_selection_menu_table(env, receiver)
+        && matches!(selector_name, "reloadData" | "setDataSource:")
+    {
+        zombie_farm_clear_selection_menu_preload_state(receiver.to_bits());
+        zombie_farm_preload_selection_menu_table(env, receiver);
+        return;
+    }
+
+    match selector_name {
+        "_moveCellOutOfSight:" => {
+            let cell = id::from_bits(env.cpu.regs()[2]);
+            if cell != nil {
+                zombie_farm_note_multicolumn_cell_offscreen(receiver.to_bits(), cell.to_bits());
+            }
+        }
+        "reloadData" | "setDataSource:" | "dealloc" => {
+            zombie_farm_clear_multicolumn_table_cache(receiver.to_bits());
+        }
+        _ => {}
+    }
+}
+
+fn zombie_farm_relayout_actor_attachments(_env: &mut Environment, _cell: id) -> bool {
+    false
+}
+
+fn zombie_farm_log_reuse_relayout_candidates(env: &mut Environment, cell: id) {
+    zombie_farm_log_class_selectors_once(env, cell, "zombie-cell-reuse");
+
+    let actor = zombie_farm_find_cell_zombie_actor(env, cell);
+    let Some(actor) = actor else {
+        return;
+    };
+    zombie_farm_log_class_selectors_once(env, actor, "zombie-cell-reuse-actor");
+
+    let Some(attachments) = zombie_farm_read_object_ivar(env, actor, "attachments") else {
+        return;
+    };
+    let Some(count) = zombie_farm_get_array_count(env, attachments) else {
+        return;
+    };
+    for idx in 0..count.min(8) {
+        let Some(attachment) = zombie_farm_get_array_object_at_index(env, attachments, idx) else {
+            continue;
+        };
+        if zombie_farm_object_class_name(env, attachment) == Some("ActorAttachment") {
+            zombie_farm_log_class_selectors_once(
+                env,
+                attachment,
+                "zombie-cell-reuse-attachment",
+            );
+            break;
+        }
+    }
+}
+
+fn zombie_farm_log_cached_cell_reuse_candidates(
+    env: &mut Environment,
+    table: id,
+    index: u32,
+    cell: id,
+    reason: &str,
+) {
+    crate::zombie_farm_debug::record_layout_event(format!(
+        "[0x{:x} cached cell reuse] table {:?} index {} cell {:?} reason={}",
+        table.to_bits(),
+        table,
+        index,
+        cell,
+        reason
+    ));
+    zombie_farm_log_class_selectors_once(env, table, "cached-table-reuse");
+    zombie_farm_log_reuse_relayout_candidates(env, cell);
+}
+
+fn zombie_farm_skip_redundant_zombie_cell_rebuild(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if !env
+        .bundle
+        .bundle_identifier()
+        .starts_with("com.playforge.Z")
+        || receiver == nil
+    {
+        return false;
+    }
+
+    if selector_name == "dealloc" {
+        zombie_farm_clear_zombie_cell_assignment(receiver);
+        return false;
+    }
+    if selector_name != "setZombie:" {
+        return false;
+    }
+
+    let class = ObjC::read_isa(receiver, &env.mem);
+    let Some(class_name) = env.objc.try_get_class_name(class) else {
+        return false;
+    };
+    let class_name = class_name.to_string();
+    if !zombie_farm_is_zombie_cell_class_name(&class_name) {
+        return false;
+    }
+
+    let zombie = id::from_bits(env.cpu.regs()[2]);
+    if zombie == nil {
+        return false;
+    }
+
+    let current_visual = zombie_farm_get_id_if_responds(env, receiver, "cellLayer")
+        .or_else(|| zombie_farm_get_id_if_responds(env, receiver, "node"));
+    let Some(current_visual) = current_visual else {
+        return false;
+    };
+    if current_visual == nil {
+        return false;
+    }
+
+    let receiver_bits = receiver.to_bits();
+    let zombie_key = zombie_farm_zombie_identity_key(env, zombie);
+    let state = zombie_farm_zombie_cell_state().lock().unwrap();
+    let cached_same =
+        state.last_zombie_by_cell.get(&receiver_bits).copied() == Some(zombie.to_bits());
+    let cached_same_key = zombie_key
+        .as_ref()
+        .is_some_and(|key| state.last_zombie_key_by_cell.get(&receiver_bits) == Some(key));
+    drop(state);
+    let current_same = {
+        let current_zombie = zombie_farm_get_id_if_responds(env, receiver, "zombie")
+            .or_else(|| zombie_farm_get_id_if_responds(env, receiver, "currentZombie"));
+        current_zombie.is_some_and(|current| current == zombie)
+    };
+    if !cached_same && !cached_same_key && !current_same {
+        return false;
+    }
+
+    zombie_farm_log_reuse_relayout_candidates(env, receiver);
+    let relaid_out = zombie_farm_relayout_actor_attachments(env, receiver);
+
+    crate::zombie_farm_debug::record_layout_event(format!(
+        "[0x{:x} {} setZombie:] skipped redundant rebuild for zombie {:?} key={:?} visual {:?} relayout={}",
+        receiver_bits, class_name, zombie, zombie_key, current_visual, relaid_out
+    ));
+    env.cpu.regs_mut()[0] = 0;
+    true
 }
 
 /// The core implementation of `objc_msgSend`, the main function of Objective-C.
@@ -4972,10 +5788,7 @@ fn objc_msgSend_inner(
     let orig_class = super2.unwrap_or_else(|| ObjC::read_isa(receiver, &env.mem));
     if orig_class == nil {
         let selector_name = selector.as_str(&env.mem).to_string();
-        if matches!(
-            selector_name.as_str(),
-            "release" | "retain" | "autorelease"
-        ) {
+        if matches!(selector_name.as_str(), "release" | "retain" | "autorelease") {
             log!(
                 "Warning: ignoring {} sent to object {:?} with nil isa",
                 selector_name,
@@ -5024,6 +5837,12 @@ fn objc_msgSend_inner(
     }
     if let Some(result) = zombie_farm_md5sum_override(env, &selector_name) {
         env.cpu.regs_mut()[0] = result.to_bits();
+        return;
+    }
+    if zombie_farm_skip_redundant_zombie_cell_rebuild(env, receiver, &selector_name) {
+        return;
+    }
+    if zombie_farm_skip_selection_menu_cell_recycle(env, receiver, &selector_name) {
         return;
     }
     if zombie_farm_disable_cctable_cell_reuse(env, receiver, &selector_name) {
@@ -5118,6 +5937,7 @@ fn objc_msgSend_inner(
     zombie_farm_prepare_local_hunger_update(env, &selector_name);
     let regs_before_zombie_farm_prepare = *env.cpu.regs();
     zombie_farm_prepare_cctable_cell(env, receiver, selector);
+    zombie_farm_prepare_multicolumn_table_reuse(env, receiver, &selector_name);
     env.cpu
         .regs_mut()
         .copy_from_slice(&regs_before_zombie_farm_prepare);
@@ -5196,8 +6016,9 @@ fn objc_msgSend_inner(
                     .unwrap_or(name)
                     .to_string();
                 let receiver_class_name = receiver_class_name_owned.as_str();
+                let zombie_farm_bundle = zombie_farm_uses_playforge_bundle(env);
                 let zombie_farm_debug_enabled =
-                    zombie_farm_uses_playforge_bundle(env) && crate::zombie_farm_debug::enabled();
+                    zombie_farm_bundle && crate::zombie_farm_debug::enabled();
                 if zombie_farm_debug_enabled {
                     crate::zombie_farm_debug::record_objc_message(
                         receiver,
@@ -5206,14 +6027,26 @@ fn objc_msgSend_inner(
                         env.cpu.regs(),
                     );
                 }
+                let zombie_farm_scroll_profile_bucket =
+                    if zombie_farm_bundle && crate::zombie_farm_debug::scroll_profile_enabled() {
+                        crate::zombie_farm_debug::scroll_profile_bucket(
+                            receiver_class_name,
+                            selector_name,
+                        )
+                        .or_else(|| {
+                            crate::zombie_farm_debug::scroll_profile_bucket(name, selector_name)
+                        })
+                    } else {
+                        None
+                    };
                 let trace_zombie_farm_layout = zombie_farm_debug_enabled
                     && (trace_zombie_farm_layout_message(receiver_class_name, selector_name)
                         || trace_zombie_farm_layout_message(name, selector_name));
-                let trace_zombie_farm_status = zombie_farm_uses_playforge_bundle(env)
+                let trace_zombie_farm_status = zombie_farm_bundle
                     && (zombie_farm_debug_enabled || zombie_farm_status_trace_enabled())
                     && (trace_zombie_farm_status_message(receiver_class_name, selector_name)
                         || trace_zombie_farm_status_message(name, selector_name));
-                let trace_zombie_farm_quest = zombie_farm_uses_playforge_bundle(env)
+                let trace_zombie_farm_quest = zombie_farm_bundle
                     && zombie_farm_quest_trace_enabled()
                     && (trace_zombie_farm_quest_message(receiver_class_name, selector_name)
                         || trace_zombie_farm_quest_message(name, selector_name));
@@ -5237,7 +6070,7 @@ fn objc_msgSend_inner(
                         name,
                         selector_name,
                     ));
-                let record_zombie_farm_cocos_label_text = zombie_farm_uses_playforge_bundle(env)
+                let record_zombie_farm_cocos_label_text = zombie_farm_bundle
                     && (crate::zombie_farm_debug::should_record_cocos_label_text(
                         receiver_class_name,
                         selector_name,
@@ -5341,6 +6174,41 @@ fn objc_msgSend_inner(
                 if trace_zombie_farm_apply_scope {
                     ZOMBIE_FARM_APPLY_TRACE_DEPTH.fetch_add(1, Ordering::Relaxed);
                 }
+                let zombie_farm_scroll_profile = zombie_farm_scroll_profile_bucket.map(|bucket| {
+                    (
+                        crate::zombie_farm_debug::begin_scroll_profile_call(
+                            bucket,
+                            receiver,
+                            receiver_class_name,
+                            selector_name,
+                            env.cpu.regs(),
+                        ),
+                        std::time::Instant::now(),
+                    )
+                });
+                let zombie_farm_cell_build_scope_started = zombie_farm_bundle
+                    && crate::zombie_farm_debug::scroll_profile_enabled()
+                    && crate::zombie_farm_debug::begin_cell_build_scope(
+                        selector_name,
+                        env.cpu.regs(),
+                    );
+                let zombie_farm_multicolumn_request_started = zombie_farm_bundle
+                    && zombie_farm_begin_multicolumn_cell_request(
+                        env,
+                        selector_name,
+                        env.cpu.regs(),
+                    );
+                let zombie_farm_zombie_cell_assignment_started = zombie_farm_bundle
+                    && zombie_farm_begin_zombie_cell_assignment(
+                        env,
+                        receiver,
+                        selector_name,
+                        env.cpu.regs(),
+                    );
+                let zombie_farm_cell_build_profile = (zombie_farm_bundle
+                    && crate::zombie_farm_debug::scroll_profile_enabled()
+                    && crate::zombie_farm_debug::cell_build_scope_active())
+                .then(std::time::Instant::now);
                 match imp {
                     IMP::Host(host_imp) => {
                         // TODO: do type checks when calling GuestIMPs too.
@@ -5376,6 +6244,29 @@ Type mismatch when sending message {} to {:?}!
                     // interfere with pass-through of stack arguments.
                     IMP::Guest(guest_imp) => guest_imp.call_without_pushing_stack_frame(env),
                 }
+                if let Some((call, start)) = zombie_farm_scroll_profile {
+                    crate::zombie_farm_debug::finish_scroll_profile_call(
+                        call,
+                        start.elapsed(),
+                        Some(env.cpu.regs()[0]),
+                    );
+                }
+                if let Some(start) = zombie_farm_cell_build_profile {
+                    crate::zombie_farm_debug::record_cell_build_message(
+                        receiver_class_name,
+                        selector_name,
+                        start.elapsed(),
+                    );
+                }
+                crate::zombie_farm_debug::end_cell_build_scope(
+                    zombie_farm_cell_build_scope_started,
+                );
+                zombie_farm_end_multicolumn_cell_request(zombie_farm_multicolumn_request_started);
+                zombie_farm_finish_zombie_cell_assignment(
+                    env,
+                    zombie_farm_zombie_cell_assignment_started,
+                    receiver,
+                );
                 if trace_zombie_farm_apply_scope {
                     ZOMBIE_FARM_APPLY_TRACE_DEPTH.fetch_sub(1, Ordering::Relaxed);
                 }
