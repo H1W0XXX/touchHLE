@@ -18,7 +18,10 @@
 //! - "Supported Image Formats" in [Loading Images](https://developer.apple.com/library/archive/documentation/2DDrawing/Conceptual/DrawingPrintingiOS/LoadingImages/LoadingImages.html)
 
 use std::ffi::{c_int, c_uchar, CStr};
+use std::io::Cursor;
 
+use tiff::decoder::{Decoder as TiffDecoder, DecodingResult};
+use tiff::ColorType;
 use touchHLE_pvrt_decompress_wrapper::*;
 use touchHLE_stb_image_wrapper::*;
 
@@ -33,6 +36,8 @@ enum PixelStore {
 }
 
 const PNG_MAGIC_NUMBER: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
+const TIFF_LE_MAGIC_NUMBER: [u8; 4] = [0x49, 0x49, 0x2a, 0x00];
+const TIFF_BE_MAGIC_NUMBER: [u8; 4] = [0x4d, 0x4d, 0x00, 0x2a];
 
 impl Image {
     pub fn from_bytes(bytes: &[u8]) -> Result<Image, String> {
@@ -65,7 +70,13 @@ impl Image {
         };
         if pixels.is_null() {
             let reason = unsafe { CStr::from_ptr(stbi_failure_reason()) };
-            return Err(reason.to_str().unwrap().to_string());
+            let reason = reason.to_str().unwrap().to_string();
+            if is_tiff(bytes) {
+                return Image::from_tiff_bytes(bytes).map_err(|tiff_err| {
+                    format!("{reason}; TIFF fallback also failed: {tiff_err}")
+                });
+            }
+            return Err(reason);
         }
 
         let width: u32 = x.try_into().unwrap();
@@ -89,6 +100,56 @@ impl Image {
             pixels: PixelStore::StbImage(pixels),
             dimensions: (width, height),
         })
+    }
+
+    fn from_tiff_bytes(bytes: &[u8]) -> Result<Image, String> {
+        let mut decoder = TiffDecoder::new(Cursor::new(bytes)).map_err(|err| err.to_string())?;
+        let dimensions = decoder.dimensions().map_err(|err| err.to_string())?;
+        let color_type = decoder.colortype().map_err(|err| err.to_string())?;
+        let decoded = decoder.read_image().map_err(|err| err.to_string())?;
+
+        let mut pixels = match (color_type, decoded) {
+            (ColorType::RGBA(8), DecodingResult::U8(data)) => data,
+            (ColorType::RGB(8), DecodingResult::U8(data)) => {
+                let mut rgba = Vec::with_capacity(data.len() / 3 * 4);
+                for pixel in data.chunks_exact(3) {
+                    rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
+                }
+                rgba
+            }
+            (ColorType::Gray(8), DecodingResult::U8(data)) => {
+                let mut rgba = Vec::with_capacity(data.len() * 4);
+                for &gray in &data {
+                    rgba.extend_from_slice(&[gray, gray, gray, 255]);
+                }
+                rgba
+            }
+            (ColorType::GrayA(8), DecodingResult::U8(data)) => {
+                let mut rgba = Vec::with_capacity(data.len() / 2 * 4);
+                for pixel in data.chunks_exact(2) {
+                    rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]);
+                }
+                rgba
+            }
+            (color_type, decoded) => {
+                return Err(format!(
+                    "unsupported TIFF color/result type: {color_type:?}/{}",
+                    decoding_result_name(&decoded),
+                ));
+            }
+        };
+
+        if dimensions.0 as usize * dimensions.1 as usize * 4 != pixels.len() {
+            return Err(format!(
+                "unexpected TIFF pixel data length: got {}, expected {} for {:?}",
+                pixels.len(),
+                dimensions.0 as usize * dimensions.1 as usize * 4,
+                dimensions,
+            ));
+        }
+
+        premultiply_rgba(&mut pixels);
+        Ok(Image::from_pixel_vec(pixels, dimensions))
     }
 
     /// TODO: This shouldn't really exist, it's a workaround for `CGImage`
@@ -218,6 +279,35 @@ impl Image {
     }
 }
 
+fn is_tiff(bytes: &[u8]) -> bool {
+    bytes.starts_with(&TIFF_LE_MAGIC_NUMBER) || bytes.starts_with(&TIFF_BE_MAGIC_NUMBER)
+}
+
+fn premultiply_rgba(pixels: &mut [u8]) {
+    for pixel in pixels.chunks_exact_mut(4) {
+        let a = pixel[3] as f32 / 255.0;
+        pixel[0] = (pixel[0] as f32 * a) as u8;
+        pixel[1] = (pixel[1] as f32 * a) as u8;
+        pixel[2] = (pixel[2] as f32 * a) as u8;
+    }
+}
+
+fn decoding_result_name(result: &DecodingResult) -> &'static str {
+    match result {
+        DecodingResult::U8(_) => "U8",
+        DecodingResult::U16(_) => "U16",
+        DecodingResult::U32(_) => "U32",
+        DecodingResult::U64(_) => "U64",
+        DecodingResult::F16(_) => "F16",
+        DecodingResult::F32(_) => "F32",
+        DecodingResult::F64(_) => "F64",
+        DecodingResult::I8(_) => "I8",
+        DecodingResult::I16(_) => "I16",
+        DecodingResult::I32(_) => "I32",
+        DecodingResult::I64(_) => "I64",
+    }
+}
+
 impl Clone for Image {
     fn clone(&self) -> Image {
         // Note: implicitly converts pixel storage from StbImage to Vec
@@ -232,6 +322,74 @@ impl Drop for Image {
             PixelStore::StbImage(ptr) => unsafe { stbi_image_free(ptr.cast()) },
             PixelStore::Vec(_) => (),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Image;
+
+    fn push_be_u16(bytes: &mut Vec<u8>, value: u16) {
+        bytes.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn push_be_u32(bytes: &mut Vec<u8>, value: u32) {
+        bytes.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn push_short_tag(bytes: &mut Vec<u8>, tag: u16, value: u16) {
+        push_be_u16(bytes, tag);
+        push_be_u16(bytes, 3);
+        push_be_u32(bytes, 1);
+        push_be_u16(bytes, value);
+        push_be_u16(bytes, 0);
+    }
+
+    fn push_long_tag(bytes: &mut Vec<u8>, tag: u16, value: u32) {
+        push_be_u16(bytes, tag);
+        push_be_u16(bytes, 4);
+        push_be_u32(bytes, 1);
+        push_be_u32(bytes, value);
+    }
+
+    fn push_offset_tag(bytes: &mut Vec<u8>, tag: u16, field_type: u16, count: u32, offset: u32) {
+        push_be_u16(bytes, tag);
+        push_be_u16(bytes, field_type);
+        push_be_u32(bytes, count);
+        push_be_u32(bytes, offset);
+    }
+
+    #[test]
+    fn decodes_big_endian_rgba_tiff() {
+        const BITS_PER_SAMPLE_OFFSET: u32 = 170;
+        const SAMPLE_FORMAT_OFFSET: u32 = 178;
+        const PIXEL_OFFSET: u32 = 186;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0x4d, 0x4d, 0x00, 0x2a]);
+        push_be_u32(&mut bytes, 8);
+        push_be_u16(&mut bytes, 13);
+        push_short_tag(&mut bytes, 256, 1);
+        push_short_tag(&mut bytes, 257, 1);
+        push_offset_tag(&mut bytes, 258, 3, 4, BITS_PER_SAMPLE_OFFSET);
+        push_short_tag(&mut bytes, 259, 1);
+        push_short_tag(&mut bytes, 262, 2);
+        push_long_tag(&mut bytes, 273, PIXEL_OFFSET);
+        push_short_tag(&mut bytes, 274, 1);
+        push_short_tag(&mut bytes, 277, 4);
+        push_short_tag(&mut bytes, 278, 1);
+        push_long_tag(&mut bytes, 279, 4);
+        push_short_tag(&mut bytes, 284, 1);
+        push_short_tag(&mut bytes, 338, 2);
+        push_offset_tag(&mut bytes, 339, 3, 4, SAMPLE_FORMAT_OFFSET);
+        push_be_u32(&mut bytes, 0);
+        bytes.extend_from_slice(&[0, 8, 0, 8, 0, 8, 0, 8]);
+        bytes.extend_from_slice(&[0, 1, 0, 1, 0, 1, 0, 1]);
+        bytes.extend_from_slice(&[100, 50, 25, 128]);
+
+        let image = Image::from_bytes(&bytes).unwrap();
+        assert_eq!(image.dimensions(), (1, 1));
+        assert_eq!(image.pixels(), &[50, 25, 12, 128]);
     }
 }
 

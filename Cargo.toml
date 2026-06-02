@@ -54,6 +54,7 @@ symphonia = { version = "0.6.0-alpha.1", default-features = false, features = [
     # codecs
     "aac", "adpcm", "alac", "mp3", "pcm"
 ] }
+tiff = { version = "0.10.3", default-features = false }
 quick-xml = "0.38.4"
 digest = "0.10.7"
 md-5 = "0.10.6"
