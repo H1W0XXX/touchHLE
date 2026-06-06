@@ -5796,6 +5796,14 @@ fn objc_msgSend_inner(
             );
             return;
         }
+        if selector_name == "retainCount" {
+            log!(
+                "Warning: returning 0 for retainCount sent to object {:?} with nil isa",
+                receiver
+            );
+            env.cpu.regs_mut()[0..2].fill(0);
+            return;
+        }
         if zombie_farm_ignore_spurious_operation_done(env, receiver, &selector_name) {
             return;
         }

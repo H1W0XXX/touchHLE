@@ -7,7 +7,6 @@
 
 use super::{CFHashCode, CFIndex};
 use crate::dyld::{export_c_func, export_c_func_aliased, FunctionExports};
-use crate::frameworks::foundation::NSUInteger;
 use crate::objc::Class;
 use crate::{msg, objc};
 use crate::{msg_class, Environment};
@@ -30,8 +29,21 @@ pub fn _CFMakeCollectable(_env: &mut Environment, object: CFTypeRef) -> CFTypeRe
 }
 
 pub fn CFGetRetainCount(env: &mut Environment, object: CFTypeRef) -> CFIndex {
-    let count: NSUInteger = msg![env; object retainCount];
-    count as CFIndex
+    assert!(!object.is_null()); // not allowed, unlike for normal objc objects
+
+    if let Some(count) = env.objc.try_get_refcount(object) {
+        return count.get() as CFIndex;
+    }
+
+    if objc::ObjC::read_isa(object, &env.mem) == objc::nil {
+        log!(
+            "Warning: CFGetRetainCount({:?}) called on object with nil isa, returning 0",
+            object
+        );
+        return 0;
+    }
+
+    msg![env; object retainCount]
 }
 
 pub fn CFEqual(env: &mut Environment, object1: CFTypeRef, object2: CFTypeRef) -> bool {
