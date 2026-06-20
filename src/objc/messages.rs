@@ -748,6 +748,31 @@ fn zombie_farm_object_pointer_looks_valid(env: &Environment, object: id) -> bool
     object != nil && object.to_bits() >= env.mem.null_segment_size() && object.to_bits() % 4 == 0
 }
 
+fn zombie_farm_return_nil_for_stale_object_message(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+    stale_kind: &str,
+) -> bool {
+    if !zombie_farm_uses_playforge_bundle(env)
+        || !matches!(
+            selector_name,
+            "currentTile" | "objectForKey:" | "objectForKeyedSubscript:"
+        )
+    {
+        return false;
+    }
+
+    log!(
+        "ZombieFarm workaround: returning nil for [{} {:?} {}]",
+        stale_kind,
+        receiver,
+        selector_name
+    );
+    env.cpu.regs_mut()[0..2].fill(0);
+    true
+}
+
 fn zombie_farm_set_gui_layer_server_date_to_now(env: &mut Environment, receiver: id) -> bool {
     if !zombie_farm_uses_playforge_bundle(env)
         || zombie_farm_object_class_name(env, receiver) != Some("ZFGuiLayer")
@@ -5807,6 +5832,14 @@ fn objc_msgSend_inner(
         if zombie_farm_ignore_spurious_operation_done(env, receiver, &selector_name) {
             return;
         }
+        if zombie_farm_return_nil_for_stale_object_message(
+            env,
+            receiver,
+            &selector_name,
+            "nil-isa object",
+        ) {
+            return;
+        }
         panic!(
             "Receiver {:?} for selector \"{}\" has nil isa",
             receiver, selector_name
@@ -5981,8 +6014,8 @@ fn objc_msgSend_inner(
         }
 
         let Some(host_object) = env.objc.get_host_object(class) else {
-            let selector_name = selector.as_str(&env.mem);
-            if matches!(selector_name, "release" | "retain" | "autorelease") {
+            let selector_name = selector.as_str(&env.mem).to_string();
+            if matches!(selector_name.as_str(), "release" | "retain" | "autorelease") {
                 log!(
                     "Warning: ignoring {} sent to object {:?} with unregistered class {:?}",
                     selector_name,
@@ -5992,6 +6025,14 @@ fn objc_msgSend_inner(
                 if selector_name == "retain" || selector_name == "autorelease" {
                     env.cpu.regs_mut()[0] = receiver.to_bits();
                 }
+                return;
+            }
+            if zombie_farm_return_nil_for_stale_object_message(
+                env,
+                receiver,
+                &selector_name,
+                "unregistered-class object",
+            ) {
                 return;
             }
             panic!(

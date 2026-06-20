@@ -434,8 +434,13 @@ fn app_picker_inner(
         () = msg![env; main_view addSubview:label];
     }
 
+    let brand_text = if crate::branding() == "UNOFFICIAL" {
+        "zombie farm"
+    } else {
+        crate::branding()
+    };
     let brand_color: id = if crate::branding() == "UNOFFICIAL" {
-        msg_class![env; UIColor redColor]
+        msg_class![env; UIColor blackColor]
     } else {
         msg_class![env; UIColor grayColor]
     };
@@ -453,7 +458,7 @@ fn app_picker_inner(
         };
         let label: id = msg_class![env; UILabel alloc];
         let label: id = msg![env; label initWithFrame:label_frame];
-        let text = ns_string::from_rust_string(env, crate::branding().to_owned());
+        let text = ns_string::from_rust_string(env, brand_text.to_owned());
         () = msg![env; label setText:text];
         () = msg![env; label setTextAlignment:(if i % 2 == 0 { UITextAlignmentLeft } else { UITextAlignmentRight })];
         let font_size: CGFloat = 48.0;

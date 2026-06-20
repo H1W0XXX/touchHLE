@@ -6,6 +6,7 @@
 use cargo_license::{get_dependencies_from_cargo_lock, GetDependenciesOpt};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 fn rerun_if_changed(path: &Path) {
     println!("cargo:rerun-if-changed={}", path.to_str().unwrap());
@@ -102,8 +103,69 @@ pub fn main() {
     }
 
     if std::env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows" {
+        compile_windows_icon_resource(package_root, &out_dir);
         // Rust removed link to advapi32 here https://github.com/rust-lang/rust/pull/138233
         // but sdl2 still depends on it
         println!("cargo::rustc-link-lib=advapi32")
     }
+}
+
+fn compile_windows_icon_resource(package_root: &Path, out_dir: &Path) {
+    let res_dir = package_root.join("res");
+    let rc_path = res_dir.join("windows.rc");
+    let icon_path = res_dir.join("zombie_farm_icon.ico");
+    rerun_if_changed(&rc_path);
+    rerun_if_changed(&icon_path);
+
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap();
+    if target_env == "msvc" {
+        let output_path = out_dir.join("touchhle.res");
+        run_resource_compiler(
+            &["rc.exe", "llvm-rc.exe"],
+            &res_dir,
+            &[
+                "/nologo".to_owned(),
+                format!("/fo{}", output_path.display()),
+                "windows.rc".to_owned(),
+            ],
+        );
+        println!(
+            "cargo:rustc-link-arg-bin=touchHLE={}",
+            output_path.display()
+        );
+    } else {
+        let output_path = out_dir.join("touchhle_icon.o");
+        run_resource_compiler(
+            &["windres.exe", "windres"],
+            &res_dir,
+            &[
+                "windows.rc".to_owned(),
+                output_path.display().to_string(),
+                "--output-format=coff".to_owned(),
+            ],
+        );
+        println!(
+            "cargo:rustc-link-arg-bin=touchHLE={}",
+            output_path.display()
+        );
+    }
+}
+
+fn run_resource_compiler(programs: &[&str], current_dir: &Path, args: &[String]) {
+    let mut last_error = None;
+    for program in programs {
+        let status = Command::new(program)
+            .current_dir(current_dir)
+            .args(args)
+            .status();
+        match status {
+            Ok(status) if status.success() => return,
+            Ok(status) => last_error = Some(format!("{program} exited with {status}")),
+            Err(err) => last_error = Some(format!("{program}: {err}")),
+        }
+    }
+    panic!(
+        "Failed to compile Windows icon resource: {}",
+        last_error.unwrap_or_else(|| "no resource compiler found".to_owned())
+    );
 }

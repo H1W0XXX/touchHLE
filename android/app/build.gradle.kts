@@ -66,8 +66,8 @@ android {
         }
         resValue("string", "app_name", join("touchHLE", " ", branding))
         buildConfigField("String", "APP_NAME", "\"${join("touchHLE", " ", branding)}\"")
-        manifestPlaceholders["icon"] = join("@drawable/icon", "_", branding.lowercase())
-        buildConfigField("int", "APP_ICON", join("R.drawable.icon", "_", branding.lowercase()))
+        manifestPlaceholders["icon"] = "@drawable/zombie_farm_icon"
+        buildConfigField("int", "APP_ICON", "R.drawable.zombie_farm_icon")
         versionName = join(getTouchHLEVersionName(), " ", branding)
 
         minSdk = 21 // first version with AArch64

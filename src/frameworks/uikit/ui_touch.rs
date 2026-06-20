@@ -339,6 +339,16 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
 }
 
 fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
+    let scroll_profile = crate::zombie_farm_debug::scroll_profile_enabled_for_bundle(env);
+    let scroll_profile_start = scroll_profile.then(std::time::Instant::now);
+    if scroll_profile {
+        crate::zombie_farm_debug::record_scroll_profile_count(
+            crate::zombie_farm_debug::ScrollProfileBucket::UiTouchMoveInput,
+            std::time::Duration::from_nanos(0),
+            map.len() as u64,
+        );
+    }
+
     let pool: id = msg_class![env; NSAutoreleasePool new];
 
     let timestamp: NSTimeInterval = {
@@ -350,6 +360,7 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
 
     // view to set of touches for this view
     let mut view_touches: HashMap<id, id> = HashMap::new();
+    let mut moved_touch_count = 0u64;
 
     for (finger_id, coords) in map {
         let Some(&touch) = env
@@ -396,6 +407,7 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         host_object.phase = UITouchPhaseMoved;
 
         let _: () = msg![env; touches addObject:touch];
+        moved_touch_count += 1;
 
         if let Entry::Vacant(e) = view_touches.entry(view) {
             let touches: id = msg_class![env; NSMutableSet allocWithZone:(MutVoidPtr::null())];
@@ -422,6 +434,14 @@ fn handle_touches_move(env: &mut Environment, map: HashMap<FingerId, Coords>) {
 
     for (view, touches) in view_touches {
         let _: () = msg![env; view touchesMoved:touches withEvent:event];
+    }
+
+    if let Some(start) = scroll_profile_start {
+        crate::zombie_farm_debug::record_scroll_profile_count(
+            crate::zombie_farm_debug::ScrollProfileBucket::UiTouchMoveDispatch,
+            start.elapsed(),
+            moved_touch_count,
+        );
     }
 
     release(env, pool);
