@@ -39,6 +39,14 @@ Windows 下需要：
 .\build_windows.bat release
 ```
 
+如果只给当前电脑自用，可以开启本机 CPU 极限优化构建：
+
+```bat
+.\build_windows.bat release native
+```
+
+这个模式会启用 `target-cpu=native`、`opt-level=3`、`codegen-units=1` 和 `lto=fat`，生成的程序可能不适合拿到其他电脑运行。去掉 `native` 参数即可关闭。
+
 调试构建可以运行：
 
 ```bat

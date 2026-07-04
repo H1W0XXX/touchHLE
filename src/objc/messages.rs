@@ -3263,6 +3263,21 @@ fn zombie_farm_return_self_for_game_data_copy(
     true
 }
 
+fn zombie_farm_should_return_self_for_unimplemented_cocos_reverse(
+    zombie_farm_bundle: bool,
+    receiver_class_name: &str,
+    implementation_class_name: &str,
+    selector_name: &str,
+) -> bool {
+    zombie_farm_bundle
+        && selector_name == "reverse"
+        && receiver_class_name.starts_with("CC")
+        && matches!(
+            implementation_class_name,
+            "CCAction" | "CCFiniteTimeAction" | "CCIntervalAction"
+        )
+}
+
 fn zombie_farm_host_actor_manager_init(
     env: &mut Environment,
     receiver: id,
@@ -6258,6 +6273,20 @@ fn objc_msgSend_inner(
                     && crate::zombie_farm_debug::scroll_profile_enabled()
                     && crate::zombie_farm_debug::cell_build_scope_active())
                 .then(std::time::Instant::now);
+                if zombie_farm_should_return_self_for_unimplemented_cocos_reverse(
+                    zombie_farm_bundle,
+                    receiver_class_name,
+                    name,
+                    selector_name,
+                ) {
+                    log!(
+                        "ZombieFarm workaround: returning self for unimplemented [{} reverse] using {}",
+                        receiver_class_name,
+                        name
+                    );
+                    env.cpu.regs_mut()[0] = receiver.to_bits();
+                    return;
+                }
                 match imp {
                     IMP::Host(host_imp) => {
                         // TODO: do type checks when calling GuestIMPs too.

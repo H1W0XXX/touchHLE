@@ -84,6 +84,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ns_dictionary::CLASSES,
         ns_enumerator::CLASSES,
         ns_error::CLASSES,
+        ns_exception::CLASSES,
         ns_file_handle::CLASSES,
         ns_file_manager::CLASSES,
         ns_http_cookie_storage::CLASSES,

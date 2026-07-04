@@ -39,6 +39,14 @@ Use the provided Windows build script:
 .\build_windows.bat release
 ```
 
+For a build that is only meant to run on the current PC, enable native CPU optimization:
+
+```bat
+.\build_windows.bat release native
+```
+
+This mode enables `target-cpu=native`, `opt-level=3`, `codegen-units=1`, and `lto=fat`, so the executable may not be suitable for other computers. Remove the `native` argument to turn it off.
+
 For a debug build:
 
 ```bat

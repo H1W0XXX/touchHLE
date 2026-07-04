@@ -19,6 +19,7 @@
 //! categories and dynamic class editing).
 
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant, HostDylib};
+use crate::frameworks::foundation::ns_string;
 use crate::objc::messages::ThreadInitializer;
 use crate::MutexId;
 use std::collections::HashMap;
@@ -231,6 +232,25 @@ fn _Block_copy(_env: &mut Environment, block: MutVoidPtr) -> MutVoidPtr {
 
 fn _Block_release(_env: &mut Environment, _block: MutVoidPtr) {}
 
+fn objc_exception_throw(env: &mut Environment, exception: id) {
+    log!(
+        "Warning: ignored objc_exception_throw: {}",
+        describe_exception(env, exception)
+    );
+}
+
+fn describe_exception(env: &mut Environment, exception: id) -> String {
+    if exception == nil {
+        return "(nil)".into();
+    }
+
+    let description: id = msg![env; exception description];
+    if description == nil {
+        return format!("{exception:?}");
+    }
+    ns_string::to_rust_string(env, description).into_owned()
+}
+
 const FUNCTIONS: FunctionExports = &[
     export_c_func!(class_getInstanceSize(_)),
     export_c_func!(class_getSuperclass(_)),
@@ -258,4 +278,5 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(objc_retainBlock(_)),
     export_c_func!(_Block_copy(_)),
     export_c_func!(_Block_release(_)),
+    export_c_func!(objc_exception_throw(_)),
 ];

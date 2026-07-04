@@ -1,16 +1,64 @@
 @echo off
-setlocal EnableExtensions
+setlocal EnableExtensions EnableDelayedExpansion
 
 set "SCRIPT_DIR=%~dp0"
 cd /d "%SCRIPT_DIR%"
 
 set "PROFILE=release"
+set "EXTREME_NATIVE=0"
+set "FORWARD_ARGS="
+
+:parse_args
+if "%~1"=="" goto args_done
 if /i "%~1"=="debug" (
     set "PROFILE=debug"
     shift
-) else if /i "%~1"=="release" (
-    shift
+    goto parse_args
 )
+if /i "%~1"=="release" (
+    set "PROFILE=release"
+    shift
+    goto parse_args
+)
+if /i "%~1"=="native" (
+    set "EXTREME_NATIVE=1"
+    shift
+    goto parse_args
+)
+if /i "%~1"=="--native" (
+    set "EXTREME_NATIVE=1"
+    shift
+    goto parse_args
+)
+if /i "%~1"=="extreme" (
+    set "EXTREME_NATIVE=1"
+    shift
+    goto parse_args
+)
+if /i "%~1"=="--extreme" (
+    set "EXTREME_NATIVE=1"
+    shift
+    goto parse_args
+)
+if /i "%~1"=="no-native" (
+    set "EXTREME_NATIVE=0"
+    shift
+    goto parse_args
+)
+if /i "%~1"=="--no-native" (
+    set "EXTREME_NATIVE=0"
+    shift
+    goto parse_args
+)
+if defined FORWARD_ARGS (
+    set "FORWARD_ARGS=%FORWARD_ARGS% %1"
+) else (
+    set "FORWARD_ARGS=%1"
+)
+shift
+goto parse_args
+
+:args_done
 
 set "VSDEVCMD="
 
@@ -62,13 +110,39 @@ set "CARGO_FLAGS="
 if /i "%PROFILE%"=="release" (
     set "CARGO_FLAGS=--release"
 )
-set "FORWARD_ARGS=%1 %2 %3 %4 %5 %6 %7 %8 %9"
+
+if "%EXTREME_NATIVE%"=="1" (
+    set "NATIVE_RUSTFLAGS=-C target-cpu=native"
+    if defined RUSTFLAGS (
+        set "RUSTFLAGS=!RUSTFLAGS! !NATIVE_RUSTFLAGS!"
+    ) else (
+        set "RUSTFLAGS=!NATIVE_RUSTFLAGS!"
+    )
+    if /i "%PROFILE%"=="release" (
+        set "CARGO_PROFILE_RELEASE_OPT_LEVEL=3"
+        set "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1"
+        set "CARGO_PROFILE_RELEASE_LTO=fat"
+    ) else (
+        set "CARGO_PROFILE_DEV_OPT_LEVEL=3"
+        set "CARGO_PROFILE_DEV_CODEGEN_UNITS=1"
+        set "CARGO_PROFILE_DEV_LTO=fat"
+    )
+)
 
 echo Using VS developer environment: "%VSDEVCMD%"
 if defined CMAKE_BIN (
     echo Using bundled CMake: "%CMAKE_BIN%"
 )
 echo Building touchHLE ^(%PROFILE%^)
+if "%EXTREME_NATIVE%"=="1" (
+    echo Extreme native CPU optimization: enabled
+    echo RUSTFLAGS=!RUSTFLAGS!
+    if /i "%PROFILE%"=="release" (
+        echo Cargo profile: opt-level=!CARGO_PROFILE_RELEASE_OPT_LEVEL!, codegen-units=!CARGO_PROFILE_RELEASE_CODEGEN_UNITS!, lto=!CARGO_PROFILE_RELEASE_LTO!
+    ) else (
+        echo Cargo profile: opt-level=!CARGO_PROFILE_DEV_OPT_LEVEL!, codegen-units=!CARGO_PROFILE_DEV_CODEGEN_UNITS!, lto=!CARGO_PROFILE_DEV_LTO!
+    )
+)
 
 call "%VSDEVCMD%" -arch=x64 >nul
 if errorlevel 1 exit /b %errorlevel%
