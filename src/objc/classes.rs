@@ -1001,6 +1001,16 @@ impl ObjC {
             None
         }
     }
+
+    pub(super) fn stable_class_name(&self, class: Class) -> Option<&'static str> {
+        if let Some(name) = self.class_names.borrow().get(&class) {
+            return Some(name);
+        }
+        let name: &'static str =
+            Box::leak(self.try_get_class_name(class)?.to_string().into_boxed_str());
+        self.class_names.borrow_mut().insert(class, name);
+        Some(name)
+    }
 }
 
 pub(super) fn objc_getClass(env: &mut Environment, name: ConstPtr<u8>) -> id {

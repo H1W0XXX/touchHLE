@@ -8,6 +8,10 @@ use crate::objc::id;
 use crate::Environment;
 
 fn should_suppress_nslog(env: &Environment, message: &str) -> bool {
+    if env.options.quiet_game_stdout {
+        return true;
+    }
+
     if std::env::var("TOUCHHLE_SHOW_NOISY_NSLOG").ok().as_deref() == Some("1") {
         return false;
     }

@@ -50,6 +50,7 @@ mod options;
 mod paths;
 mod stack;
 mod window;
+mod zfr_profile;
 mod zombie_farm_debug;
 
 // Environment is used very frequently used and used to be in this module, so
@@ -338,6 +339,11 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         let parse_result = options.parse_argument(&option_arg);
         assert!(parse_result == Ok(true));
     }
+    zfr_profile::init(
+        options.zfr_profile
+            && (app_id.starts_with("com.playforge.ZombieFarm")
+                || app_id.starts_with("com.playforge.ZFR")),
+    );
 
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         Environment::new(bundle, fs, options.clone(), app_args.unwrap_or_default())
@@ -367,5 +373,6 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<(), String> {
         }
     };
     env.run();
+    zfr_profile::final_report();
     Ok(())
 }

@@ -278,6 +278,7 @@ impl Cpu {
     /// something else happened which requires attention from the host.
     #[must_use]
     pub fn run_or_step(&mut self, mem: &mut Mem, ticks: Option<&mut u64>) -> CpuState {
+        let _profile = crate::zfr_profile::scope(crate::zfr_profile::Category::GuestCpuRun);
         // See ::new() for why this is done.
         if !self.direct_memory_access_ptr.is_null() {
             assert!(self.direct_memory_access_ptr == unsafe { mem.direct_memory_access_ptr() });

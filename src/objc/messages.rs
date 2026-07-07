@@ -931,7 +931,7 @@ fn zombie_farm_begin_multicolumn_cell_request(
         .unwrap()
         .current_requests
         .push((table.to_bits(), regs[3]));
-    log!(
+    log_dbg!(
         "ZombieFarm cache trace: begin request table=0x{:x} index={}",
         table.to_bits(),
         regs[3]
@@ -945,7 +945,7 @@ fn zombie_farm_end_multicolumn_cell_request(started: bool) {
     }
     let mut state = zombie_farm_multicolumn_reuse_state().lock().unwrap();
     let popped = state.current_requests.pop();
-    log!("ZombieFarm cache trace: end request popped={popped:?}");
+    log_dbg!("ZombieFarm cache trace: end request popped={popped:?}");
 }
 
 fn zombie_farm_current_multicolumn_request(table_bits: u32) -> Option<u32> {
@@ -973,7 +973,7 @@ fn zombie_farm_note_multicolumn_cell_assignment(table_bits: u32, index: u32, cel
     table
         .reusable_by_index
         .retain(|_, cached_cell| *cached_cell != cell_bits);
-    log!(
+    log_dbg!(
         "ZombieFarm cache trace: assign table=0x{:x} index={} cell=0x{:x}",
         table_bits,
         index,
@@ -984,7 +984,7 @@ fn zombie_farm_note_multicolumn_cell_assignment(table_bits: u32, index: u32, cel
 fn zombie_farm_note_multicolumn_cell_offscreen(table_bits: u32, cell_bits: u32) {
     let mut state = zombie_farm_multicolumn_reuse_state().lock().unwrap();
     let Some(table) = state.tables.get_mut(&table_bits) else {
-        log!(
+        log_dbg!(
             "ZombieFarm cache trace: offscreen table=0x{:x} cell=0x{:x} missing table state",
             table_bits,
             cell_bits
@@ -992,7 +992,7 @@ fn zombie_farm_note_multicolumn_cell_offscreen(table_bits: u32, cell_bits: u32) 
         return;
     };
     let Some(&index) = table.cell_to_index.get(&cell_bits) else {
-        log!(
+        log_dbg!(
             "ZombieFarm cache trace: offscreen table=0x{:x} cell=0x{:x} missing index mapping",
             table_bits,
             cell_bits
@@ -1000,7 +1000,7 @@ fn zombie_farm_note_multicolumn_cell_offscreen(table_bits: u32, cell_bits: u32) 
         return;
     };
     table.reusable_by_index.insert(index, cell_bits);
-    log!(
+    log_dbg!(
         "ZombieFarm cache trace: offscreen table=0x{:x} index={} cached_cell=0x{:x}",
         table_bits,
         index,
@@ -1011,7 +1011,7 @@ fn zombie_farm_note_multicolumn_cell_offscreen(table_bits: u32, cell_bits: u32) 
 fn zombie_farm_take_multicolumn_cached_cell(table_bits: u32, index: u32) -> Option<id> {
     let mut state = zombie_farm_multicolumn_reuse_state().lock().unwrap();
     let Some(table) = state.tables.get_mut(&table_bits) else {
-        log!(
+        log_dbg!(
             "ZombieFarm cache trace: take table=0x{:x} index={} no table state",
             table_bits,
             index
@@ -1019,7 +1019,7 @@ fn zombie_farm_take_multicolumn_cached_cell(table_bits: u32, index: u32) -> Opti
         return None;
     };
     let Some(cell_bits) = table.reusable_by_index.remove(&index) else {
-        log!(
+        log_dbg!(
             "ZombieFarm cache trace: take table=0x{:x} index={} no cached cell",
             table_bits,
             index
@@ -1027,7 +1027,7 @@ fn zombie_farm_take_multicolumn_cached_cell(table_bits: u32, index: u32) -> Opti
         return None;
     };
     let matches = table.cell_to_index.get(&cell_bits).copied() == Some(index);
-    log!(
+    log_dbg!(
         "ZombieFarm cache trace: take table=0x{:x} index={} cell=0x{:x} matches={}",
         table_bits,
         index,
@@ -5758,6 +5758,246 @@ fn zombie_farm_skip_redundant_zombie_cell_rebuild(
     true
 }
 
+fn zombie_farm_pre_dispatch_workarounds(
+    env: &mut Environment,
+    receiver: id,
+    selector: SEL,
+    selector_name: &str,
+) -> bool {
+    let _profile = crate::zfr_profile::scope(crate::zfr_profile::Category::ZombiePreDispatch);
+    if !zombie_farm_uses_playforge_bundle(env) {
+        return false;
+    }
+
+    if zombie_farm_sprite_trace_enabled() {
+        trace_zombie_farm_sprite_message(env, receiver, selector_name);
+    }
+
+    if env.bundle.bundle_identifier() == "com.playforge.ZombieFarm2" {
+        zombie_farm_trace_game_interaction_message(env, receiver, selector_name);
+        zombie_farm_force_status_bar_timeout(env, receiver, selector_name);
+        if zombie_farm_ignore_spurious_operation_done(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_forward_backing_array_fast_enumeration(
+            env,
+            receiver,
+            selector,
+            selector_name,
+        ) {
+            return true;
+        }
+        if zombie_farm_ignore_null_attachment_placeholder(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_force_zombie_hunger_message(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_object_class_name(env, receiver) == Some("MainMenu")
+            || selector_name == "playTapped"
+        {
+            ZOMBIE_FARM_LAST_MAIN_MENU.store(receiver.to_bits() as usize, Ordering::Relaxed);
+            if selector_name == "playTapped" {
+                log!(
+                    "ZombieFarm2 workaround: remembered {:?} ({}) as MainMenu candidate",
+                    receiver,
+                    zombie_farm_object_class_name(env, receiver).unwrap_or("unknown")
+                );
+            }
+        }
+        if let Some(result) = zombie_farm_md5sum_override(env, selector_name) {
+            env.cpu.regs_mut()[0] = result.to_bits();
+            return true;
+        }
+        if zombie_farm_skip_redundant_zombie_cell_rebuild(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_skip_selection_menu_cell_recycle(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_disable_cctable_cell_reuse(env, receiver, selector_name) {
+            return true;
+        }
+        zombie_farm_prepare_game_state_save_date(env, receiver, selector_name);
+        if zombie_farm_skip_epic_event_with_missing_remote_data(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_override_cocos2d_get_zeye(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_skip_cocos2d_projection_setup(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_skip_remote_asset_requests(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_skip_event_tracker_nil_last_event(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_skip_event_tracker_init(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_return_open_udid(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_skip_vungle_ad_sdk(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_skip_broken_font_preload(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_skip_brain_client_network(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_skip_sync_queue_network(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_return_safe_game_state_count(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_skip_remote_dependent_game_state_update(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_return_self_for_game_data_copy(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_host_actor_manager_init(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_skip_tool_manager_transient_actions(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_skip_quest_manager_reset(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_skip_unsafe_toolbar_build(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_skip_market_offers(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_skip_event_ad_networks(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_skip_farmer_head_modal(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_host_load_farm_scene(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_skip_startup_profile_detection(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_skip_startup_internet_loading(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_skip_cocos_denshion_effects(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_route_eagl_view_touches(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_host_cocos_touch_dispatcher(env, receiver, selector_name) {
+            return true;
+        }
+        if zombie_farm_skip_unsafe_cocos_touch_dispatch(env, receiver, selector_name) {
+            return true;
+        }
+        zombie_farm_prepare_local_server_date(env, receiver, selector_name);
+        zombie_farm_prepare_local_hunger_update(env, selector_name);
+        return false;
+    }
+
+    match selector_name {
+        "operationDone" => {
+            if zombie_farm_ignore_spurious_operation_done(env, receiver, selector_name) {
+                return true;
+            }
+        }
+        "statusMessage:cancelAfter:"
+        | "showMessage:withCancelTimeout:andCancelNotification:"
+        | "updateMessage:andCancelTimeout:andCancelNotification:" => {
+            zombie_farm_force_status_bar_timeout(env, receiver, selector_name);
+        }
+        "getAverageHunger" | "hunger" | "setHunger:" => {
+            if zombie_farm_force_zombie_hunger_message(env, receiver, selector_name) {
+                return true;
+            }
+        }
+        "md5sum:" => {
+            if let Some(result) = zombie_farm_md5sum_override(env, selector_name) {
+                env.cpu.regs_mut()[0] = result.to_bits();
+                return true;
+            }
+        }
+        "setZombie:" | "dealloc" => {
+            if zombie_farm_skip_redundant_zombie_cell_rebuild(env, receiver, selector_name) {
+                return true;
+            }
+        }
+        "_moveCellOutOfSight:" => {
+            if zombie_farm_skip_selection_menu_cell_recycle(env, receiver, selector_name) {
+                return true;
+            }
+        }
+        "dequeueCell" => {
+            if zombie_farm_disable_cctable_cell_reuse(env, receiver, selector_name) {
+                return true;
+            }
+        }
+        "setSaveDate:" => {
+            zombie_farm_prepare_game_state_save_date(env, receiver, selector_name);
+        }
+        "getServerTime" | "handleResponse:forAction:" => {
+            zombie_farm_prepare_local_server_date(env, receiver, selector_name);
+        }
+        "openMenu"
+        | "openMenuThroughMausoleum"
+        | "displayCurrentZombie"
+        | "updateSelectedZombieInfo"
+        | "displayHunger"
+        | "table:cellTouched:"
+        | "saveGame"
+        | "startInvasion:"
+        | "startInvasion:checkHunger:"
+        | "startInvasionWithDictionary:checkHunger:"
+        | "invadeButtonTapped:"
+        | "switchToFightScene" => {
+            zombie_farm_prepare_local_hunger_update(env, selector_name);
+        }
+        _ => {}
+    }
+
+    false
+}
+
+fn zombie_farm_post_dispatch_workarounds(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) {
+    let _profile = crate::zfr_profile::scope(crate::zfr_profile::Category::ZombiePostDispatch);
+    if !zombie_farm_uses_playforge_bundle(env) {
+        return;
+    }
+
+    if zombie_farm_touch_trace_enabled() {
+        zombie_farm_trace_game_interaction_return(env, receiver, selector_name);
+    }
+
+    match selector_name {
+        "handleTimeResponse:" => {
+            zombie_farm_apply_local_hunger_update(env, receiver, selector_name);
+        }
+        "statusCheckDone" | "startUpChecksComplete" => {
+            zombie_farm_apply_local_hunger_update(env, receiver, selector_name);
+            zombie_farm_check_local_daily_event(env, receiver, selector_name);
+            zombie_farm_restore_local_quest_progress(env, receiver, selector_name);
+        }
+        _ => {}
+    }
+}
+
 /// The core implementation of `objc_msgSend`, the main function of Objective-C.
 ///
 /// Note that while only two parameters (usually receiver and selector) are
@@ -5778,37 +6018,26 @@ fn objc_msgSend_inner(
     super2: Option<Class>,
     tolerate_type_mismatch: bool,
 ) {
-    log_dbg!(
-        "Dispatching {} for {:?}",
-        selector.as_str(&env.mem),
-        receiver
-    );
-    let receiver_class_name = if receiver != nil {
-        let class = super2.unwrap_or_else(|| ObjC::read_isa(receiver, &env.mem));
-        if class == nil {
-            None
-        } else {
-            env.objc.try_get_class_name(class).map(str::to_string)
-        }
-    } else {
-        None
-    };
+    let _profile = crate::zfr_profile::scope(crate::zfr_profile::Category::ObjcMsgSend);
+    let selector_name = env.objc.selector_name(selector, &env.mem);
+    log_dbg!("Dispatching {} for {:?}", selector_name, receiver);
+    let receiver_class =
+        (receiver != nil).then(|| super2.unwrap_or_else(|| ObjC::read_isa(receiver, &env.mem)));
     env.objc.last_message_debug = Some(crate::objc::ObjCMessageDebug {
         receiver,
-        selector_name: selector.as_str(&env.mem).to_string(),
-        receiver_class_name,
+        selector,
+        receiver_class: receiver_class.filter(|class| *class != nil),
     });
-    crate::objc::set_global_last_message_debug(env.objc.last_message_debug_string());
+    crate::objc::set_global_last_message_debug(env.objc.last_message_debug.unwrap());
     let message_type_info = env.objc.message_type_info.take();
 
     if receiver == nil {
         // https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/ObjectiveC/Chapters/ocObjectsClasses.html#//apple_ref/doc/uid/TP30001163-CH11-SW7
-        log_dbg!("[nil {}]", selector.as_str(&env.mem));
+        log_dbg!("[nil {}]", selector_name);
         env.cpu.regs_mut()[0..2].fill(0);
         return;
     }
     if receiver.to_bits() < env.mem.null_segment_size() || receiver.to_bits() % 4 != 0 {
-        let selector_name = selector.as_str(&env.mem);
         if selector_name == "compare:" {
             log_dbg!(
                 "Ignoring compare: sent to invalid low ObjC pointer {:?}",
@@ -5827,8 +6056,7 @@ fn objc_msgSend_inner(
 
     let orig_class = super2.unwrap_or_else(|| ObjC::read_isa(receiver, &env.mem));
     if orig_class == nil {
-        let selector_name = selector.as_str(&env.mem).to_string();
-        if matches!(selector_name.as_str(), "release" | "retain" | "autorelease") {
+        if matches!(selector_name, "release" | "retain" | "autorelease") {
             log!(
                 "Warning: ignoring {} sent to object {:?} with nil isa",
                 selector_name,
@@ -5844,13 +6072,13 @@ fn objc_msgSend_inner(
             env.cpu.regs_mut()[0..2].fill(0);
             return;
         }
-        if zombie_farm_ignore_spurious_operation_done(env, receiver, &selector_name) {
+        if zombie_farm_ignore_spurious_operation_done(env, receiver, selector_name) {
             return;
         }
         if zombie_farm_return_nil_for_stale_object_message(
             env,
             receiver,
-            &selector_name,
+            selector_name,
             "nil-isa object",
         ) {
             return;
@@ -5862,145 +6090,37 @@ fn objc_msgSend_inner(
     }
     maybe_initialize_class(env, receiver);
 
-    let selector_name = selector.as_str(&env.mem).to_string();
-    trace_zombie_farm_sprite_message(env, receiver, &selector_name);
-    zombie_farm_trace_game_interaction_message(env, receiver, &selector_name);
-    zombie_farm_force_status_bar_timeout(env, receiver, &selector_name);
-    if zombie_farm_ignore_spurious_operation_done(env, receiver, &selector_name) {
+    if zombie_farm_pre_dispatch_workarounds(env, receiver, selector, selector_name) {
         return;
     }
-    if zombie_farm_forward_backing_array_fast_enumeration(env, receiver, selector, &selector_name) {
-        return;
-    }
-    if zombie_farm_ignore_null_attachment_placeholder(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_force_zombie_hunger_message(env, receiver, &selector_name) {
-        return;
-    }
-    if env.bundle.bundle_identifier() == "com.playforge.ZombieFarm2"
-        && (zombie_farm_object_class_name(env, receiver) == Some("MainMenu")
-            || selector_name == "playTapped")
-    {
-        ZOMBIE_FARM_LAST_MAIN_MENU.store(receiver.to_bits() as usize, Ordering::Relaxed);
-        if selector_name == "playTapped" {
-            log!(
-                "ZombieFarm2 workaround: remembered {:?} ({}) as MainMenu candidate",
-                receiver,
-                zombie_farm_object_class_name(env, receiver).unwrap_or("unknown")
-            );
-        }
-    }
-    if let Some(result) = zombie_farm_md5sum_override(env, &selector_name) {
-        env.cpu.regs_mut()[0] = result.to_bits();
-        return;
-    }
-    if zombie_farm_skip_redundant_zombie_cell_rebuild(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_skip_selection_menu_cell_recycle(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_disable_cctable_cell_reuse(env, receiver, &selector_name) {
-        return;
-    }
-    zombie_farm_prepare_game_state_save_date(env, receiver, &selector_name);
-    if zombie_farm_skip_epic_event_with_missing_remote_data(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_override_cocos2d_get_zeye(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_skip_cocos2d_projection_setup(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_skip_remote_asset_requests(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_skip_event_tracker_nil_last_event(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_skip_event_tracker_init(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_return_open_udid(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_skip_vungle_ad_sdk(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_skip_broken_font_preload(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_skip_brain_client_network(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_skip_sync_queue_network(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_return_safe_game_state_count(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_skip_remote_dependent_game_state_update(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_return_self_for_game_data_copy(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_host_actor_manager_init(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_skip_tool_manager_transient_actions(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_skip_quest_manager_reset(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_skip_unsafe_toolbar_build(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_skip_market_offers(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_skip_event_ad_networks(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_skip_farmer_head_modal(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_host_load_farm_scene(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_skip_startup_profile_detection(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_skip_startup_internet_loading(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_skip_cocos_denshion_effects(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_route_eagl_view_touches(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_host_cocos_touch_dispatcher(env, receiver, &selector_name) {
-        return;
-    }
-    if zombie_farm_skip_unsafe_cocos_touch_dispatch(env, receiver, &selector_name) {
-        return;
-    }
-    zombie_farm_prepare_local_server_date(env, receiver, &selector_name);
-    zombie_farm_prepare_local_hunger_update(env, &selector_name);
     let regs_before_zombie_farm_prepare = *env.cpu.regs();
-    zombie_farm_prepare_cctable_cell(env, receiver, selector);
-    zombie_farm_prepare_multicolumn_table_reuse(env, receiver, &selector_name);
+    if selector_name == "_setIndex:forCell:" {
+        zombie_farm_prepare_cctable_cell(env, receiver, selector);
+    }
+    if matches!(
+        selector_name,
+        "_moveCellOutOfSight:" | "reloadData" | "setDataSource:" | "dealloc"
+    ) {
+        zombie_farm_prepare_multicolumn_table_reuse(env, receiver, selector_name);
+    }
     env.cpu
         .regs_mut()
         .copy_from_slice(&regs_before_zombie_farm_prepare);
 
     // Traverse the chain of superclasses to find the method implementation.
 
-    let mut class = orig_class;
+    let super_lookup = super2.is_some();
+    let cached_method_class =
+        env.objc
+            .lookup_cached_method_class(orig_class, selector, super_lookup);
+    let mut class = if let Some(cached_method_class) = cached_method_class {
+        crate::zfr_profile::count(crate::zfr_profile::Category::ObjcMsgCacheHit);
+        cached_method_class
+    } else {
+        crate::zfr_profile::count(crate::zfr_profile::Category::ObjcMsgCacheMiss);
+        orig_class
+    };
+    let mut using_cached_method_class = cached_method_class.is_some();
     loop {
         if class == nil {
             assert!(class != orig_class);
@@ -6029,6 +6149,13 @@ fn objc_msgSend_inner(
         }
 
         let Some(host_object) = env.objc.get_host_object(class) else {
+            if using_cached_method_class {
+                env.objc
+                    .remove_cached_method_class(orig_class, selector, super_lookup);
+                class = orig_class;
+                using_cached_method_class = false;
+                continue;
+            }
             let selector_name = selector.as_str(&env.mem).to_string();
             if matches!(selector_name.as_str(), "release" | "retain" | "autorelease") {
                 log!(
@@ -6065,21 +6192,19 @@ fn objc_msgSend_inner(
         {
             // Skip method lookup on first iteration if this is the super-call
             // variant of objc_msgSend (look up the superclass first)
-            if super2.is_some() && class == orig_class {
+            if !using_cached_method_class && super_lookup && class == orig_class {
                 class = superclass;
                 continue;
             }
 
             if let Some(imp) = methods.get(&selector) {
+                if !using_cached_method_class {
+                    env.objc
+                        .cache_method_class(orig_class, selector, super_lookup, class);
+                }
                 log_dbg!("Found method on: {}", name);
-                let selector_name_owned = selector.as_str(&env.mem).to_string();
-                let selector_name = selector_name_owned.as_str();
-                let receiver_class_name_owned = env
-                    .objc
-                    .try_get_class_name(orig_class)
-                    .unwrap_or(name)
-                    .to_string();
-                let receiver_class_name = receiver_class_name_owned.as_str();
+                let receiver_class_name =
+                    env.objc.stable_class_name(orig_class).unwrap_or("unknown");
                 let zombie_farm_bundle = zombie_farm_uses_playforge_bundle(env);
                 let zombie_farm_debug_enabled =
                     zombie_farm_bundle && crate::zombie_farm_debug::enabled();
@@ -6234,7 +6359,7 @@ fn objc_msgSend_inner(
                         );
                     }
                 }
-                let selector_name_for_after = selector_name.to_string();
+                let selector_name_for_after = selector_name;
                 if trace_zombie_farm_apply_scope {
                     ZOMBIE_FARM_APPLY_TRACE_DEPTH.fetch_add(1, Ordering::Relaxed);
                 }
@@ -6287,40 +6412,44 @@ fn objc_msgSend_inner(
                     env.cpu.regs_mut()[0] = receiver.to_bits();
                     return;
                 }
-                match imp {
-                    IMP::Host(host_imp) => {
-                        // TODO: do type checks when calling GuestIMPs too.
-                        // That requires using Objective-C type strings,
-                        // rather than Rust types, and should probably
-                        // warn rather than panicking,
-                        // because apps might rely on type punning.
-                        if let Some((sent_type_id, sent_type_desc)) = message_type_info {
-                            let (expected_type_id, expected_type_desc) = host_imp.type_info();
-                            if sent_type_id != expected_type_id {
-                                let msg = format!(
-                                    "\
+                {
+                    let _profile =
+                        crate::zfr_profile::scope(crate::zfr_profile::Category::ObjcImpCall);
+                    match imp {
+                        IMP::Host(host_imp) => {
+                            // TODO: do type checks when calling GuestIMPs too.
+                            // That requires using Objective-C type strings,
+                            // rather than Rust types, and should probably
+                            // warn rather than panicking,
+                            // because apps might rely on type punning.
+                            if let Some((sent_type_id, sent_type_desc)) = message_type_info {
+                                let (expected_type_id, expected_type_desc) = host_imp.type_info();
+                                if sent_type_id != expected_type_id {
+                                    let msg = format!(
+                                        "\
 Type mismatch when sending message {} to {:?}!
 - Message has type: {:?} / {}
 - Method expects type: {:?} / {}",
-                                    selector.as_str(&env.mem),
-                                    receiver,
-                                    sent_type_id,
-                                    sent_type_desc,
-                                    expected_type_id,
-                                    expected_type_desc
-                                );
-                                if tolerate_type_mismatch {
-                                    log!("Warning: {}", msg);
-                                } else {
-                                    panic!("{}", msg);
+                                        selector_name,
+                                        receiver,
+                                        sent_type_id,
+                                        sent_type_desc,
+                                        expected_type_id,
+                                        expected_type_desc
+                                    );
+                                    if tolerate_type_mismatch {
+                                        log!("Warning: {}", msg);
+                                    } else {
+                                        panic!("{}", msg);
+                                    }
                                 }
                             }
+                            host_imp.call_from_guest(env)
                         }
-                        host_imp.call_from_guest(env)
+                        // We can't create a new stack frame, because that would
+                        // interfere with pass-through of stack arguments.
+                        IMP::Guest(guest_imp) => guest_imp.call_without_pushing_stack_frame(env),
                     }
-                    // We can't create a new stack frame, because that would
-                    // interfere with pass-through of stack arguments.
-                    IMP::Guest(guest_imp) => guest_imp.call_without_pushing_stack_frame(env),
                 }
                 if let Some((call, start)) = zombie_farm_scroll_profile {
                     crate::zombie_farm_debug::finish_scroll_profile_call(
@@ -6433,12 +6562,17 @@ Type mismatch when sending message {} to {:?}!
                         regs_before_zombie_farm_record.as_ref().unwrap(),
                     );
                 }
-                zombie_farm_trace_game_interaction_return(env, receiver, &selector_name_for_after);
-                zombie_farm_apply_local_hunger_update(env, receiver, &selector_name_for_after);
-                zombie_farm_check_local_daily_event(env, receiver, &selector_name_for_after);
-                zombie_farm_restore_local_quest_progress(env, receiver, &selector_name_for_after);
+                zombie_farm_post_dispatch_workarounds(env, receiver, selector_name_for_after);
                 return;
             } else {
+                if using_cached_method_class {
+                    env.objc
+                        .remove_cached_method_class(orig_class, selector, super_lookup);
+                    class = orig_class;
+                    using_cached_method_class = false;
+                    continue;
+                }
+                using_cached_method_class = false;
                 class = superclass;
             }
         } else if let Some(&super::UnimplementedClass {

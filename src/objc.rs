@@ -23,7 +23,6 @@ use crate::frameworks::foundation::ns_string;
 use crate::objc::messages::ThreadInitializer;
 use crate::MutexId;
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
 
 mod classes;
 mod messages;
@@ -57,7 +56,16 @@ use methods::method_list_t;
 use objects::{objc_object, object_getClass, HostObjectEntry};
 use properties::{ivar_list_t, objc_copyStruct, objc_getProperty, objc_setProperty};
 use selectors::sel_registerName;
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicU32, Ordering};
 use synchronization::{objc_sync_enter, objc_sync_exit};
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub(super) struct MethodCacheKey {
+    class: Class,
+    selector: SEL,
+    super_lookup: bool,
+}
 
 /// Typedef for `NSZone *`. This is a [fossil type] found in the signature of
 /// `allocWithZone:` and similar methods. Its value is always ignored.
@@ -70,6 +78,10 @@ pub struct ObjC {
     /// Known selectors (interned method name strings).
     selectors: HashMap<String, SEL>,
 
+    /// Reverse map for selectors so hot message dispatch can get a stable
+    /// string without allocating.
+    selector_names: HashMap<SEL, &'static str>,
+
     /// Mapping of known (guest) object pointers to their host objects.
     ///
     /// If an object isn't in this map, we will consider it not to exist.
@@ -79,6 +91,13 @@ pub struct ObjC {
     ///
     /// Look at the `isa` to get the metaclass for a class.
     classes: HashMap<String, Class>,
+
+    /// Cache from an Objective-C lookup starting point to the class that
+    /// actually provides the method.
+    method_cache: RefCell<HashMap<MethodCacheKey, Class>>,
+
+    /// Stable class names for hot debug/workaround checks.
+    class_names: RefCell<HashMap<Class, &'static str>>,
 
     /// Mutexes used in @synchronized blocks (objc_sync_enter/exit).
     sync_mutexes: HashMap<id, MutexId>,
@@ -95,19 +114,22 @@ pub struct ObjC {
     last_message_debug: Option<ObjCMessageDebug>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub(crate) struct ObjCMessageDebug {
     pub receiver: id,
-    pub selector_name: String,
-    pub receiver_class_name: Option<String>,
+    pub selector: SEL,
+    pub receiver_class: Option<Class>,
 }
 
 impl ObjC {
     pub fn new() -> ObjC {
         ObjC {
             selectors: HashMap::new(),
+            selector_names: HashMap::new(),
             objects: HashMap::new(),
             classes: HashMap::new(),
+            method_cache: RefCell::new(HashMap::new()),
+            class_names: RefCell::new(HashMap::new()),
             sync_mutexes: HashMap::new(),
             initializer_threads: HashMap::new(),
             message_type_info: None,
@@ -116,18 +138,30 @@ impl ObjC {
     }
 }
 
-static LAST_MESSAGE_DEBUG_GLOBAL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static LAST_MESSAGE_RECEIVER: AtomicU32 = AtomicU32::new(0);
+static LAST_MESSAGE_SELECTOR: AtomicU32 = AtomicU32::new(0);
+static LAST_MESSAGE_CLASS: AtomicU32 = AtomicU32::new(0);
 
-fn last_message_debug_global() -> &'static Mutex<Option<String>> {
-    LAST_MESSAGE_DEBUG_GLOBAL.get_or_init(|| Mutex::new(None))
+pub(crate) fn set_global_last_message_debug(debug: ObjCMessageDebug) {
+    LAST_MESSAGE_RECEIVER.store(debug.receiver.to_bits(), Ordering::Relaxed);
+    LAST_MESSAGE_SELECTOR.store(debug.selector.to_bits(), Ordering::Relaxed);
+    LAST_MESSAGE_CLASS.store(
+        debug.receiver_class.map_or(0, |class| class.to_bits()),
+        Ordering::Relaxed,
+    );
 }
 
-pub(crate) fn set_global_last_message_debug(debug: String) {
-    *last_message_debug_global().lock().unwrap() = Some(debug);
-}
-
-pub(crate) fn global_last_message_debug() -> Option<String> {
-    last_message_debug_global().lock().unwrap().clone()
+pub(crate) fn global_last_message_debug() -> String {
+    let selector = LAST_MESSAGE_SELECTOR.load(Ordering::Relaxed);
+    if selector == 0 {
+        return "none".to_string();
+    }
+    format!(
+        "receiver=0x{:x}, selector=0x{:x}, receiver_class=0x{:x}",
+        LAST_MESSAGE_RECEIVER.load(Ordering::Relaxed),
+        selector,
+        LAST_MESSAGE_CLASS.load(Ordering::Relaxed),
+    )
 }
 
 pub const DYLIB: HostDylib = HostDylib {

@@ -329,15 +329,13 @@ impl super::ObjC {
             return "none".to_string();
         };
         format!(
-            "receiver={:?}, selector={}, receiver_class={}",
+            "receiver={:?}, selector={:?}, receiver_class={}",
             last.receiver,
-            last.selector_name,
-            last.receiver_class_name.as_deref().unwrap_or("unknown"),
+            last.selector,
+            last.receiver_class
+                .and_then(|class| self.try_get_class_name(class))
+                .unwrap_or("unknown"),
         )
-    }
-
-    pub(crate) fn last_message_debug_string(&self) -> String {
-        self.describe_last_message_debug()
     }
 
     /// Increase the refcount of a reference-counted object. Do not call this

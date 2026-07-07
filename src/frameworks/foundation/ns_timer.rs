@@ -144,6 +144,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())fire {
+    let _profile = crate::zfr_profile::scope(crate::zfr_profile::Category::TimerFire);
     let &NSTimerHostObject {
         target,
         selector,

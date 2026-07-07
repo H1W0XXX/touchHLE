@@ -362,6 +362,9 @@ fn fwrite(
     // TODO: Refactor, use traits instead of this hack
     match fd {
         STDOUT_FILENO => {
+            if env.options.quiet_game_stdout {
+                return n_items;
+            }
             let buffer_slice = env.mem.bytes_at(buffer.cast(), total_size);
             match std::io::stdout().write(buffer_slice) {
                 Ok(bytes_written) => (bytes_written / (item_size as usize)) as GuestUSize,
@@ -369,6 +372,9 @@ fn fwrite(
             }
         }
         STDERR_FILENO => {
+            if env.options.quiet_game_stdout {
+                return n_items;
+            }
             let buffer_slice = env.mem.bytes_at(buffer.cast(), total_size);
             match std::io::stderr().write(buffer_slice) {
                 Ok(bytes_written) => (bytes_written / (item_size as usize)) as GuestUSize,
@@ -559,6 +565,10 @@ fn puts(env: &mut Environment, s: ConstPtr<u8>) -> i32 {
     // TODO: handle errno properly
     set_errno(env, 0);
 
+    if env.options.quiet_game_stdout {
+        return 0;
+    }
+
     let _ = std::io::stdout().write_all(env.mem.cstr_at(s));
     let _ = std::io::stdout().write_all(b"\n");
     // TODO: I/O error handling
@@ -569,6 +579,10 @@ fn puts(env: &mut Environment, s: ConstPtr<u8>) -> i32 {
 fn putchar(env: &mut Environment, c: u8) -> i32 {
     // TODO: handle errno properly
     set_errno(env, 0);
+
+    if env.options.quiet_game_stdout {
+        return c.into();
+    }
 
     let _ = std::io::stdout().write(std::slice::from_ref(&c));
     0

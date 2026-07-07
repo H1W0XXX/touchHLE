@@ -246,6 +246,16 @@ Other options:
         be no graphical output and no input. Only useful for command-line apps.
         Implies --no-error-popup.
 
+    --quiet-game-stdout
+        Suppress stdout, stderr and NSLog output produced by the app itself.
+        This can reduce CPU overhead for noisy apps while keeping touchHLE's
+        own warnings and errors visible.
+
+    --zfr-profile
+        Enable lightweight periodic profiling for Zombie Farm only. Reports
+        guest CPU, ObjC dispatch, run loop, timer and OpenGL presentation
+        timings to the log every few seconds.
+
     --args
         All arguments following this option will be passed to the app (via C's
         argc/argv) rather than processed by touchHLE. This option can't be used

@@ -1553,6 +1553,7 @@ impl Environment {
     }
 
     fn run_inner(&mut self) {
+        let _profile = crate::zfr_profile::scope(crate::zfr_profile::Category::EnvironmentRunInner);
         let initial_thread = self.current_thread;
         assert!(self.threads[initial_thread].active);
         assert!(self.threads[initial_thread].guest_context.is_none());
@@ -1573,6 +1574,7 @@ impl Environment {
                         self.debug_cpu_error(e);
                     }
                 }
+                crate::zfr_profile::maybe_report();
                 if self.remaining_ticks.is_none() {
                     break;
                 }

@@ -324,6 +324,7 @@ pub fn run_run_loop(
     single_iteration: bool,
     unix_time_limit: Option<f64>,
 ) {
+    let _profile = crate::zfr_profile::scope(crate::zfr_profile::Category::RunLoop);
     if single_iteration {
         log_dbg!(
             "Entering run loop {:?} (single iteration), limit {:?}",
@@ -460,6 +461,7 @@ pub fn run_run_loop(
         if is_main_run_loop {
             media_player::handle_players(env);
         }
+        crate::zfr_profile::maybe_report();
 
         // Unfortunately, touchHLE has to poll for certain things repeatedly;
         // it can't just wait until the next event appears.

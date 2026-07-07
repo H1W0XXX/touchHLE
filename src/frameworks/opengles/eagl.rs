@@ -263,6 +263,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (bool)presentRenderbuffer:(NSUInteger)target {
+    let _profile =
+        crate::zfr_profile::scope(crate::zfr_profile::Category::EaglPresentRenderbuffer);
     assert!(target == gles11::RENDERBUFFER_OES);
 
     // The presented frame should be displayed ASAP, but the next one must be
@@ -549,6 +551,7 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, mut pixel_buffer: Vec<u8>) -> (
 /// [present_frame], trying to avoid noticeably modifying OpenGL ES state while
 /// doing so. The front and back buffers are then swapped.
 unsafe fn present_renderbuffer(env: &mut Environment) {
+    let _profile = crate::zfr_profile::scope(crate::zfr_profile::Category::EaglPresentFastPath);
     // Save these for when we need to draw the frame
     let viewport = env.window.as_mut().unwrap().viewport();
     let rotation_matrix = env.window.as_mut().unwrap().rotation_matrix();
@@ -686,7 +689,10 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
     );
 
     // Draw the quad
-    present_frame(gles, viewport, rotation_matrix, virtual_cursor_visible_at);
+    {
+        let _profile = crate::zfr_profile::scope(crate::zfr_profile::Category::GlPresentFrame);
+        present_frame(gles, viewport, rotation_matrix, virtual_cursor_visible_at);
+    }
     if let Some(overlay) = &inspector_overlay {
         ui_view::draw_debug_inspector_overlay(gles, viewport, rotation_matrix, overlay);
     }
@@ -767,7 +773,10 @@ unsafe fn present_renderbuffer(env: &mut Environment) {
 
     // SDL2's documentation warns 0 should be bound to the draw framebuffer
     // when swapping the window, so this is the perfect moment.
-    env.window.as_ref().unwrap().swap_window();
+    {
+        let _profile = crate::zfr_profile::scope(crate::zfr_profile::Category::GlSwapWindow);
+        env.window.as_ref().unwrap().swap_window();
+    }
 
     let mut gles_boxed = gles_ctx.make_current(env.window.as_mut().unwrap());
     let gles = gles_boxed.as_mut();

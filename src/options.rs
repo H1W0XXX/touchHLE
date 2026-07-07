@@ -53,6 +53,8 @@ pub struct Options {
     pub gdb_listen_addrs: Option<Vec<SocketAddr>>,
     pub preferred_languages: Option<Vec<String>>,
     pub headless: bool,
+    pub quiet_game_stdout: bool,
+    pub zfr_profile: bool,
     pub print_fps: bool,
     pub fps_limit: Option<f64>,
     pub force_composition: bool,
@@ -86,6 +88,8 @@ impl Default for Options {
             gdb_listen_addrs: None,
             preferred_languages: None,
             headless: false,
+            quiet_game_stdout: false,
+            zfr_profile: false,
             print_fps: false,
             fps_limit: Some(60.0), // Original iPhone is 60Hz and uses v-sync,
             force_composition: false,
@@ -225,6 +229,10 @@ impl Options {
             self.headless = true;
             // Can't show the dialog box when headless!
             self.popup_errors = false;
+        } else if arg == "--quiet-game-stdout" {
+            self.quiet_game_stdout = true;
+        } else if arg == "--zfr-profile" {
+            self.zfr_profile = true;
         } else if arg == "--print-fps" {
             self.print_fps = true;
         } else if let Some(value) = arg.strip_prefix("--fps-limit=") {

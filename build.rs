@@ -106,7 +106,16 @@ pub fn main() {
         compile_windows_icon_resource(package_root, &out_dir);
         // Rust removed link to advapi32 here https://github.com/rust-lang/rust/pull/138233
         // but sdl2 still depends on it
-        println!("cargo::rustc-link-lib=advapi32")
+        println!("cargo::rustc-link-lib=advapi32");
+        export_high_performance_gpu_hints();
+    }
+}
+
+fn export_high_performance_gpu_hints() {
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap();
+    if target_env == "msvc" {
+        println!("cargo:rustc-link-arg-bin=touchHLE=/EXPORT:NvOptimusEnablement");
+        println!("cargo:rustc-link-arg-bin=touchHLE=/EXPORT:AmdPowerXpressRequestHighPerformance");
     }
 }
 

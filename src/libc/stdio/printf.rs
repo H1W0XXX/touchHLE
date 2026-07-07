@@ -638,7 +638,9 @@ fn vprintf(env: &mut Environment, format: ConstPtr<u8>, arg: VaList) -> i32 {
 
     let res = printf_inner::<false, _>(env, |mem, idx| mem.read(format + idx), arg);
     // TODO: I/O error handling
-    let _ = std::io::stdout().write_all(&res);
+    if !env.options.quiet_game_stdout {
+        let _ = std::io::stdout().write_all(&res);
+    }
     res.len().try_into().unwrap()
 }
 
@@ -841,7 +843,9 @@ fn printf(env: &mut Environment, format: ConstPtr<u8>, args: DotDotDot) -> i32 {
 
     let res = printf_inner::<false, _>(env, |mem, idx| mem.read(format + idx), args.start());
     // TODO: I/O error handling
-    let _ = std::io::stdout().write_all(&res);
+    if !env.options.quiet_game_stdout {
+        let _ = std::io::stdout().write_all(&res);
+    }
     res.len().try_into().unwrap()
 }
 
@@ -1328,7 +1332,9 @@ fn vfprintf(env: &mut Environment, stream: MutPtr<FILE>, format: ConstPtr<u8>, a
     // TODO: I/O error handling
     match env.mem.read(stream).fd {
         STDIN_FILENO => panic!("Unexpected file descriptor"),
+        STDOUT_FILENO if env.options.quiet_game_stdout => {}
         STDOUT_FILENO => _ = std::io::stdout().write_all(&res),
+        STDERR_FILENO if env.options.quiet_game_stdout => {}
         STDERR_FILENO => _ = std::io::stderr().write_all(&res),
         _ => {
             let buf = env.mem.alloc_and_write_cstr(res.as_slice());

@@ -135,10 +135,65 @@ impl ClassHostObject {
             // TODO: avoid storing duplicated signatures globally
             self.guest_method_signatures.insert(sel, types);
         }
+        if count != 0 {
+            objc.clear_method_cache();
+        }
     }
 }
 
 impl ObjC {
+    pub(super) fn lookup_cached_method_class(
+        &self,
+        class: Class,
+        selector: SEL,
+        super_lookup: bool,
+    ) -> Option<Class> {
+        self.method_cache
+            .borrow()
+            .get(&super::MethodCacheKey {
+                class,
+                selector,
+                super_lookup,
+            })
+            .copied()
+    }
+
+    pub(super) fn cache_method_class(
+        &self,
+        class: Class,
+        selector: SEL,
+        super_lookup: bool,
+        implementation_class: Class,
+    ) {
+        self.method_cache.borrow_mut().insert(
+            super::MethodCacheKey {
+                class,
+                selector,
+                super_lookup,
+            },
+            implementation_class,
+        );
+    }
+
+    pub(super) fn remove_cached_method_class(
+        &self,
+        class: Class,
+        selector: SEL,
+        super_lookup: bool,
+    ) {
+        self.method_cache
+            .borrow_mut()
+            .remove(&super::MethodCacheKey {
+                class,
+                selector,
+                super_lookup,
+            });
+    }
+
+    pub(super) fn clear_method_cache(&self) {
+        self.method_cache.borrow_mut().clear();
+    }
+
     /// Checks if the provided class has a method in its class chain (that is
     /// to say, objects of the given class respond to a selector).
     pub fn class_has_method(&self, class: Class, sel: SEL) -> bool {

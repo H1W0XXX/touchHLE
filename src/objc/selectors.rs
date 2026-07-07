@@ -64,6 +64,9 @@ impl SEL {
         // selectors are probably always UTF-8 but this hasn't been verified
         mem.cstr_at_utf8(self.0).unwrap()
     }
+    pub(crate) fn to_bits(self) -> u32 {
+        self.0.to_bits()
+    }
     pub fn is_null(self) -> bool {
         self.0.is_null()
     }
@@ -76,6 +79,22 @@ impl ObjC {
         self.selectors.get(name).copied()
     }
 
+    fn remember_selector_name(&mut self, sel: SEL, name: &str) -> &'static str {
+        if let Some(existing) = self.selector_names.get(&sel) {
+            return existing;
+        }
+        let name: &'static str = Box::leak(name.to_string().into_boxed_str());
+        self.selector_names.insert(sel, name);
+        name
+    }
+
+    pub(super) fn selector_name(&mut self, sel: SEL, mem: &Mem) -> &'static str {
+        if let Some(name) = self.selector_names.get(&sel) {
+            return name;
+        }
+        self.remember_selector_name(sel, sel.as_str(mem))
+    }
+
     /// Register a selector using a Rust [String]. Despite the name there is no
     /// inherent "host" quality of the resulting selector, but because this
     /// function will allocate a new C string, this function is not the most
@@ -86,6 +105,7 @@ impl ObjC {
         }
 
         let sel = SEL(mem.alloc_and_write_cstr(name.as_bytes()).cast_const());
+        self.remember_selector_name(sel, &name);
         self.selectors.insert(name, sel);
         sel
     }
@@ -108,6 +128,7 @@ impl ObjC {
                         continue;
                     }
                     let sel = SEL(mem.alloc_and_write_cstr(name.as_bytes()).cast_const());
+                    self.remember_selector_name(sel, name);
                     self.selectors.insert(name.to_string(), sel);
                 }
             }
@@ -123,6 +144,7 @@ impl ObjC {
             existing_sel
         } else {
             let sel = SEL(sel_cstr);
+            self.remember_selector_name(sel, sel_str);
             self.selectors.insert(sel_str.to_string(), sel);
             sel
         }
