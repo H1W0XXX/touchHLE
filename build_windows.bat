@@ -6,10 +6,12 @@ cd /d "%SCRIPT_DIR%"
 
 set "PROFILE=release"
 set "EXTREME_NATIVE=0"
+set "CPU_TARGET="
 set "FORWARD_ARGS="
 
 :parse_args
 if "%~1"=="" goto args_done
+set "ARG=%~1"
 if /i "%~1"=="debug" (
     set "PROFILE=debug"
     shift
@@ -22,31 +24,71 @@ if /i "%~1"=="release" (
 )
 if /i "%~1"=="native" (
     set "EXTREME_NATIVE=1"
+    set "CPU_TARGET=native"
     shift
     goto parse_args
 )
 if /i "%~1"=="--native" (
     set "EXTREME_NATIVE=1"
+    set "CPU_TARGET=native"
     shift
     goto parse_args
 )
 if /i "%~1"=="extreme" (
     set "EXTREME_NATIVE=1"
+    set "CPU_TARGET=native"
     shift
     goto parse_args
 )
 if /i "%~1"=="--extreme" (
     set "EXTREME_NATIVE=1"
+    set "CPU_TARGET=native"
     shift
     goto parse_args
 )
 if /i "%~1"=="no-native" (
     set "EXTREME_NATIVE=0"
+    set "CPU_TARGET="
     shift
     goto parse_args
 )
 if /i "%~1"=="--no-native" (
     set "EXTREME_NATIVE=0"
+    set "CPU_TARGET="
+    shift
+    goto parse_args
+)
+if /i "%~1"=="--cpu" (
+    if "%~2"=="" (
+        echo Missing CPU name after --cpu.
+        echo Example: build_windows.bat release --cpu raptorlake
+        exit /b 1
+    )
+    set "EXTREME_NATIVE=1"
+    set "CPU_TARGET=%~2"
+    shift
+    shift
+    goto parse_args
+)
+if /i "!ARG:~0,6!"=="--cpu=" (
+    if "!ARG:~6!"=="" (
+        echo Missing CPU name after --cpu=.
+        echo Example: build_windows.bat release --cpu=raptorlake
+        exit /b 1
+    )
+    set "EXTREME_NATIVE=1"
+    set "CPU_TARGET=!ARG:~6!"
+    shift
+    goto parse_args
+)
+if /i "!ARG:~0,4!"=="cpu=" (
+    if "!ARG:~4!"=="" (
+        echo Missing CPU name after cpu=.
+        echo Example: build_windows.bat release cpu=raptorlake
+        exit /b 1
+    )
+    set "EXTREME_NATIVE=1"
+    set "CPU_TARGET=!ARG:~4!"
     shift
     goto parse_args
 )
@@ -112,7 +154,10 @@ if /i "%PROFILE%"=="release" (
 )
 
 if "%EXTREME_NATIVE%"=="1" (
-    set "NATIVE_RUSTFLAGS=-C target-cpu=native"
+    if not defined CPU_TARGET (
+        set "CPU_TARGET=native"
+    )
+    set "NATIVE_RUSTFLAGS=-C target-cpu=!CPU_TARGET!"
     if defined RUSTFLAGS (
         set "RUSTFLAGS=!RUSTFLAGS! !NATIVE_RUSTFLAGS!"
     ) else (
@@ -135,7 +180,7 @@ if defined CMAKE_BIN (
 )
 echo Building touchHLE ^(%PROFILE%^)
 if "%EXTREME_NATIVE%"=="1" (
-    echo Extreme native CPU optimization: enabled
+    echo CPU optimization: enabled ^(target-cpu=!CPU_TARGET!^)
     echo RUSTFLAGS=!RUSTFLAGS!
     if /i "%PROFILE%"=="release" (
         echo Cargo profile: opt-level=!CARGO_PROFILE_RELEASE_OPT_LEVEL!, codegen-units=!CARGO_PROFILE_RELEASE_CODEGEN_UNITS!, lto=!CARGO_PROFILE_RELEASE_LTO!

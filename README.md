@@ -47,6 +47,27 @@ Windows 下需要：
 
 这个模式会启用 `target-cpu=native`、`opt-level=3`、`codegen-units=1` 和 `lto=fat`，生成的程序可能不适合拿到其他电脑运行。去掉 `native` 参数即可关闭。
 
+如果要给指定 CPU 的电脑分发，可以显式指定 Rust/LLVM 的 CPU 名称：
+
+```bat
+.\build_windows.bat release --cpu=raptorlake
+.\build_windows.bat release --cpu=znver4
+```
+
+例如 Intel Core i9-14900K 可以用 `--cpu=raptorlake`。AMD 机器需要按对方实际架构选择，比如 Ryzen 5000 通常是 `znver3`，Ryzen 7000/9000 通常是 `znver4`/`znver5`。如果不确定对方 CPU 支持什么，优先用兼容性更好的 `--cpu=x86-64-v3`。
+
+查询本机 CPU 型号：
+
+```powershell
+Get-CimInstance Win32_Processor | Select-Object -ExpandProperty Name
+```
+
+查询当前 Rust 工具链支持的 CPU 名称：
+
+```powershell
+rustc -C target-cpu=help --target x86_64-pc-windows-msvc
+```
+
 调试构建可以运行：
 
 ```bat

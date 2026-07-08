@@ -47,6 +47,27 @@ For a build that is only meant to run on the current PC, enable native CPU optim
 
 This mode enables `target-cpu=native`, `opt-level=3`, `codegen-units=1`, and `lto=fat`, so the executable may not be suitable for other computers. Remove the `native` argument to turn it off.
 
+For a build intended for a specific CPU family, pass the Rust/LLVM CPU name explicitly:
+
+```bat
+.\build_windows.bat release --cpu=raptorlake
+.\build_windows.bat release --cpu=znver4
+```
+
+For example, Intel Core i9-14900K can use `--cpu=raptorlake`. For AMD systems, choose the target based on the recipient's CPU architecture, such as `znver3` for many Ryzen 5000 CPUs, and `znver4`/`znver5` for many Ryzen 7000/9000 CPUs. If you are not sure what the recipient supports, prefer the more compatible `--cpu=x86-64-v3`.
+
+To check the local CPU model in PowerShell:
+
+```powershell
+Get-CimInstance Win32_Processor | Select-Object -ExpandProperty Name
+```
+
+To list CPU names supported by the current Rust toolchain:
+
+```powershell
+rustc -C target-cpu=help --target x86_64-pc-windows-msvc
+```
+
 For a debug build:
 
 ```bat
