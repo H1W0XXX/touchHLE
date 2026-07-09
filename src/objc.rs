@@ -58,6 +58,7 @@ use properties::{ivar_list_t, objc_copyStruct, objc_getProperty, objc_setPropert
 use selectors::sel_registerName;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
 use synchronization::{objc_sync_enter, objc_sync_exit};
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -141,6 +142,17 @@ impl ObjC {
 static LAST_MESSAGE_RECEIVER: AtomicU32 = AtomicU32::new(0);
 static LAST_MESSAGE_SELECTOR: AtomicU32 = AtomicU32::new(0);
 static LAST_MESSAGE_CLASS: AtomicU32 = AtomicU32::new(0);
+
+pub(crate) fn last_message_debug_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        cfg!(debug_assertions)
+            || std::env::var("TOUCHHLE_OBJC_LAST_MESSAGE_DEBUG")
+                .ok()
+                .as_deref()
+                == Some("1")
+    })
+}
 
 pub(crate) fn set_global_last_message_debug(debug: ObjCMessageDebug) {
     LAST_MESSAGE_RECEIVER.store(debug.receiver.to_bits(), Ordering::Relaxed);
