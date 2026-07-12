@@ -167,14 +167,13 @@ use zombie_farm::{
     trace_zombie_farm_layout_stret_return, trace_zombie_farm_layout_to_console,
     trace_zombie_farm_quest_message, trace_zombie_farm_quest_normal_return,
     trace_zombie_farm_status_message, trace_zombie_farm_status_normal_return,
-    zombie_farm_begin_multicolumn_cell_request, zombie_farm_begin_zombie_cell_assignment,
-    zombie_farm_cell_content_size_override, zombie_farm_end_multicolumn_cell_request,
+    zombie_farm_begin_zombie_cell_assignment, zombie_farm_cell_content_size_override,
     zombie_farm_finish_zombie_cell_assignment, zombie_farm_ignore_spurious_operation_done,
     zombie_farm_layout_arg_details, zombie_farm_log_quest_object_state,
     zombie_farm_log_status_object_state, zombie_farm_needs_post_dispatch_workarounds,
     zombie_farm_needs_pre_dispatch_workarounds, zombie_farm_post_dispatch_workarounds,
     zombie_farm_pre_dispatch_workarounds, zombie_farm_prepare_cctable_cell,
-    zombie_farm_prepare_multicolumn_table_reuse, zombie_farm_quest_arg_details,
+    zombie_farm_quest_arg_details,
     zombie_farm_quest_trace_enabled, zombie_farm_return_nil_for_stale_object_message,
     zombie_farm_should_return_self_for_unimplemented_cocos_reverse, zombie_farm_status_arg_details,
     zombie_farm_status_trace_enabled, zombie_farm_uses_playforge_bundle,
@@ -283,12 +282,6 @@ fn objc_msgSend_inner(
     if selector_name == "_setIndex:forCell:" {
         zombie_farm_prepare_cctable_cell(env, receiver, selector);
     }
-    if matches!(
-        selector_name,
-        "_moveCellOutOfSight:" | "reloadData" | "setDataSource:" | "dealloc"
-    ) {
-        zombie_farm_prepare_multicolumn_table_reuse(env, receiver, selector_name);
-    }
     env.cpu
         .regs_mut()
         .copy_from_slice(&regs_before_zombie_farm_prepare);
@@ -296,17 +289,17 @@ fn objc_msgSend_inner(
     // Traverse the chain of superclasses to find the method implementation.
 
     let super_lookup = super2.is_some();
-    let cached_method_class =
-        env.objc
-            .lookup_cached_method_class(orig_class, selector, super_lookup);
-    let mut class = if let Some(cached_method_class) = cached_method_class {
+    let cached_method = env
+        .objc
+        .lookup_cached_method_class(orig_class, selector, super_lookup);
+    let mut class = if let Some(cached_method) = cached_method {
         crate::zfr_profile::count(crate::zfr_profile::Category::ObjcMsgCacheHit);
-        cached_method_class
+        cached_method.implementation_class
     } else {
         crate::zfr_profile::count(crate::zfr_profile::Category::ObjcMsgCacheMiss);
         orig_class
     };
-    let mut using_cached_method_class = cached_method_class.is_some();
+    let mut using_cached_method_class = cached_method.is_some();
     loop {
         if class == nil {
             assert!(class != orig_class);
@@ -383,10 +376,17 @@ fn objc_msgSend_inner(
                 continue;
             }
 
-            if let Some(imp) = methods.get(&selector) {
+            let imp = if using_cached_method_class {
+                cached_method
+                    .filter(|cached| cached.implementation_class == class)
+                    .map(|cached| cached.imp)
+            } else {
+                methods.get(&selector).copied()
+            };
+            if let Some(imp) = imp {
                 if !using_cached_method_class {
                     env.objc
-                        .cache_method_class(orig_class, selector, super_lookup, class);
+                        .cache_method_class(orig_class, selector, super_lookup, class, imp);
                 }
                 log_dbg!("Found method on: {}", name);
                 let zombie_farm_bundle = zombie_farm_uses_playforge_bundle(env);
@@ -589,12 +589,6 @@ fn objc_msgSend_inner(
                         selector_name,
                         env.cpu.regs(),
                     );
-                let zombie_farm_multicolumn_request_started = zombie_farm_bundle
-                    && zombie_farm_begin_multicolumn_cell_request(
-                        env,
-                        selector_name,
-                        env.cpu.regs(),
-                    );
                 let zombie_farm_zombie_cell_assignment_started = zombie_farm_bundle
                     && zombie_farm_begin_zombie_cell_assignment(
                         env,
@@ -676,7 +670,6 @@ Type mismatch when sending message {} to {:?}!
                 crate::zombie_farm_debug::end_cell_build_scope(
                     zombie_farm_cell_build_scope_started,
                 );
-                zombie_farm_end_multicolumn_cell_request(zombie_farm_multicolumn_request_started);
                 zombie_farm_finish_zombie_cell_assignment(
                     env,
                     zombie_farm_zombie_cell_assignment_started,

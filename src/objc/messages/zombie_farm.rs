@@ -690,36 +690,14 @@ fn zombie_farm_sync_operations() -> &'static Mutex<HashMap<u32, ZombieFarmSyncOp
 }
 
 #[derive(Default)]
-struct ZombieFarmMultiColumnReuseTable {
-    cell_to_index: HashMap<u32, u32>,
-    reusable_by_index: HashMap<u32, u32>,
-}
-
-#[derive(Default)]
-struct ZombieFarmMultiColumnReuseState {
-    current_requests: Vec<(u32, u32)>,
-    tables: HashMap<u32, ZombieFarmMultiColumnReuseTable>,
-}
-
-#[derive(Default)]
 struct ZombieFarmZombieCellState {
     current_assignments: Vec<(u32, u32)>,
     last_zombie_by_cell: HashMap<u32, u32>,
     last_zombie_key_by_cell: HashMap<u32, String>,
 }
 
-static ZOMBIE_FARM_MULTICOLUMN_REUSE: OnceLock<Mutex<ZombieFarmMultiColumnReuseState>> =
-    OnceLock::new();
 static ZOMBIE_FARM_ZOMBIE_CELL_STATE: OnceLock<Mutex<ZombieFarmZombieCellState>> = OnceLock::new();
 static ZOMBIE_FARM_SELECTOR_DUMPS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-static ZOMBIE_FARM_SELECTION_MENU_PRELOADED: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
-static ZOMBIE_FARM_SELECTION_MENU_PRELOAD_IN_PROGRESS: OnceLock<Mutex<HashSet<u32>>> =
-    OnceLock::new();
-
-fn zombie_farm_multicolumn_reuse_state() -> &'static Mutex<ZombieFarmMultiColumnReuseState> {
-    ZOMBIE_FARM_MULTICOLUMN_REUSE
-        .get_or_init(|| Mutex::new(ZombieFarmMultiColumnReuseState::default()))
-}
 
 fn zombie_farm_zombie_cell_state() -> &'static Mutex<ZombieFarmZombieCellState> {
     ZOMBIE_FARM_ZOMBIE_CELL_STATE.get_or_init(|| Mutex::new(ZombieFarmZombieCellState::default()))
@@ -727,260 +705,6 @@ fn zombie_farm_zombie_cell_state() -> &'static Mutex<ZombieFarmZombieCellState> 
 
 fn zombie_farm_selector_dumps() -> &'static Mutex<HashSet<String>> {
     ZOMBIE_FARM_SELECTOR_DUMPS.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-fn zombie_farm_selection_menu_preloaded() -> &'static Mutex<HashSet<u32>> {
-    ZOMBIE_FARM_SELECTION_MENU_PRELOADED.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-fn zombie_farm_selection_menu_preload_in_progress() -> &'static Mutex<HashSet<u32>> {
-    ZOMBIE_FARM_SELECTION_MENU_PRELOAD_IN_PROGRESS.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-fn zombie_farm_supports_index_cached_reuse(env: &Environment, table: id) -> bool {
-    if table == nil {
-        return false;
-    }
-    let class = ObjC::read_isa(table, &env.mem);
-    class != nil
-        && matches!(
-            env.objc.try_get_class_name(class),
-            Some("CCTableView" | "CCMultiColumnTableView")
-        )
-}
-
-fn zombie_farm_is_selection_menu_table(env: &Environment, table: id) -> bool {
-    if table == nil {
-        return false;
-    }
-    let Some(parent) = zombie_farm_read_object_ivar(env, table, "parent_") else {
-        return false;
-    };
-    zombie_farm_object_class_name(env, parent) == Some("ZFZombieSelectionMenu")
-}
-
-fn zombie_farm_clear_selection_menu_preload_state(table_bits: u32) {
-    zombie_farm_selection_menu_preloaded()
-        .lock()
-        .unwrap()
-        .remove(&table_bits);
-    zombie_farm_selection_menu_preload_in_progress()
-        .lock()
-        .unwrap()
-        .remove(&table_bits);
-}
-
-pub(super) fn zombie_farm_begin_multicolumn_cell_request(
-    env: &Environment,
-    selector_name: &str,
-    regs: &[u32; 16],
-) -> bool {
-    if selector_name != "table:cellAtIndex:" {
-        return false;
-    }
-    let table = id::from_bits(regs[2]);
-    if !zombie_farm_supports_index_cached_reuse(env, table) {
-        return false;
-    }
-    zombie_farm_multicolumn_reuse_state()
-        .lock()
-        .unwrap()
-        .current_requests
-        .push((table.to_bits(), regs[3]));
-    log_dbg!(
-        "ZombieFarm cache trace: begin request table=0x{:x} index={}",
-        table.to_bits(),
-        regs[3]
-    );
-    true
-}
-
-pub(super) fn zombie_farm_end_multicolumn_cell_request(started: bool) {
-    if !started {
-        return;
-    }
-    let mut state = zombie_farm_multicolumn_reuse_state().lock().unwrap();
-    let popped = state.current_requests.pop();
-    log_dbg!("ZombieFarm cache trace: end request popped={popped:?}");
-}
-
-fn zombie_farm_current_multicolumn_request(table_bits: u32) -> Option<u32> {
-    let state = zombie_farm_multicolumn_reuse_state().lock().unwrap();
-    state
-        .current_requests
-        .iter()
-        .rev()
-        .find_map(|&(table, index)| (table == table_bits).then_some(index))
-}
-
-fn zombie_farm_clear_multicolumn_table_cache(table_bits: u32) {
-    let mut state = zombie_farm_multicolumn_reuse_state().lock().unwrap();
-    state.tables.remove(&table_bits);
-    state
-        .current_requests
-        .retain(|&(table, _)| table != table_bits);
-    zombie_farm_clear_selection_menu_preload_state(table_bits);
-}
-
-fn zombie_farm_note_multicolumn_cell_assignment(table_bits: u32, index: u32, cell_bits: u32) {
-    let mut state = zombie_farm_multicolumn_reuse_state().lock().unwrap();
-    let table = state.tables.entry(table_bits).or_default();
-    table.cell_to_index.insert(cell_bits, index);
-    table
-        .reusable_by_index
-        .retain(|_, cached_cell| *cached_cell != cell_bits);
-    log_dbg!(
-        "ZombieFarm cache trace: assign table=0x{:x} index={} cell=0x{:x}",
-        table_bits,
-        index,
-        cell_bits
-    );
-}
-
-fn zombie_farm_note_multicolumn_cell_offscreen(table_bits: u32, cell_bits: u32) {
-    let mut state = zombie_farm_multicolumn_reuse_state().lock().unwrap();
-    let Some(table) = state.tables.get_mut(&table_bits) else {
-        log_dbg!(
-            "ZombieFarm cache trace: offscreen table=0x{:x} cell=0x{:x} missing table state",
-            table_bits,
-            cell_bits
-        );
-        return;
-    };
-    let Some(&index) = table.cell_to_index.get(&cell_bits) else {
-        log_dbg!(
-            "ZombieFarm cache trace: offscreen table=0x{:x} cell=0x{:x} missing index mapping",
-            table_bits,
-            cell_bits
-        );
-        return;
-    };
-    table.reusable_by_index.insert(index, cell_bits);
-    log_dbg!(
-        "ZombieFarm cache trace: offscreen table=0x{:x} index={} cached_cell=0x{:x}",
-        table_bits,
-        index,
-        cell_bits
-    );
-}
-
-fn zombie_farm_take_multicolumn_cached_cell(table_bits: u32, index: u32) -> Option<id> {
-    let mut state = zombie_farm_multicolumn_reuse_state().lock().unwrap();
-    let Some(table) = state.tables.get_mut(&table_bits) else {
-        log_dbg!(
-            "ZombieFarm cache trace: take table=0x{:x} index={} no table state",
-            table_bits,
-            index
-        );
-        return None;
-    };
-    let Some(cell_bits) = table.reusable_by_index.remove(&index) else {
-        log_dbg!(
-            "ZombieFarm cache trace: take table=0x{:x} index={} no cached cell",
-            table_bits,
-            index
-        );
-        return None;
-    };
-    let matches = table.cell_to_index.get(&cell_bits).copied() == Some(index);
-    log_dbg!(
-        "ZombieFarm cache trace: take table=0x{:x} index={} cell=0x{:x} matches={}",
-        table_bits,
-        index,
-        cell_bits,
-        matches
-    );
-    matches.then(|| id::from_bits(cell_bits))
-}
-
-fn zombie_farm_preload_selection_menu_table(env: &mut Environment, table: id) {
-    if !zombie_farm_is_selection_menu_table(env, table) {
-        return;
-    }
-
-    let table_bits = table.to_bits();
-    if zombie_farm_selection_menu_preloaded()
-        .lock()
-        .unwrap()
-        .contains(&table_bits)
-    {
-        return;
-    }
-    {
-        let mut in_progress = zombie_farm_selection_menu_preload_in_progress()
-            .lock()
-            .unwrap();
-        if !in_progress.insert(table_bits) {
-            return;
-        }
-    }
-
-    let regs = *env.cpu.regs();
-    let result = (|| {
-        let data_source = zombie_farm_get_id_if_responds(env, table, "dataSource")?;
-        let number_selector = env.objc.lookup_selector("numberOfCellsInTable:")?;
-        let cell_selector = env.objc.lookup_selector("table:cellAtIndex:")?;
-        let set_index_selector = env.objc.lookup_selector("_setIndex:forCell:")?;
-        let add_selector = env.objc.lookup_selector("_addCellIfNecessary:")?;
-        let existing_selector = env.objc.lookup_selector("cellWithIndex:")?;
-
-        if !env
-            .objc
-            .object_has_method(&env.mem, data_source, number_selector)
-            || !env
-                .objc
-                .object_has_method(&env.mem, data_source, cell_selector)
-            || !env
-                .objc
-                .object_has_method(&env.mem, table, set_index_selector)
-            || !env.objc.object_has_method(&env.mem, table, add_selector)
-            || !env
-                .objc
-                .object_has_method(&env.mem, table, existing_selector)
-        {
-            return None;
-        }
-
-        let count: NSUInteger =
-            msg_send_no_type_checking(env, (data_source, number_selector, table));
-        let mut built = 0usize;
-        let mut reused = 0usize;
-        for index in 0..count {
-            let existing: id = msg_send_no_type_checking(env, (table, existing_selector, index));
-            if existing != nil {
-                reused += 1;
-                continue;
-            }
-            let cell: id =
-                msg_send_no_type_checking(env, (data_source, cell_selector, table, index));
-            if cell == nil {
-                continue;
-            }
-            let _: () = msg_send_no_type_checking(env, (table, set_index_selector, index, cell));
-            let _: () = msg_send_no_type_checking(env, (table, add_selector, cell));
-            built += 1;
-        }
-        Some((count, built, reused))
-    })();
-    env.cpu.regs_mut().copy_from_slice(&regs);
-
-    zombie_farm_selection_menu_preload_in_progress()
-        .lock()
-        .unwrap()
-        .remove(&table_bits);
-    if let Some((count, built, reused)) = result {
-        zombie_farm_selection_menu_preloaded()
-            .lock()
-            .unwrap()
-            .insert(table_bits);
-        log!(
-            "ZombieFarm preload trace: preloaded selection menu table=0x{:x} count={} built={} existing={}",
-            table_bits,
-            count,
-            built,
-            reused
-        );
-    }
 }
 
 fn zombie_farm_find_cell_zombie_actor(env: &mut Environment, cell: id) -> Option<id> {
@@ -5172,49 +4896,6 @@ fn zombie_farm_disable_cctable_cell_reuse(
         return false;
     }
 
-    if zombie_farm_is_selection_menu_table(env, receiver) {
-        crate::zombie_farm_debug::record_table_object_return(
-            receiver,
-            &class_name,
-            selector_name,
-            nil,
-            None,
-        );
-        env.cpu.regs_mut()[0] = nil.to_bits();
-        return true;
-    }
-
-    if matches!(
-        class_name.as_str(),
-        "CCTableView" | "CCMultiColumnTableView"
-    ) {
-        let table_bits = receiver.to_bits();
-        if let Some(index) = zombie_farm_current_multicolumn_request(table_bits) {
-            if let Some(cell) = zombie_farm_take_multicolumn_cached_cell(table_bits, index) {
-                zombie_farm_log_cached_cell_reuse_candidates(
-                    env,
-                    receiver,
-                    index,
-                    cell,
-                    "dequeueCell",
-                );
-                crate::zombie_farm_debug::record_table_object_return(
-                    receiver,
-                    &class_name,
-                    selector_name,
-                    cell,
-                    zombie_farm_object_class_name(env, cell),
-                );
-                crate::zombie_farm_debug::record_layout_event(format!(
-                    "[0x{:x} {} dequeueCell] reused cached row index {} cell {:?}",
-                    table_bits, class_name, index, cell
-                ));
-                env.cpu.regs_mut()[0] = cell.to_bits();
-                return true;
-            }
-        }
-    }
-
     crate::zombie_farm_debug::record_table_object_return(
         receiver,
         &class_name,
@@ -5228,22 +4909,6 @@ fn zombie_farm_disable_cctable_cell_reuse(
         class_name
     ));
     env.cpu.regs_mut()[0] = nil.to_bits();
-    true
-}
-
-fn zombie_farm_skip_selection_menu_cell_recycle(
-    env: &mut Environment,
-    receiver: id,
-    selector_name: &str,
-) -> bool {
-    if selector_name != "_moveCellOutOfSight:"
-        || receiver == nil
-        || !zombie_farm_uses_playforge_bundle(env)
-        || !zombie_farm_is_selection_menu_table(env, receiver)
-    {
-        return false;
-    }
-    env.cpu.regs_mut()[0] = 0;
     true
 }
 
@@ -5372,20 +5037,6 @@ pub(super) fn zombie_farm_prepare_cctable_cell(env: &mut Environment, receiver: 
         }
     }
 
-    if matches!(
-        table_class_name.as_str(),
-        "CCTableView" | "CCMultiColumnTableView"
-    ) {
-        zombie_farm_note_multicolumn_cell_assignment(receiver.to_bits(), index, cell.to_bits());
-        zombie_farm_log_cached_cell_reuse_candidates(
-            env,
-            receiver,
-            index,
-            cell,
-            "_setIndex:forCell:",
-        );
-    }
-
     log_dbg!(
         "ZombieFarm workaround: prepared {} index {} cell {:?} node {:?} contentSize={} synced={:?}",
         cell_class_name,
@@ -5476,43 +5127,6 @@ fn zombie_farm_cell_size(env: &mut Environment, cell: id) -> Option<CGSize> {
     None
 }
 
-pub(super) fn zombie_farm_prepare_multicolumn_table_reuse(
-    env: &mut Environment,
-    receiver: id,
-    selector_name: &str,
-) {
-    if !env
-        .bundle
-        .bundle_identifier()
-        .starts_with("com.playforge.Z")
-        || receiver == nil
-        || !zombie_farm_supports_index_cached_reuse(env, receiver)
-    {
-        return;
-    }
-
-    if zombie_farm_is_selection_menu_table(env, receiver)
-        && matches!(selector_name, "reloadData" | "setDataSource:")
-    {
-        zombie_farm_clear_selection_menu_preload_state(receiver.to_bits());
-        zombie_farm_preload_selection_menu_table(env, receiver);
-        return;
-    }
-
-    match selector_name {
-        "_moveCellOutOfSight:" => {
-            let cell = id::from_bits(env.cpu.regs()[2]);
-            if cell != nil {
-                zombie_farm_note_multicolumn_cell_offscreen(receiver.to_bits(), cell.to_bits());
-            }
-        }
-        "reloadData" | "setDataSource:" | "dealloc" => {
-            zombie_farm_clear_multicolumn_table_cache(receiver.to_bits());
-        }
-        _ => {}
-    }
-}
-
 fn zombie_farm_relayout_actor_attachments(_env: &mut Environment, _cell: id) -> bool {
     false
 }
@@ -5541,25 +5155,6 @@ fn zombie_farm_log_reuse_relayout_candidates(env: &mut Environment, cell: id) {
             break;
         }
     }
-}
-
-fn zombie_farm_log_cached_cell_reuse_candidates(
-    env: &mut Environment,
-    table: id,
-    index: u32,
-    cell: id,
-    reason: &str,
-) {
-    crate::zombie_farm_debug::record_layout_event(format!(
-        "[0x{:x} cached cell reuse] table {:?} index {} cell {:?} reason={}",
-        table.to_bits(),
-        table,
-        index,
-        cell,
-        reason
-    ));
-    zombie_farm_log_class_selectors_once(env, table, "cached-table-reuse");
-    zombie_farm_log_reuse_relayout_candidates(env, cell);
 }
 
 fn zombie_farm_skip_redundant_zombie_cell_rebuild(
@@ -5690,9 +5285,6 @@ pub(super) fn zombie_farm_pre_dispatch_workarounds(
         if zombie_farm_skip_redundant_zombie_cell_rebuild(env, receiver, selector_name) {
             return true;
         }
-        if zombie_farm_skip_selection_menu_cell_recycle(env, receiver, selector_name) {
-            return true;
-        }
         if zombie_farm_disable_cctable_cell_reuse(env, receiver, selector_name) {
             return true;
         }
@@ -5810,11 +5402,6 @@ pub(super) fn zombie_farm_pre_dispatch_workarounds(
         }
         "setZombie:" | "dealloc" => {
             if zombie_farm_skip_redundant_zombie_cell_rebuild(env, receiver, selector_name) {
-                return true;
-            }
-        }
-        "_moveCellOutOfSight:" => {
-            if zombie_farm_skip_selection_menu_cell_recycle(env, receiver, selector_name) {
                 return true;
             }
         }

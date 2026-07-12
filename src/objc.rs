@@ -68,6 +68,12 @@ pub(super) struct MethodCacheKey {
     super_lookup: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct MethodCacheValue {
+    implementation_class: Class,
+    imp: IMP,
+}
+
 /// Typedef for `NSZone *`. This is a [fossil type] found in the signature of
 /// `allocWithZone:` and similar methods. Its value is always ignored.
 ///
@@ -95,7 +101,7 @@ pub struct ObjC {
 
     /// Cache from an Objective-C lookup starting point to the class that
     /// actually provides the method.
-    method_cache: RefCell<HashMap<MethodCacheKey, Class>>,
+    method_cache: RefCell<HashMap<MethodCacheKey, MethodCacheValue>>,
 
     /// Stable class names for hot debug/workaround checks.
     class_names: RefCell<HashMap<Class, &'static str>>,

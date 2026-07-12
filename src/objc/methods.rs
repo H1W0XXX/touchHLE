@@ -24,6 +24,7 @@ use std::any::TypeId;
 /// "guest methods" (functions in the guest app). Either way, the function needs
 /// to conform to the same ABI: [id] and [SEL] must be its first two parameters.
 #[allow(clippy::upper_case_acronyms)]
+#[derive(Clone, Copy)]
 pub enum IMP {
     Host(&'static dyn HostIMP),
     Guest(GuestIMP),
@@ -147,7 +148,7 @@ impl ObjC {
         class: Class,
         selector: SEL,
         super_lookup: bool,
-    ) -> Option<Class> {
+    ) -> Option<super::MethodCacheValue> {
         self.method_cache
             .borrow()
             .get(&super::MethodCacheKey {
@@ -164,6 +165,7 @@ impl ObjC {
         selector: SEL,
         super_lookup: bool,
         implementation_class: Class,
+        imp: IMP,
     ) {
         self.method_cache.borrow_mut().insert(
             super::MethodCacheKey {
@@ -171,7 +173,10 @@ impl ObjC {
                 selector,
                 super_lookup,
             },
-            implementation_class,
+            super::MethodCacheValue {
+                implementation_class,
+                imp,
+            },
         );
     }
 

@@ -50,6 +50,7 @@ const CATEGORY_NAMES: [&str; CATEGORY_COUNT] = [
 
 struct Counter {
     calls: AtomicU64,
+    samples: AtomicU64,
     nanos: AtomicU64,
 }
 
@@ -57,6 +58,7 @@ impl Counter {
     const fn new() -> Self {
         Self {
             calls: AtomicU64::new(0),
+            samples: AtomicU64::new(0),
             nanos: AtomicU64::new(0),
         }
     }
@@ -65,6 +67,7 @@ impl Counter {
 #[derive(Clone, Copy, Default)]
 struct Snapshot {
     calls: u64,
+    samples: u64,
     nanos: u64,
 }
 
@@ -107,9 +110,26 @@ pub fn is_enabled() -> bool {
 }
 
 pub fn scope(category: Category) -> Scope {
+    if !is_enabled() {
+        return Scope {
+            category,
+            start: None,
+        };
+    }
+
+    let counter = &COUNTERS[category as usize];
+    let call = counter.calls.fetch_add(1, Ordering::Relaxed) + 1;
+    let sample_every = match category {
+        Category::GuestCpuRun
+        | Category::EnvironmentRunInner
+        | Category::ObjcMsgSend
+        | Category::ObjcImpCall => 1024,
+        Category::ZombiePreDispatch | Category::ZombiePostDispatch => 256,
+        _ => 1,
+    };
     Scope {
         category,
-        start: is_enabled().then(Instant::now),
+        start: call.is_multiple_of(sample_every).then(Instant::now),
     }
 }
 
@@ -129,14 +149,14 @@ pub struct Scope {
 impl Drop for Scope {
     fn drop(&mut self) {
         if let Some(start) = self.start {
-            add(self.category, start.elapsed());
+            add_sample(self.category, start.elapsed());
         }
     }
 }
 
-fn add(category: Category, elapsed: Duration) {
+fn add_sample(category: Category, elapsed: Duration) {
     let counter = &COUNTERS[category as usize];
-    counter.calls.fetch_add(1, Ordering::Relaxed);
+    counter.samples.fetch_add(1, Ordering::Relaxed);
     counter
         .nanos
         .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
@@ -182,6 +202,7 @@ fn report(label: &str) {
     for (index, counter) in COUNTERS.iter().enumerate() {
         current[index] = Snapshot {
             calls: counter.calls.load(Ordering::Relaxed),
+            samples: counter.samples.load(Ordering::Relaxed),
             nanos: counter.nanos.load(Ordering::Relaxed),
         };
     }
@@ -193,28 +214,42 @@ fn report(label: &str) {
 
     echo!("touchHLE ZFR profile ({label}, {:.1}s elapsed):", elapsed);
     echo!(
-        "{:<28} {:>10} {:>12} {:>12} {:>12}",
+        "{:<28} {:>10} {:>10} {:>12} {:>12} {:>12}",
         "category",
         "calls",
-        "total_ms",
-        "delta_ms",
+        "samples",
+        "est_total_ms",
+        "est_delta_ms",
         "avg_us"
     );
     for index in 0..CATEGORY_COUNT {
         let snapshot = current[index];
         let previous = last[index];
+        let delta_calls = snapshot.calls.saturating_sub(previous.calls);
+        let delta_samples = snapshot.samples.saturating_sub(previous.samples);
         let delta_nanos = snapshot.nanos.saturating_sub(previous.nanos);
-        let avg_us = if snapshot.calls == 0 {
+        let estimated_total_nanos = if snapshot.samples == 0 {
+            0
+        } else {
+            snapshot.nanos.saturating_mul(snapshot.calls) / snapshot.samples
+        };
+        let estimated_delta_nanos = if delta_samples == 0 {
+            0
+        } else {
+            delta_nanos.saturating_mul(delta_calls) / delta_samples
+        };
+        let avg_us = if snapshot.samples == 0 {
             0.0
         } else {
-            snapshot.nanos as f64 / snapshot.calls as f64 / 1_000.0
+            snapshot.nanos as f64 / snapshot.samples as f64 / 1_000.0
         };
         echo!(
-            "{:<28} {:>10} {:>12.3} {:>12.3} {:>12.3}",
+            "{:<28} {:>10} {:>10} {:>12.3} {:>12.3} {:>12.3}",
             CATEGORY_NAMES[index],
             snapshot.calls,
-            snapshot.nanos as f64 / 1_000_000.0,
-            delta_nanos as f64 / 1_000_000.0,
+            snapshot.samples,
+            estimated_total_nanos as f64 / 1_000_000.0,
+            estimated_delta_nanos as f64 / 1_000_000.0,
             avg_us
         );
     }
