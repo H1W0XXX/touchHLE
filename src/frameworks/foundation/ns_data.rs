@@ -169,7 +169,18 @@ pub const CLASSES: ClassExports = objc_classes! {
     log_dbg!("[(NSData*){:?} initWithContentsOfFile:{:?}]", this, path);
     let read_path = ns_property_list_serialization::zombie_farm_plist_fallback_path(env, &path)
         .unwrap_or_else(|| GuestPath::new(&path).to_owned());
-    let Ok(bytes) = env.fs.read(read_path.as_ref()) else {
+    let bytes = env.fs.read(read_path.as_ref()).or_else(|_| {
+        let materialized = crate::frameworks::game_kit::materialize_zombie_farm_neighbor_save(
+            env,
+            read_path.as_str(),
+        );
+        if materialized {
+            env.fs.read(read_path.as_ref())
+        } else {
+            Err(())
+        }
+    });
+    let Ok(bytes) = bytes else {
         if is_zombie_farm_save_path(&path) {
             log!("ZombieFarm save: NSData read missing '{}'", path);
         }

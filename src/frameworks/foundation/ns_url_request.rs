@@ -84,7 +84,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     );
 
     // Preserving old behaviour
-    if !env.options.network_access {
+    if !env.options.network_access
+        && !super::ns_url_connection::zombie_farm_http_redirect_enabled(env)
+    {
         log_dbg!(
             "Network access is disabled, [(NSURLRequest *){:?} initWithURL:{} cachePolicy:{} timeoutInterval:{}] -> nil",
             this,
@@ -109,6 +111,12 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (id)HTTPBody {
     env.objc.borrow::<NSURLRequestHostObject>(this).http_body
+}
+- (id)HTTPMethod {
+    env.objc.borrow::<NSURLRequestHostObject>(this).http_method
+}
+- (id)allHTTPHeaderFields {
+    env.objc.borrow::<NSURLRequestHostObject>(this).http_header_fields
 }
 - (NSTimeInterval)timeoutInterval {
     env.objc.borrow::<NSURLRequestHostObject>(this).timeout_interval

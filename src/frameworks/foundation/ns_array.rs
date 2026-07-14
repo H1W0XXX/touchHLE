@@ -150,6 +150,27 @@ pub const CLASSES: ClassExports = objc_classes! {
     autorelease(env, array)
 }
 
+// This designated initializer belongs to NSArray itself so concrete mutable
+// and immutable class-cluster implementations can both inherit it.
+- (id)initWithObjects:(id)firstObj, ...args {
+    let mut objects = Vec::new();
+    if firstObj != nil {
+        retain(env, firstObj);
+        objects.push(firstObj);
+        let mut varargs = args.start();
+        loop {
+            let next_arg: id = varargs.next(env);
+            if next_arg == nil {
+                break;
+            }
+            retain(env, next_arg);
+            objects.push(next_arg);
+        }
+    }
+    replace_array_contents(env, this, objects);
+    this
+}
+
 // These probably comes from some category related to plists.
 - (id)initWithContentsOfFile:(id)path { // NSString*
     release(env, this);
@@ -277,6 +298,22 @@ pub const CLASSES: ClassExports = objc_classes! {
                        context:(MutVoidPtr)context {
     let array = msg![env; this mutableCopy];
     () = msg![env; array sortUsingFunction:comparator context:context];
+    let array_imm = msg![env; array copy];
+    release(env, array);
+    autorelease(env, array_imm)
+}
+
+- (id)sortedArrayUsingSelector:(SEL)comparator {
+    let array = msg![env; this mutableCopy];
+    () = msg![env; array sortUsingSelector:comparator];
+    let array_imm = msg![env; array copy];
+    release(env, array);
+    autorelease(env, array_imm)
+}
+
+- (id)sortedArrayUsingDescriptors:(id)descriptors { // NSArray*
+    let array = msg![env; this mutableCopy];
+    () = msg![env; array sortUsingDescriptors:descriptors];
     let array_imm = msg![env; array copy];
     release(env, array);
     autorelease(env, array_imm)
@@ -543,18 +580,6 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
     let res = from_vec(env, tmp);
     autorelease(env, res)
-}
-
-- (id)sortedArrayUsingSelector:(SEL)comparator {
-    let new = msg![env; this mutableCopy];
-    () = msg![env; new sortUsingSelector:comparator];
-    autorelease(env, new)
-}
-
-- (id)sortedArrayUsingDescriptors:(id)descriptors { // NSArray*
-    let new = msg![env; this mutableCopy];
-    () = msg![env; new sortUsingDescriptors:descriptors];
-    autorelease(env, new)
 }
 
 @end

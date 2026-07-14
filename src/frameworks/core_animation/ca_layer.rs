@@ -234,7 +234,19 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow_mut::<CALayerHostObject>(layer).superlayer = this;
 
     let CALayerHostObject { ref mut sublayers, .. } = env.objc.borrow_mut(this);
-    sublayers.insert(idx.try_into().unwrap(), layer);
+    let requested_idx: usize = idx.try_into().unwrap();
+    let insertion_idx = requested_idx.min(sublayers.len());
+    if insertion_idx != requested_idx {
+        log_dbg!(
+            "Clamping [(CALayer*){:?} insertSublayer:{:?} atIndex:{}] to index {} ({} existing sublayers)",
+            this,
+            layer,
+            idx,
+            insertion_idx,
+            sublayers.len()
+        );
+    }
+    sublayers.insert(insertion_idx, layer);
 }
 
 - (())insertSublayer:(id)layer below:(id)sibling {

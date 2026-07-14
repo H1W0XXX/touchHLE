@@ -9,13 +9,15 @@ use super::{autorelease, id, msg_send_no_type_checking, nil, release, retain, Ob
 use crate::cpu::Cpu;
 use crate::frameworks::core_graphics::{CGPoint, CGSize};
 use crate::frameworks::foundation::{
-    ns_date, ns_dictionary, ns_property_list_serialization, ns_string, NSUInteger,
+    ns_date, ns_dictionary, ns_property_list_serialization, ns_string, ns_url_connection,
+    NSUInteger,
 };
 use crate::fs::GuestPath;
-use crate::mem::{ConstPtr, MutVoidPtr};
+use crate::mem::{guest_size_of, ConstPtr, MutPtr, MutVoidPtr};
 use crate::Environment;
 use crate::{msg, msg_class};
 use plist::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::sync::{
@@ -1300,8 +1302,13 @@ pub(super) fn zombie_farm_ignore_spurious_operation_done(
         }
         return false;
     };
-    if !matches!(class_name.as_str(), "NSString" | "_touchHLE_NSString") {
-        return false;
+    if let Some(operation_done_selector) = env.objc.lookup_selector(selector_name) {
+        if env
+            .objc
+            .object_has_method(&env.mem, receiver, operation_done_selector)
+        {
+            return false;
+        }
     }
 
     env.cpu.regs_mut()[0] = 0;
@@ -4472,6 +4479,65 @@ fn zombie_farm_prepare_local_server_date(env: &mut Environment, receiver: id, se
     env.cpu.regs_mut().copy_from_slice(&regs);
 }
 
+fn zombie_farm_complete_server_time_locally(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if selector_name != "getServerTime"
+        || zombie_farm_object_class_name(env, receiver) != Some("ZFGuiLayer")
+        || ns_url_connection::zombie_farm_http_base_url(env).is_none()
+    {
+        return false;
+    }
+
+    let regs = *env.cpu.regs();
+    zombie_farm_set_gui_layer_server_date_to_now(env, receiver);
+    let response = zombie_farm_local_time_response(env);
+    let handled =
+        zombie_farm_send_id_arg_if_responds(env, receiver, "handleTimeResponse:", response);
+    release(env, response);
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    env.cpu.regs_mut()[0] = 0;
+
+    if handled {
+        log!("ZombieFarm public online: completed getServerTime locally without /shared/time.php");
+    }
+    handled
+}
+
+fn zombie_farm_disable_legacy_status_check_for_public_online(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if selector_name != "objectForKey:"
+        || zombie_farm_object_class_name(env, receiver) != Some("NSUserDefaults")
+        || ns_url_connection::zombie_farm_http_base_url(env).is_none()
+    {
+        return false;
+    }
+
+    let key = id::from_bits(env.cpu.regs()[2]);
+    if key == nil || ns_string::to_rust_string(env, key).as_ref() != "ZFStatusCheckDisabled" {
+        return false;
+    }
+
+    // Zombie Farm already has an offline status-check path guarded by this
+    // preference. It clears the transient status, updates the active farm, and
+    // posts kActiveProfileStatusCheckDoneNotification without contacting the
+    // retired Playforge profile-status endpoint. Keep the override in-memory
+    // and scoped to the explicitly enabled public server mode.
+    let disabled: id = msg_class![env; NSNumber numberWithBool:true];
+    env.cpu.regs_mut()[0] = disabled.to_bits();
+
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        log!("ZombieFarm public online: using the game's local active-profile status completion");
+    }
+    true
+}
+
 fn zombie_farm_apply_local_hunger_update(env: &mut Environment, receiver: id, selector_name: &str) {
     if !matches!(
         selector_name,
@@ -5231,6 +5297,670 @@ fn zombie_farm_skip_redundant_zombie_cell_rebuild(
     true
 }
 
+fn zombie_farm_override_active_player_display_name(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if selector_name != "displayName"
+        || zombie_farm_object_class_name(env, receiver) != Some("PlayerProfile")
+    {
+        return false;
+    }
+
+    static PLAYER_NAME: OnceLock<Option<String>> = OnceLock::new();
+    let Some(player_name) = PLAYER_NAME
+        .get_or_init(|| {
+            std::env::var("TOUCHHLE_ZOMBIE_FARM_PLAYER_NAME")
+                .ok()
+                .filter(|name| !name.is_empty())
+        })
+        .as_deref()
+    else {
+        return false;
+    };
+
+    let active_player: id = msg_class![env; PlayerProfileManager getActivePlayer];
+    if active_player == nil || receiver != active_player {
+        return false;
+    }
+
+    let player_name = ns_string::from_rust_string(env, player_name.to_string());
+    env.cpu.regs_mut()[0] = autorelease(env, player_name).to_bits();
+
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        log!(
+            "ZombieFarm: overriding active player displayName from TOUCHHLE_ZOMBIE_FARM_PLAYER_NAME"
+        );
+    }
+    true
+}
+
+fn zombie_farm_override_public_game_center_profile(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if !matches!(
+        selector_name,
+        "playerProfileType" | "playerGameCenterID" | "gameCenterAlias" | "playforgeAlias"
+    ) || zombie_farm_object_class_name(env, receiver) != Some("PlayerProfile")
+        || ns_url_connection::zombie_farm_http_base_url(env).is_none()
+    {
+        return false;
+    }
+
+    let active_player: id = msg_class![env; PlayerProfileManager getActivePlayer];
+    if active_player == nil || receiver != active_player {
+        return false;
+    }
+
+    if selector_name == "playerProfileType" {
+        // Zombie Farm 1.0 uses 2 for a Game Center-backed PlayerProfile and
+        // refuses to open the social menu for any other profile type.
+        env.cpu.regs_mut()[0] = 2;
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            log!("ZombieFarm public identity mapped to active Game Center profile");
+        }
+        return true;
+    }
+
+    let local_player: id = msg_class![env; GKLocalPlayer localPlayer];
+    if local_player == nil {
+        return false;
+    }
+    let value: id = if selector_name == "playerGameCenterID" {
+        msg![env; local_player playerID]
+    } else {
+        msg![env; local_player alias]
+    };
+    if value == nil {
+        return false;
+    }
+    env.cpu.regs_mut()[0] = value.to_bits();
+    true
+}
+
+#[derive(serde::Deserialize)]
+struct ZombieFarmPublicFriendList {
+    farms: Vec<ZombieFarmPublicFriend>,
+}
+
+#[derive(serde::Deserialize)]
+struct ZombieFarmPublicFriend {
+    public_id: String,
+    username: String,
+}
+
+#[derive(Clone)]
+struct ZombieFarmPublicFriendIdentity {
+    public_id: String,
+    username: String,
+}
+
+fn zombie_farm_public_friend_ids() -> &'static Mutex<HashMap<i32, ZombieFarmPublicFriendIdentity>> {
+    static IDS: OnceLock<Mutex<HashMap<i32, ZombieFarmPublicFriendIdentity>>> = OnceLock::new();
+    IDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn zombie_farm_public_friend_numeric_id(public_id: &str, used: &HashSet<i32>) -> i32 {
+    let digest = Sha256::digest(public_id.as_bytes());
+    let mut candidate =
+        (u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) & 0x7fff_ffff) as i32;
+    if candidate == 0 {
+        candidate = 1;
+    }
+    while candidate == 1_450_573 || used.contains(&candidate) {
+        candidate = if candidate == i32::MAX {
+            1
+        } else {
+            candidate + 1
+        };
+    }
+    candidate
+}
+
+fn zombie_farm_load_public_friend_list(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    let receiver_class = zombie_farm_object_class_name(env, receiver);
+    let from_social_menu = receiver_class == Some("SocialMenu") && selector_name == "findFriends";
+    let friends_table = match (receiver_class, selector_name) {
+        (Some("SocialTableViewNeighbors"), "getFriendsList" | "findFriends:") => receiver,
+        (Some("SocialMenu"), "findFriends") => {
+            let table: id = msg![env; receiver friendsTable];
+            if table == nil
+                || zombie_farm_object_class_name(env, table) != Some("SocialTableViewNeighbors")
+            {
+                return false;
+            }
+            table
+        }
+        _ => return false,
+    };
+    let Some(base_url) = ns_url_connection::zombie_farm_http_base_url(env) else {
+        return false;
+    };
+
+    let local_player: id = msg_class![env; GKLocalPlayer localPlayer];
+    let local_id = if local_player == nil {
+        String::new()
+    } else {
+        let value: id = msg![env; local_player playerID];
+        if value == nil {
+            String::new()
+        } else {
+            ns_string::to_rust_string(env, value).into_owned()
+        }
+    };
+    let url = format!(
+        "{}/v1/farms?exclude={}&limit=200",
+        base_url,
+        zombie_farm_percent_encode(&local_id)
+    );
+    let friends = match ns_url_connection::zombie_farm_http_request("GET", &url, &[], Vec::new()) {
+        Ok(response) if response.status == 200 => {
+            match serde_json::from_slice::<ZombieFarmPublicFriendList>(&response.body) {
+                Ok(list) => list.farms,
+                Err(error) => {
+                    log!("ZombieFarm public friend list rejected invalid response: {error}");
+                    Vec::new()
+                }
+            }
+        }
+        Ok(response) => {
+            log!(
+                "ZombieFarm public friend list failed: server returned HTTP {}",
+                response.status
+            );
+            Vec::new()
+        }
+        Err(error) => {
+            log!("ZombieFarm public friend list failed: {error}");
+            Vec::new()
+        }
+    };
+
+    let neighbors: id = msg_class![env; NSMutableArray new];
+    let game_state: id = msg_class![env; GameState gameState];
+    let game_neighbors: id = if game_state == nil {
+        nil
+    } else {
+        let existing: id = msg![env; game_state neighborsDictionary];
+        if existing == nil {
+            msg_class![env; NSMutableDictionary new]
+        } else {
+            msg![env; existing mutableCopy]
+        }
+    };
+    let mut used = HashSet::new();
+    let mut id_map = HashMap::new();
+    for friend in friends {
+        if friend.public_id.is_empty()
+            || friend.public_id.len() > 80
+            || friend.username.trim().is_empty()
+        {
+            continue;
+        }
+        let numeric_id = zombie_farm_public_friend_numeric_id(&friend.public_id, &used);
+        let username_text = friend.username.trim().to_string();
+        used.insert(numeric_id);
+        id_map.insert(
+            numeric_id,
+            ZombieFarmPublicFriendIdentity {
+                public_id: friend.public_id,
+                username: username_text.clone(),
+            },
+        );
+
+        let user: id = msg_class![env; UserData new];
+        let username = ns_string::from_rust_string(env, username_text);
+        let username = autorelease(env, username);
+        let empty = ns_string::from_rust_string(env, String::new());
+        let empty = autorelease(env, empty);
+        let _: () = msg![env; user setUserIdentifier:numeric_id];
+        let _: () = msg![env; user setUserName:username];
+        let _: () = msg![env; user setFacebookID:empty];
+        let _: () = msg![env; user setUserLevel:1i8];
+        let _: () = msg![env; user setActivityLevel:0i8];
+        let _: () = msg![env; user setHeadID:0i8];
+        let _: () = msg![env; user setTimeTilGiftable:0i32];
+        let _: () = msg![env; user setTimeTilTagable:0i32];
+        let _: () = msg![env; neighbors addObject:user];
+        release(env, user);
+
+        // friendProfileUpdated: looks up the selected profile ID in
+        // GameState.neighborsDictionary before it updates the visiting HUD.
+        // The public list is otherwise only visible to SocialTableViewNeighbors,
+        // leaving that lookup nil even though the remote GameData loaded and the
+        // map was switched successfully.
+        if game_neighbors != nil {
+            let profile_id = ns_string::from_rust_string(env, format!("P{numeric_id}"));
+            let profile_id = autorelease(env, profile_id);
+            let neighbor: id = msg_class![env; ZFNeighbor new];
+            let _: () = msg![env; neighbor setPlayforgeID:numeric_id];
+            let _: () = msg![env; neighbor setAlias:username];
+            let _: () = msg![env; neighbor setFacebookID:empty];
+            let _: () = msg![env; neighbor setHeadID:0i32];
+            let _: () = msg![env; neighbor setLevel:1i32];
+            let _: () = msg![env; neighbor setInteractionLevel:0i32];
+            let _: () = msg![env; neighbor setMinutesUntilGift:0i32];
+            let _: () = msg![env; neighbor setMinutesUntilTag:0i32];
+            let _: () = msg![env; game_neighbors setObject:neighbor forKey:profile_id];
+            release(env, neighbor);
+        }
+    }
+    *zombie_farm_public_friend_ids().lock().unwrap() = id_map;
+
+    if game_neighbors != nil {
+        let _: () = msg![env; game_state setNeighborsDictionary:game_neighbors];
+        release(env, game_neighbors);
+    }
+
+    let count: NSUInteger = msg![env; neighbors count];
+    let _: () = msg![env; friends_table setNeighborsData:neighbors];
+
+    // The table view does not render directly from neighborsData. Its data source
+    // reads the "neighbors" and "pending" arrays from neighborsTableData.
+    let table_data: id = msg_class![env; NSMutableDictionary new];
+    let neighbors_key = ns_string::from_rust_string(env, "neighbors".to_string());
+    let neighbors_key = autorelease(env, neighbors_key);
+    let pending_key = ns_string::from_rust_string(env, "pending".to_string());
+    let pending_key = autorelease(env, pending_key);
+    let pending: id = msg_class![env; NSMutableArray new];
+    let _: () = msg![env; table_data setObject:neighbors forKey:neighbors_key];
+    let _: () = msg![env; table_data setObject:pending forKey:pending_key];
+    let _: () = msg![env; friends_table setNeighborsTableData:table_data];
+    let _: () = msg![env; friends_table setPendingInvitesData:pending];
+    let _: () = msg![env; friends_table setAwaitingApprovalData:pending];
+    release(env, pending);
+    release(env, table_data);
+
+    let table_view: id = msg![env; friends_table tableView];
+    let mut sections = 0i32;
+    let mut rows = 0i32;
+    let _: () = msg![env; friends_table setTutorialMode:false];
+    if game_state != nil {
+        let game_data: id = msg![env; game_state zfGameData];
+        if game_data != nil {
+            // SocialMenu's real tutorial state machine consumes bits 0..=8
+            // of gflags2, ending with 0x100 in tutorialOkButtonPressed.
+            let flags: i32 = msg![env; game_data gflags2];
+            let _: () = msg![env; game_data setGflags2:(flags | 0x1ff)];
+            let social_menu: id = if from_social_menu {
+                receiver
+            } else {
+                msg_class![env; SocialMenu socialMenu]
+            };
+            if social_menu != nil {
+                let _: () = msg![env; social_menu tutorialNextStep];
+            }
+            log!("ZombieFarm public friend list marked the social tutorial complete");
+        }
+    }
+    if table_view != nil {
+        let _: () = msg![env; table_view reloadData];
+        sections = msg![env; friends_table numberOfSectionsInTableView:table_view];
+        for section in 0..sections {
+            let section_rows: i32 =
+                msg![env; friends_table tableView:table_view numberOfRowsInSection:section];
+            rows += section_rows;
+        }
+    }
+    release(env, neighbors);
+    env.cpu.regs_mut()[0] = 0;
+    log!(
+        "ZombieFarm public friend list loaded with {count} farm(s), table has {sections} section(s) and {rows} row(s)"
+    );
+    true
+}
+
+fn zombie_farm_load_public_friend_profile(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if selector_name != "updateProfile:forFriend:"
+        || zombie_farm_object_class_name(env, receiver) != Some("PlayerProfileManager")
+    {
+        return false;
+    }
+    let Some(base_url) = ns_url_connection::zombie_farm_http_base_url(env) else {
+        return false;
+    };
+    let profile_id_object = id::from_bits(env.cpu.regs()[2]);
+    if profile_id_object == nil {
+        return false;
+    }
+    let profile_id = ns_string::to_rust_string(env, profile_id_object).into_owned();
+    let Some(numeric_id) = profile_id
+        .strip_prefix('P')
+        .and_then(|value| value.parse::<i32>().ok())
+    else {
+        return false;
+    };
+    let Some(public_friend) = zombie_farm_public_friend_ids()
+        .lock()
+        .unwrap()
+        .get(&numeric_id)
+        .cloned()
+    else {
+        return false;
+    };
+    let public_id = public_friend.public_id;
+
+    let url = format!(
+        "{}/v1/farms/{}/save",
+        base_url,
+        zombie_farm_percent_encode(&public_id)
+    );
+    let save = match ns_url_connection::zombie_farm_http_request("GET", &url, &[], Vec::new()) {
+        Ok(response) if response.status == 200 && !response.body.is_empty() => response.body,
+        Ok(response) => {
+            log!(
+                "ZombieFarm public friend farm fetch failed for {}: HTTP {}",
+                public_id,
+                response.status
+            );
+            return false;
+        }
+        Err(error) => {
+            log!(
+                "ZombieFarm public friend farm fetch failed for {}: {}",
+                public_id,
+                error
+            );
+            return false;
+        }
+    };
+    if save.len() > 4 << 20 {
+        log!(
+            "ZombieFarm public friend farm fetch rejected oversized save for {}",
+            public_id
+        );
+        return false;
+    }
+
+    let neighbor_directory = env.fs.home_directory().join("Documents/neighborData");
+    if env.fs.create_dir_all(neighbor_directory.clone()).is_err() {
+        log!("ZombieFarm public friend farm could not create neighborData directory");
+        return false;
+    }
+    let save_file_name = format!("saveGame_{profile_id}.friend");
+    let save_path = neighbor_directory.join(&save_file_name);
+    if env.fs.write(&save_path, &save).is_err() {
+        log!("ZombieFarm public friend farm could not write {profile_id}");
+        return false;
+    }
+
+    let save_file_name = ns_string::from_rust_string(env, save_file_name);
+    let exception_ptr: MutPtr<id> = env.mem.alloc(guest_size_of::<id>()).cast();
+    env.mem.write(exception_ptr, nil);
+    let game_data: id = msg_class![env; GameData
+        gameDataFromBinayFile:save_file_name
+        asFriend:true
+        exception_p:exception_ptr];
+    let exception: id = env.mem.read(exception_ptr);
+    env.mem.free(exception_ptr.cast());
+    release(env, save_file_name);
+    if game_data == nil {
+        if exception == nil {
+            log!("ZombieFarm public friend binary decoder returned no GameData for {profile_id}");
+        } else {
+            let description: id = msg![env; exception description];
+            let description = if description == nil {
+                "(unknown exception)".to_string()
+            } else {
+                ns_string::to_rust_string(env, description).into_owned()
+            };
+            log!("ZombieFarm public friend binary decoder failed for {profile_id}: {description}");
+        }
+        return false;
+    }
+
+    let profile: id = msg_class![env; PlayerProfile alloc];
+    let profile: id = msg![env; profile initWithGameData:game_data];
+    if profile == nil {
+        log!("ZombieFarm public friend farm could not load {profile_id}");
+        return false;
+    }
+    let profile_alias = ns_string::from_rust_string(env, public_friend.username.clone());
+    let profile_alias = autorelease(env, profile_alias);
+    let _: () = msg![env; profile setPlayerProfileID:profile_id_object];
+    let _: () = msg![env; profile setPlayerProfileType:2i32];
+    let _: () = msg![env; profile setPlayforgeID:numeric_id];
+    let _: () = msg![env; profile setPlayforgeAlias:profile_alias];
+    let _: () = msg![env; profile setDisplayName:profile_alias];
+    let _: () = msg![env; game_data setPlayerProfileID:profile_id_object];
+    let _: () = msg![env; game_data setPlayforgeID:numeric_id];
+    let _: () = msg![env; game_data setPlayforgeAlias:profile_alias];
+
+    // SocialMenu can rebuild GameState.neighborsDictionary after the public
+    // table was populated. Reinstall the selected identity immediately before
+    // friendProfileUpdated: consumes it for changeHudToVisiting:.
+    let game_state: id = msg_class![env; GameState gameState];
+    if game_state != nil {
+        let existing: id = msg![env; game_state neighborsDictionary];
+        let game_neighbors: id = if existing == nil {
+            msg_class![env; NSMutableDictionary new]
+        } else {
+            msg![env; existing mutableCopy]
+        };
+        let username = ns_string::from_rust_string(env, public_friend.username);
+        let username = autorelease(env, username);
+        let empty = ns_string::from_rust_string(env, String::new());
+        let empty = autorelease(env, empty);
+        let neighbor: id = msg_class![env; ZFNeighbor new];
+        let _: () = msg![env; neighbor setPlayforgeID:numeric_id];
+        let _: () = msg![env; neighbor setAlias:username];
+        let _: () = msg![env; neighbor setFacebookID:empty];
+        let _: () = msg![env; neighbor setHeadID:0i32];
+        let _: () = msg![env; neighbor setLevel:1i32];
+        let _: () = msg![env; neighbor setInteractionLevel:0i32];
+        let _: () = msg![env; neighbor setMinutesUntilGift:0i32];
+        let _: () = msg![env; neighbor setMinutesUntilTag:0i32];
+        let _: () = msg![env; game_neighbors setObject:neighbor forKey:profile_id_object];
+        let _: () = msg![env; game_state setNeighborsDictionary:game_neighbors];
+        release(env, neighbor);
+        release(env, game_neighbors);
+    }
+
+    let result: id = msg_class![env; NSMutableDictionary new];
+    let profile_key = ns_string::from_rust_string(env, "playerProfile".to_string());
+    let profile_key = autorelease(env, profile_key);
+    let _: () = msg![env; result setObject:profile forKey:profile_key];
+    let game_data: id = msg![env; profile playerGameData];
+    let dictionary_class = env.objc.get_known_class("NSDictionary", &mut env.mem);
+    let null_class = env.objc.get_known_class("NSNull", &mut env.mem);
+    let result_is_dictionary: bool = msg![env; result isKindOfClass:dictionary_class];
+    let profile_is_null: bool = msg![env; profile isKindOfClass:null_class];
+    let game_data_is_null: bool = if game_data == nil {
+        false
+    } else {
+        msg![env; game_data isKindOfClass:null_class]
+    };
+    log!(
+        "ZombieFarm public friend profile validation: resultDictionary={}, profileNull={}, gameData={:?} (class {:?}, null={})",
+        result_is_dictionary,
+        profile_is_null,
+        game_data,
+        zombie_farm_object_class_name(env, game_data),
+        game_data_is_null
+    );
+    zombie_farm_post_notification_name_object(env, "kProfileUpdatedNotification", result);
+    release(env, result);
+    release(env, profile);
+    env.cpu.regs_mut()[0] = 0;
+    log!(
+        "ZombieFarm public friend farm loaded {} as {}",
+        public_id,
+        profile_id
+    );
+    true
+}
+
+fn zombie_farm_load_public_giftable_friends(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if !matches!(
+        selector_name,
+        "getGiftableNeighbors" | "showNeighborsForGifting"
+    ) || zombie_farm_object_class_name(env, receiver) != Some("SocialTableViewGifts")
+    {
+        return false;
+    }
+    if ns_url_connection::zombie_farm_http_base_url(env).is_none() {
+        return false;
+    }
+
+    let social_menu: id = msg_class![env; SocialMenu socialMenu];
+    if social_menu == nil {
+        return false;
+    }
+    let friends_table: id = msg![env; social_menu friendsTable];
+    if friends_table == nil
+        || !zombie_farm_load_public_friend_list(env, friends_table, "getFriendsList")
+    {
+        return false;
+    }
+
+    let public_friends: id = msg![env; friends_table neighborsData];
+    if public_friends == nil {
+        return false;
+    }
+    let giftable: id = msg_class![env; NSMutableArray new];
+    let count: NSUInteger = msg![env; public_friends count];
+    for index in 0..count {
+        let user: id = msg![env; public_friends objectAtIndex:index];
+        if user == nil {
+            continue;
+        }
+        let playforge_id: i32 = msg![env; user userIdentifier];
+        let alias: id = msg![env; user userName];
+        let facebook_id: id = msg![env; user facebookID];
+        let head_id: i8 = msg![env; user headID];
+        let head_id = i32::from(head_id);
+
+        let neighbor: id = msg_class![env; ZFNeighbor new];
+        let _: () = msg![env; neighbor setPlayforgeID:playforge_id];
+        let _: () = msg![env; neighbor setAlias:alias];
+        let _: () = msg![env; neighbor setFacebookID:facebook_id];
+        let _: () = msg![env; neighbor setHeadID:head_id];
+        let _: () = msg![env; neighbor setLevel:1i32];
+        let _: () = msg![env; neighbor setInteractionLevel:0i32];
+        let _: () = msg![env; neighbor setMinutesUntilGift:0i32];
+        let _: () = msg![env; neighbor setMinutesUntilTag:0i32];
+        let _: () = msg![env; giftable addObject:neighbor];
+        release(env, neighbor);
+    }
+
+    let giftable_count: NSUInteger = msg![env; giftable count];
+    let _: () = msg![env; receiver setGiftableFriendsData:giftable];
+    release(env, giftable);
+    let table_view: id = msg![env; receiver tableView];
+    if table_view != nil {
+        let _: () = msg![env; table_view reloadData];
+    }
+    zombie_farm_post_notification_name_object(env, "kGiftingNeighborsRetrieved", nil);
+    env.cpu.regs_mut()[0] = 0;
+    log!("ZombieFarm public gift list loaded with {giftable_count} neighbor(s)");
+    true
+}
+
+fn zombie_farm_publish_public_farm(env: &mut Environment, context: &str) {
+    let Some(base_url) = ns_url_connection::zombie_farm_http_base_url(env) else {
+        return;
+    };
+    let player_name = std::env::var("TOUCHHLE_ZOMBIE_FARM_PLAYER_NAME")
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "Zombie Farmer".to_string());
+    let local_player: id = msg_class![env; GKLocalPlayer localPlayer];
+    if local_player == nil {
+        log!("ZombieFarm public farm publish skipped: local player is unavailable");
+        return;
+    }
+    let player_id: id = msg![env; local_player playerID];
+    if player_id == nil {
+        log!("ZombieFarm public farm publish skipped: public ID is unavailable");
+        return;
+    }
+    let player_id = ns_string::to_rust_string(env, player_id).into_owned();
+    let save_path = env.fs.home_directory().join("Documents/saveGame.bin2");
+    let Ok(save) = env.fs.read(&save_path) else {
+        log!("ZombieFarm public farm publish skipped: saveGame.bin2 is unavailable");
+        return;
+    };
+    if save.is_empty() || save.len() > 4 << 20 {
+        log!(
+            "ZombieFarm public farm publish skipped: save size {} is invalid",
+            save.len()
+        );
+        return;
+    }
+
+    let digest: [u8; 32] = Sha256::digest(&save).into();
+    static LAST_PUBLISHED_DIGEST: OnceLock<Mutex<Option<[u8; 32]>>> = OnceLock::new();
+    let last_digest = LAST_PUBLISHED_DIGEST.get_or_init(|| Mutex::new(None));
+    if *last_digest.lock().unwrap() == Some(digest) {
+        return;
+    }
+
+    let url = format!(
+        "{}/v1/farms/{}?username={}",
+        base_url,
+        player_id,
+        zombie_farm_percent_encode(&player_name)
+    );
+    let headers = vec![(
+        "Content-Type".to_string(),
+        "application/octet-stream".to_string(),
+    )];
+    match ns_url_connection::zombie_farm_http_request("PUT", &url, &headers, save) {
+        Ok(response) if response.status == 200 => {
+            *last_digest.lock().unwrap() = Some(digest);
+            log!(
+                "ZombieFarm public farm published after {} as {}",
+                context,
+                player_id
+            );
+        }
+        Ok(response) => {
+            log!(
+                "ZombieFarm public farm publish failed after {}: HTTP {}",
+                context,
+                response.status
+            );
+        }
+        Err(error) => {
+            log!(
+                "ZombieFarm public farm publish failed after {}: {}",
+                context,
+                error
+            );
+        }
+    }
+}
+
+fn zombie_farm_percent_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write;
+            write!(&mut encoded, "%{:02X}", byte).unwrap();
+        }
+    }
+    encoded
+}
+
 pub(super) fn zombie_farm_pre_dispatch_workarounds(
     env: &mut Environment,
     receiver: id,
@@ -5244,6 +5974,26 @@ pub(super) fn zombie_farm_pre_dispatch_workarounds(
 
     if zombie_farm_sprite_trace_enabled() {
         trace_zombie_farm_sprite_message(env, receiver, selector_name);
+    }
+
+    if zombie_farm_override_active_player_display_name(env, receiver, selector_name) {
+        return true;
+    }
+
+    if zombie_farm_override_public_game_center_profile(env, receiver, selector_name) {
+        return true;
+    }
+
+    if zombie_farm_load_public_friend_list(env, receiver, selector_name) {
+        return true;
+    }
+
+    if zombie_farm_load_public_friend_profile(env, receiver, selector_name) {
+        return true;
+    }
+
+    if zombie_farm_load_public_giftable_friends(env, receiver, selector_name) {
+        return true;
     }
 
     if env.bundle.bundle_identifier() == "com.playforge.ZombieFarm2" {
@@ -5384,6 +6134,23 @@ pub(super) fn zombie_farm_pre_dispatch_workarounds(
                 return true;
             }
         }
+        "objectForKey:" => {
+            if zombie_farm_disable_legacy_status_check_for_public_online(
+                env,
+                receiver,
+                selector_name,
+            ) {
+                return true;
+            }
+        }
+        "showUnableToVisitError:" => {
+            log!(
+                "ZombieFarm public friend visit failure: [{} showUnableToVisitError:{}], guest LR=0x{:08x}",
+                zombie_farm_object_class_name(env, receiver).unwrap_or("unknown"),
+                env.cpu.regs()[2] != 0,
+                env.cpu.regs()[14]
+            );
+        }
         "statusMessage:cancelAfter:"
         | "showMessage:withCancelTimeout:andCancelNotification:"
         | "updateMessage:andCancelTimeout:andCancelNotification:" => {
@@ -5413,7 +6180,13 @@ pub(super) fn zombie_farm_pre_dispatch_workarounds(
         "setSaveDate:" => {
             zombie_farm_prepare_game_state_save_date(env, receiver, selector_name);
         }
-        "getServerTime" | "handleResponse:forAction:" => {
+        "getServerTime" => {
+            if zombie_farm_complete_server_time_locally(env, receiver, selector_name) {
+                return true;
+            }
+            zombie_farm_prepare_local_server_date(env, receiver, selector_name);
+        }
+        "handleResponse:forAction:" => {
             zombie_farm_prepare_local_server_date(env, receiver, selector_name);
         }
         "openMenu"
@@ -5453,6 +6226,8 @@ pub(super) fn zombie_farm_needs_pre_dispatch_workarounds(
     matches!(
         selector_name,
         "operationDone"
+            | "objectForKey:"
+            | "showUnableToVisitError:"
             | "statusMessage:cancelAfter:"
             | "showMessage:withCancelTimeout:andCancelNotification:"
             | "updateMessage:andCancelTimeout:andCancelNotification:"
@@ -5479,6 +6254,17 @@ pub(super) fn zombie_farm_needs_pre_dispatch_workarounds(
             | "startInvasionWithDictionary:checkHunger:"
             | "invadeButtonTapped:"
             | "switchToFightScene"
+            | "displayName"
+            | "playerProfileType"
+            | "playerGameCenterID"
+            | "gameCenterAlias"
+            | "playforgeAlias"
+            | "getFriendsList"
+            | "findFriends"
+            | "findFriends:"
+            | "updateProfile:forFriend:"
+            | "getGiftableNeighbors"
+            | "showNeighborsForGifting"
     )
 }
 
@@ -5504,7 +6290,9 @@ pub(super) fn zombie_farm_post_dispatch_workarounds(
             zombie_farm_apply_local_hunger_update(env, receiver, selector_name);
             zombie_farm_check_local_daily_event(env, receiver, selector_name);
             zombie_farm_restore_local_quest_progress(env, receiver, selector_name);
+            zombie_farm_publish_public_farm(env, selector_name);
         }
+        "saveGame" => zombie_farm_publish_public_farm(env, selector_name),
         _ => {}
     }
 }
@@ -5517,6 +6305,6 @@ pub(super) fn zombie_farm_needs_post_dispatch_workarounds(
         && (zombie_farm_touch_trace_enabled()
             || matches!(
                 selector_name,
-                "handleTimeResponse:" | "statusCheckDone" | "startUpChecksComplete"
+                "handleTimeResponse:" | "statusCheckDone" | "startUpChecksComplete" | "saveGame"
             ))
 }

@@ -412,19 +412,8 @@ fn should_record_zombie_relayout_candidate(class_name: &str, selector_name: &str
 
     let lower = selector_name.to_ascii_lowercase();
     [
-        "init",
-        "sprite",
-        "frame",
-        "attach",
-        "update",
-        "layout",
-        "refresh",
-        "display",
-        "position",
-        "scale",
-        "rotation",
-        "anchor",
-        "visible",
+        "init", "sprite", "frame", "attach", "update", "layout", "refresh", "display", "position",
+        "scale", "rotation", "anchor", "visible",
     ]
     .iter()
     .any(|keyword| lower.contains(keyword))
@@ -473,7 +462,10 @@ pub fn record_cell_build_message(class_name: &str, selector_name: &str, elapsed:
 
     if should_record_zombie_relayout_candidate(class_name, selector_name) {
         let trace_key = format!("{class_name} {selector_name}");
-        let trace = build.messages.entry(format!("RELAYOUT {trace_key}")).or_default();
+        let trace = build
+            .messages
+            .entry(format!("RELAYOUT {trace_key}"))
+            .or_default();
         trace.calls += 1;
         trace.nanos += nanos;
     }

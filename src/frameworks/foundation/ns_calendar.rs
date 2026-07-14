@@ -15,6 +15,7 @@ use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
     NSZonePtr,
 };
+use chrono::{DateTime, Months, NaiveDateTime, TimeDelta, Utc};
 
 const NSGregorianCalendar: &str = "NSGregorianCalendar";
 const NSUndefinedDateComponent: NSInteger = NSInteger::MAX;
@@ -65,6 +66,62 @@ impl Default for NSDateComponentsHostObject {
     }
 }
 impl HostObject for NSDateComponentsHostObject {}
+
+fn add_months(date_time: NaiveDateTime, months: NSInteger) -> Option<NaiveDateTime> {
+    let magnitude = Months::new(months.unsigned_abs());
+    if months >= 0 {
+        date_time.checked_add_months(magnitude)
+    } else {
+        date_time.checked_sub_months(magnitude)
+    }
+}
+
+fn add_defined_time_delta(
+    date_time: NaiveDateTime,
+    value: NSInteger,
+    seconds_per_unit: i64,
+) -> Option<NaiveDateTime> {
+    if value == NSUndefinedDateComponent {
+        return Some(date_time);
+    }
+    let seconds = i64::from(value).checked_mul(seconds_per_unit)?;
+    date_time.checked_add_signed(TimeDelta::seconds(seconds))
+}
+
+fn timestamp_by_adding_components(
+    timestamp: NSTimeInterval,
+    time_zone_offset: i32,
+    components: NSDateComponentsHostObject,
+) -> Option<NSTimeInterval> {
+    if !timestamp.is_finite() {
+        return None;
+    }
+
+    let whole_seconds = timestamp.floor();
+    if whole_seconds < i64::MIN as NSTimeInterval || whole_seconds > i64::MAX as NSTimeInterval {
+        return None;
+    }
+    let fractional_second = timestamp - whole_seconds;
+    let local_seconds = (whole_seconds as i64).checked_add(i64::from(time_zone_offset))?;
+    let mut date_time = DateTime::<Utc>::from_timestamp(local_seconds, 0)?.naive_utc();
+
+    if components.year != NSUndefinedDateComponent {
+        date_time = add_months(date_time, components.year.checked_mul(12)?)?;
+    }
+    if components.month != NSUndefinedDateComponent {
+        date_time = add_months(date_time, components.month)?;
+    }
+    date_time = add_defined_time_delta(date_time, components.day, 86_400)?;
+    date_time = add_defined_time_delta(date_time, components.hour, 3_600)?;
+    date_time = add_defined_time_delta(date_time, components.minute, 60)?;
+    date_time = add_defined_time_delta(date_time, components.second, 1)?;
+
+    let result_seconds = date_time
+        .and_utc()
+        .timestamp()
+        .checked_sub(i64::from(time_zone_offset))?;
+    Some(result_seconds as NSTimeInterval + fractional_second)
+}
 
 fn calendar_time_zone_offset_seconds(env: &mut crate::Environment, calendar: id) -> i32 {
     let time_zone = env.objc.borrow::<NSCalendarHostObject>(calendar).time_zone;
@@ -183,6 +240,25 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 }
 
+- (id)dateByAddingComponents:(id)components
+                      toDate:(id)date
+                     options:(NSUInteger)_options {
+    if components == nil || date == nil {
+        return nil;
+    }
+
+    let timestamp: NSTimeInterval = msg![env; date timeIntervalSince1970];
+    let time_zone_offset = calendar_time_zone_offset_seconds(env, this);
+    let components = *env
+        .objc
+        .borrow::<NSDateComponentsHostObject>(components);
+    let Some(result) = timestamp_by_adding_components(timestamp, time_zone_offset, components)
+    else {
+        return nil;
+    };
+    msg_class![env; NSDate dateWithTimeIntervalSince1970:result]
+}
+
 - (id)dateFromComponents:(id)components {
     let year: NSInteger = msg![env; components year];
     let month: NSInteger = msg![env; components month];
@@ -236,3 +312,42 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adding_a_month_clamps_to_the_last_valid_day() {
+        let timestamp = calendar_date_to_timestamp(tm::from(2012, 1, 31, 12, 30, 0));
+        let components = NSDateComponentsHostObject {
+            month: 1,
+            ..Default::default()
+        };
+
+        let result = timestamp_by_adding_components(timestamp.into(), 0, components).unwrap();
+        let date = timestamp_to_calendar_date(result as i32);
+        let actual = (
+            date.tm_year + 1900,
+            date.tm_mon + 1,
+            date.tm_mday,
+            date.tm_hour,
+            date.tm_min,
+            date.tm_sec,
+        );
+        assert_eq!(actual, (2012, 2, 29, 12, 30, 0));
+    }
+
+    #[test]
+    fn adding_smaller_units_carries_and_preserves_fractional_seconds() {
+        let components = NSDateComponentsHostObject {
+            day: 1,
+            minute: 2,
+            second: 3,
+            ..Default::default()
+        };
+
+        let result = timestamp_by_adding_components(1_000_000.75, 8 * 3_600, components).unwrap();
+        assert_eq!(result, 1_000_000.75 + 86_400.0 + 120.0 + 3.0);
+    }
+}

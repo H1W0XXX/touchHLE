@@ -1752,10 +1752,21 @@ pub const CLASSES: ClassExports = objc_classes! {
         ..
     } = env.objc.borrow_mut(this);
 
-    subviews.insert(index as usize, view);
+    let requested_index = usize::try_from(index).unwrap_or(0);
+    let insertion_index = requested_index.min(subviews.len());
+    if insertion_index != requested_index || index < 0 {
+        log_dbg!(
+            "Clamping [(UIView*){:?} insertSubview:{:?} atIndex:{}] to index {} ({} existing subviews)",
+            this,
+            view,
+            index,
+            insertion_index,
+            subviews.len()
+        );
+    }
+    subviews.insert(insertion_index, view);
 
-    assert!(index >= 0);
-    () = msg![env; this_layer insertSublayer:subview_layer atIndex:(index as u32)];
+    () = msg![env; this_layer insertSublayer:subview_layer atIndex:(insertion_index as u32)];
 }
 
 - (())insertSubview:(id)view belowSubview:(id)sibling {

@@ -138,6 +138,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (Class)class {
     this
 }
++ (Class)self {
+    this
+}
 + (bool)isSubclassOfClass:(Class)class {
     env.objc.class_is_subclass_of(this, class)
 }
@@ -210,6 +213,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)init {
+    this
+}
+
+- (id)self {
     this
 }
 

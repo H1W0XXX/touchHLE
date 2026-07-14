@@ -105,18 +105,50 @@ pub const CLASSES: ClassExports = objc_classes! {
     let bytes: ConstVoidPtr = msg![env; data bytes];
     let slice = env.mem.bytes_at(bytes.cast(), length);
 
+    {
+        let host_obj = env.objc.borrow::<NSKeyedUnarchiverHostObject>(this);
+        assert!(host_obj.already_unarchived.is_empty());
+        assert!(host_obj.current_key.is_none());
+        assert!(host_obj.plist.is_empty());
+    }
+
+    // Some callers intentionally probe an old keyed-archive format before
+    // falling back to their own binary decoder. Invalid archive data must not
+    // turn that format probe into a host-side Rust panic.
+    let plist = match Value::from_reader(Cursor::new(slice)) {
+        Ok(Value::Dictionary(plist)) => plist,
+        Ok(_) => {
+            log!("NSKeyedUnarchiver rejected a non-dictionary archive ({length} bytes)");
+            release(env, this);
+            return nil;
+        }
+        Err(error) => {
+            log!("NSKeyedUnarchiver rejected invalid archive data ({length} bytes): {error}");
+            release(env, this);
+            return nil;
+        }
+    };
+    if plist
+        .get("$version")
+        .and_then(Value::as_unsigned_integer)
+        != Some(100000)
+        || plist.get("$archiver").and_then(Value::as_string) != Some("NSKeyedArchiver")
+    {
+        log!("NSKeyedUnarchiver rejected data without a keyed-archive header ({length} bytes)");
+        release(env, this);
+        return nil;
+    }
+    let Some(key_count) = plist
+        .get("$objects")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+    else {
+        log!("NSKeyedUnarchiver rejected data without a keyed-archive object table ({length} bytes)");
+        release(env, this);
+        return nil;
+    };
+
     let host_obj = env.objc.borrow_mut::<NSKeyedUnarchiverHostObject>(this);
-    assert!(host_obj.already_unarchived.is_empty());
-    assert!(host_obj.current_key.is_none());
-    assert!(host_obj.plist.is_empty());
-
-    let plist = Value::from_reader(Cursor::new(slice)).unwrap();
-    let plist = plist.into_dictionary().unwrap();
-    assert!(plist["$version"].as_unsigned_integer() == Some(100000));
-    assert!(plist["$archiver"].as_string() == Some("NSKeyedArchiver"));
-
-    let key_count = plist["$objects"].as_array().unwrap().len();
-
     host_obj.already_unarchived = vec![None; key_count];
     host_obj.plist = plist;
 

@@ -94,6 +94,42 @@ rustc -C target-cpu=help --target x86_64-pc-windows-msvc
 .\touchHLE.exe ".\zombie_farm\Zombie_Farm_1.181.ipa"
 ```
 
+## 玩家名字
+
+可以用环境变量覆盖 Zombie Farm 当前本地玩家的显示名，不会修改存档，也不会覆盖好友的名字：
+
+```powershell
+$env:TOUCHHLE_ZOMBIE_FARM_PLAYER_NAME="你的名字"
+.\touchHLE.exe ".\zombie_farm\ZFR.ipa" --device-family="ipad"
+```
+
+清除名字覆盖：
+
+```powershell
+Remove-Item Env:\TOUCHHLE_ZOMBIE_FARM_PLAYER_NAME
+```
+
+## 实验性公开好友农场
+
+该功能默认关闭。只有在设置 `TOUCHHLE_ZOMBIE_FARM_HTTP_BASE_URL` 后，Zombie Farm 1.0 才会启用公开好友接口，把当前用户名和 `saveGame.bin2` 存档快照上传到指定服务端，并允许查看服务端上的所有公开农场。
+
+此实验接口不使用密码、Cookie、令牌或其他鉴权信息。服务端没有鉴权，知道公开玩家 ID 的客户端可以覆盖对应记录，因此不要在请求或环境变量中放入任何密码或秘密信息。
+
+```powershell
+$env:TOUCHHLE_ZOMBIE_FARM_HTTP_BASE_URL="http://127.0.0.1:8080"
+$env:TOUCHHLE_ZOMBIE_FARM_PLAYER_NAME="你的名字"
+$env:TOUCHHLE_ZOMBIE_FARM_PLAYER_ID="your_public_player_01"
+.\touchHLE.exe ".\zombie_farm\ZFR.ipa" --device-family="ipad"
+```
+
+`TOUCHHLE_ZOMBIE_FARM_PLAYER_ID` 是公开标识，不是密码；允许 1 到 80 个 ASCII 字母、数字、`-` 或 `_`。如果不设置，touchHLE 会为当前安装生成并持久化一个公开 ID。当前实现只接受明文 `http://` 基础地址，并且只对包标识为 `com.playforge.ZFR.LZ54D2GT3D`、版本为 `1.0` 的 Zombie Farm 启用。
+
+关闭在线功能：
+
+```powershell
+Remove-Item Env:\TOUCHHLE_ZOMBIE_FARM_HTTP_BASE_URL
+```
+
 ## 时间偏移
 
 如果需要让模拟器内时间向未来或过去偏移，可以在 PowerShell 中先设置环境变量。

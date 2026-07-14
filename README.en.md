@@ -94,6 +94,42 @@ Some versions can also be started with the default device mode:
 .\touchHLE.exe ".\zombie_farm\Zombie_Farm_1.181.ipa"
 ```
 
+## Player Name
+
+An environment variable can override the current local player's Zombie Farm display name without changing the save file or replacing friends' names:
+
+```powershell
+$env:TOUCHHLE_ZOMBIE_FARM_PLAYER_NAME="Your Name"
+.\touchHLE.exe ".\zombie_farm\ZFR.ipa" --device-family="ipad"
+```
+
+To clear the override:
+
+```powershell
+Remove-Item Env:\TOUCHHLE_ZOMBIE_FARM_PLAYER_NAME
+```
+
+## Experimental public friend farms
+
+This feature is disabled by default. Zombie Farm 1.0 enables the public friend API only when `TOUCHHLE_ZOMBIE_FARM_HTTP_BASE_URL` is set. It uploads the current username and a `saveGame.bin2` snapshot to that server and allows the game to see every public farm stored there.
+
+The experiment sends no passwords, cookies, tokens, or other authentication data. The server deliberately has no authentication, so a client that knows a public player ID can overwrite that record. Do not put passwords or secrets in these environment variables or requests.
+
+```powershell
+$env:TOUCHHLE_ZOMBIE_FARM_HTTP_BASE_URL="http://127.0.0.1:8080"
+$env:TOUCHHLE_ZOMBIE_FARM_PLAYER_NAME="Your Name"
+$env:TOUCHHLE_ZOMBIE_FARM_PLAYER_ID="your_public_player_01"
+.\touchHLE.exe ".\zombie_farm\ZFR.ipa" --device-family="ipad"
+```
+
+`TOUCHHLE_ZOMBIE_FARM_PLAYER_ID` is a public identifier, not a password. It accepts 1 to 80 ASCII letters, digits, `-`, or `_`. If omitted, touchHLE generates and persists a public ID for the current installation. The current implementation accepts only a plain `http://` base URL and is gated to Zombie Farm bundle `com.playforge.ZFR.LZ54D2GT3D`, version `1.0`.
+
+To disable the online feature:
+
+```powershell
+Remove-Item Env:\TOUCHHLE_ZOMBIE_FARM_HTTP_BASE_URL
+```
+
 ## Time Offset
 
 To shift the in-emulator time forward or backward, set an environment variable before launching the game.
