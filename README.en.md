@@ -113,16 +113,16 @@ Remove-Item Env:\TOUCHHLE_ZOMBIE_FARM_PLAYER_NAME
 
 This feature is disabled by default. Zombie Farm 1.0 enables the public friend API only when `TOUCHHLE_ZOMBIE_FARM_HTTP_BASE_URL` is set. It uploads the current username and a `saveGame.bin2` snapshot to that server and allows the game to see every public farm stored there.
 
-The experiment sends no passwords, cookies, tokens, or other authentication data. The server deliberately has no authentication, so a client that knows a public player ID can overwrite that record. Do not put passwords or secrets in these environment variables or requests.
+The experiment sends no passwords, cookies, tokens, or other authentication data. The server has no authentication at all: any client can choose any valid public player ID and username, view every uploaded farm, and overwrite an existing record by using the same public player ID. Do not use a username that needs protection, and do not put passwords, secrets, or private save data in these environment variables or requests.
 
 ```powershell
-$env:TOUCHHLE_ZOMBIE_FARM_HTTP_BASE_URL="http://127.0.0.1:8080"
+$env:TOUCHHLE_ZOMBIE_FARM_HTTP_BASE_URL="https://zombiefarm.aeutlook.com"
 $env:TOUCHHLE_ZOMBIE_FARM_PLAYER_NAME="Your Name"
 $env:TOUCHHLE_ZOMBIE_FARM_PLAYER_ID="your_public_player_01"
 .\touchHLE.exe ".\zombie_farm\ZFR.ipa" --device-family="ipad"
 ```
 
-`TOUCHHLE_ZOMBIE_FARM_PLAYER_ID` is a public identifier, not a password. It accepts 1 to 80 ASCII letters, digits, `-`, or `_`. If omitted, touchHLE generates and persists a public ID for the current installation. The current implementation accepts only a plain `http://` base URL and is gated to Zombie Farm bundle `com.playforge.ZFR.LZ54D2GT3D`, version `1.0`.
+Setting `TOUCHHLE_ZOMBIE_FARM_HTTP_BASE_URL` is enough to enable the online feature; the display name and public player ID are optional overrides. `TOUCHHLE_ZOMBIE_FARM_PLAYER_ID` is a public identifier, not a password. It accepts 1 to 80 ASCII letters, digits, `-`, or `_`. If omitted, touchHLE generates and persists a public ID for the current installation. The base URL may use `http://` or `https://` with a normally trusted certificate. Network requests have timeout fallbacks, so an unavailable server returns a failure instead of waiting forever. This feature is gated to Zombie Farm bundle `com.playforge.ZFR.LZ54D2GT3D`, version `1.0`.
 
 To disable the online feature:
 

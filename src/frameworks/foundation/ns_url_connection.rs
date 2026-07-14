@@ -21,6 +21,9 @@ const ZFR_HTTP_BASE_URL_ENV: &str = "TOUCHHLE_ZOMBIE_FARM_HTTP_BASE_URL";
 const ZFR_BUNDLE_ID: &str = "com.playforge.ZFR.LZ54D2GT3D";
 const ZFR_BUNDLE_VERSION: &str = "1.0";
 const MAX_RESPONSE_BYTES: usize = 8 << 20;
+const ZFR_HTTP_GLOBAL_TIMEOUT: Duration = Duration::from_secs(6);
+const ZFR_HTTP_PHASE_TIMEOUT: Duration = Duration::from_secs(3);
+const ZFR_HTTP_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Our helper type, Foundation just uses ints.
 type NSURLErrorCode = NSInteger;
@@ -236,16 +239,23 @@ pub(crate) fn zombie_farm_http_base_url(env: &Environment) -> Option<String> {
         return None;
     }
     let value = std::env::var(ZFR_HTTP_BASE_URL_ENV).ok()?;
-    let value = value.trim().trim_end_matches('/');
-    let uri: ureq::http::Uri = value.parse().ok()?;
-    if uri.scheme_str() != Some("http") || uri.host().is_none() {
+    let Some(value) = normalize_zombie_farm_http_base_url(&value) else {
         static LOGGED: OnceLock<()> = OnceLock::new();
         if LOGGED.set(()).is_ok() {
             log!(
-                "ZombieFarm HTTP redirect ignored: {} must be an http:// base URL without credentials",
+                "ZombieFarm HTTP redirect ignored: {} must be an http:// or https:// base URL without credentials",
                 ZFR_HTTP_BASE_URL_ENV
             );
         }
+        return None;
+    };
+    Some(value)
+}
+
+fn normalize_zombie_farm_http_base_url(value: &str) -> Option<String> {
+    let value = value.trim().trim_end_matches('/');
+    let uri: ureq::http::Uri = value.parse().ok()?;
+    if !matches!(uri.scheme_str(), Some("http") | Some("https")) || uri.host().is_none() {
         return None;
     }
     if uri
@@ -277,18 +287,7 @@ pub(crate) fn zombie_farm_http_request(
         .map_err(|_| "invalid HTTP request".to_string())?;
 
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    let agent = AGENT.get_or_init(|| {
-        let config = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(20)))
-            .http_status_as_error(false)
-            // The experimental base URL is an explicit user-selected endpoint.
-            // Do not inherit HTTP_PROXY/HTTPS_PROXY, which can both leak the
-            // public farm payload to an unrelated proxy and make local/private
-            // endpoints hang unexpectedly.
-            .proxy(None)
-            .build();
-        config.into()
-    });
+    let agent = AGENT.get_or_init(|| zombie_farm_http_config().into());
     let mut response = agent.run(request).map_err(|error| error.to_string())?;
     let status = response.status().as_u16();
     let headers = response
@@ -312,6 +311,28 @@ pub(crate) fn zombie_farm_http_request(
         headers,
         body,
     })
+}
+
+fn zombie_farm_http_config() -> ureq::config::Config {
+    ureq::Agent::config_builder()
+        // NSURLConnection is currently synchronous in touchHLE. Keep both an
+        // end-to-end deadline and phase deadlines so an unavailable HTTP/HTTPS
+        // endpoint, DNS resolver, TLS handshake, upload, or response body
+        // cannot leave the game waiting indefinitely.
+        .timeout_global(Some(ZFR_HTTP_GLOBAL_TIMEOUT))
+        .timeout_resolve(Some(ZFR_HTTP_PHASE_TIMEOUT))
+        .timeout_connect(Some(ZFR_HTTP_PHASE_TIMEOUT))
+        .timeout_send_request(Some(ZFR_HTTP_PHASE_TIMEOUT))
+        .timeout_send_body(Some(ZFR_HTTP_BODY_TIMEOUT))
+        .timeout_recv_response(Some(ZFR_HTTP_BODY_TIMEOUT))
+        .timeout_recv_body(Some(ZFR_HTTP_BODY_TIMEOUT))
+        .http_status_as_error(false)
+        // The experimental base URL is an explicit user-selected endpoint.
+        // Do not inherit HTTP_PROXY/HTTPS_PROXY, which can both leak the
+        // public farm payload to an unrelated proxy and make local/private
+        // endpoints hang unexpectedly.
+        .proxy(None)
+        .build()
 }
 
 fn perform_request(
@@ -519,5 +540,53 @@ fn url_string_from_request(env: &mut Environment, request: id) -> Cow<'static, s
         let url = msg![env; request URL];
         let ns_string = msg![env; url absoluteString];
         ns_string::to_rust_string(env, ns_string)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        normalize_zombie_farm_http_base_url, zombie_farm_http_config, ZFR_HTTP_BODY_TIMEOUT,
+        ZFR_HTTP_GLOBAL_TIMEOUT, ZFR_HTTP_PHASE_TIMEOUT,
+    };
+
+    #[test]
+    fn zombie_farm_base_url_accepts_http_and_https() {
+        assert_eq!(
+            normalize_zombie_farm_http_base_url(" http://127.0.0.1:28083/ "),
+            Some("http://127.0.0.1:28083".to_string())
+        );
+        assert_eq!(
+            normalize_zombie_farm_http_base_url("https://farm.example.com/"),
+            Some("https://farm.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn zombie_farm_base_url_rejects_unsupported_or_credentialed_urls() {
+        assert_eq!(
+            normalize_zombie_farm_http_base_url("ftp://farm.example.com"),
+            None
+        );
+        assert_eq!(
+            normalize_zombie_farm_http_base_url("https://user:password@farm.example.com"),
+            None
+        );
+        assert_eq!(
+            normalize_zombie_farm_http_base_url("farm.example.com"),
+            None
+        );
+    }
+
+    #[test]
+    fn zombie_farm_http_config_bounds_every_blocking_phase() {
+        let timeouts = zombie_farm_http_config().timeouts();
+        assert_eq!(timeouts.global, Some(ZFR_HTTP_GLOBAL_TIMEOUT));
+        assert_eq!(timeouts.resolve, Some(ZFR_HTTP_PHASE_TIMEOUT));
+        assert_eq!(timeouts.connect, Some(ZFR_HTTP_PHASE_TIMEOUT));
+        assert_eq!(timeouts.send_request, Some(ZFR_HTTP_PHASE_TIMEOUT));
+        assert_eq!(timeouts.send_body, Some(ZFR_HTTP_BODY_TIMEOUT));
+        assert_eq!(timeouts.recv_response, Some(ZFR_HTTP_BODY_TIMEOUT));
+        assert_eq!(timeouts.recv_body, Some(ZFR_HTTP_BODY_TIMEOUT));
     }
 }

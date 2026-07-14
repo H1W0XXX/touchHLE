@@ -113,16 +113,16 @@ Remove-Item Env:\TOUCHHLE_ZOMBIE_FARM_PLAYER_NAME
 
 该功能默认关闭。只有在设置 `TOUCHHLE_ZOMBIE_FARM_HTTP_BASE_URL` 后，Zombie Farm 1.0 才会启用公开好友接口，把当前用户名和 `saveGame.bin2` 存档快照上传到指定服务端，并允许查看服务端上的所有公开农场。
 
-此实验接口不使用密码、Cookie、令牌或其他鉴权信息。服务端没有鉴权，知道公开玩家 ID 的客户端可以覆盖对应记录，因此不要在请求或环境变量中放入任何密码或秘密信息。
+此实验接口不使用密码、Cookie、令牌或其他鉴权信息。服务端完全没有鉴权：任何客户端都可以填写任意合法的公开玩家 ID 和用户名、查看所有已上传的农场，并且可以用相同公开玩家 ID 覆盖已有记录。因此不要使用需要保护的用户名，也不要在请求或环境变量中放入任何密码、秘密信息或私人存档。
 
 ```powershell
-$env:TOUCHHLE_ZOMBIE_FARM_HTTP_BASE_URL="http://127.0.0.1:8080"
+$env:TOUCHHLE_ZOMBIE_FARM_HTTP_BASE_URL="https://zombiefarm.aeutlook.com"
 $env:TOUCHHLE_ZOMBIE_FARM_PLAYER_NAME="你的名字"
 $env:TOUCHHLE_ZOMBIE_FARM_PLAYER_ID="your_public_player_01"
 .\touchHLE.exe ".\zombie_farm\ZFR.ipa" --device-family="ipad"
 ```
 
-`TOUCHHLE_ZOMBIE_FARM_PLAYER_ID` 是公开标识，不是密码；允许 1 到 80 个 ASCII 字母、数字、`-` 或 `_`。如果不设置，touchHLE 会为当前安装生成并持久化一个公开 ID。当前实现只接受明文 `http://` 基础地址，并且只对包标识为 `com.playforge.ZFR.LZ54D2GT3D`、版本为 `1.0` 的 Zombie Farm 启用。
+只需要设置 `TOUCHHLE_ZOMBIE_FARM_HTTP_BASE_URL` 就会启用在线功能；名字和公开玩家 ID 可以按需设置。`TOUCHHLE_ZOMBIE_FARM_PLAYER_ID` 是公开标识，不是密码；允许 1 到 80 个 ASCII 字母、数字、`-` 或 `_`。如果不设置，touchHLE 会为当前安装生成并持久化一个公开 ID。基础地址支持 `http://` 和使用正常受信任证书的 `https://`；网络请求带有超时兜底，服务不可用时会返回失败而不是无限等待。该功能只对包标识为 `com.playforge.ZFR.LZ54D2GT3D`、版本为 `1.0` 的 Zombie Farm 启用。
 
 关闭在线功能：
 
