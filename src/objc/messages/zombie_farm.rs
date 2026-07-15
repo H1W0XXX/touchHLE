@@ -4580,6 +4580,47 @@ fn zombie_farm_apply_local_hunger_update(env: &mut Environment, receiver: id, se
     env.cpu.regs_mut().copy_from_slice(&regs);
 }
 
+const ZOMBIE_FARM_SOCIAL_TUTORIAL_FLAGS: i32 = 0x1ff;
+
+/// Mark every step of Zombie Farm's social tutorial as completed while the
+/// experimental public-farm server is enabled.
+///
+/// Doing this during startup makes a brand-new local save usable before the
+/// player first opens SocialMenu. Doing it again before `saveGame` ensures the
+/// completed bits are serialized into saveGame.bin2 instead of being only an
+/// in-memory UI workaround.
+fn zombie_farm_complete_social_tutorial(env: &mut Environment, reason: &str) -> bool {
+    if ns_url_connection::zombie_farm_http_base_url(env).is_none() {
+        return false;
+    }
+
+    let regs = *env.cpu.regs();
+    let game_state: id = msg_class![env; GameState gameState];
+    let game_data: id = if game_state == nil {
+        nil
+    } else {
+        msg![env; game_state zfGameData]
+    };
+    if game_data == nil {
+        env.cpu.regs_mut().copy_from_slice(&regs);
+        return false;
+    }
+
+    // SocialMenu consumes bits 0..=8 of gflags2, with 0x100 being the final
+    // acknowledgement set by tutorialOkButtonPressed.
+    let flags: i32 = msg![env; game_data gflags2];
+    let completed_flags = flags | ZOMBIE_FARM_SOCIAL_TUTORIAL_FLAGS;
+    if completed_flags != flags {
+        let _: () = msg![env; game_data setGflags2:completed_flags];
+        log!(
+            "ZombieFarm public online: completed social tutorial in GameData during {reason} (gflags2 0x{flags:x} -> 0x{completed_flags:x})"
+        );
+    }
+
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    true
+}
+
 fn zombie_farm_check_local_daily_event(env: &mut Environment, receiver: id, selector_name: &str) {
     if !zombie_farm_uses_playforge_bundle(env)
         || !matches!(selector_name, "statusCheckDone" | "startUpChecksComplete")
@@ -5584,22 +5625,14 @@ fn zombie_farm_load_public_friend_list(
     let mut sections = 0i32;
     let mut rows = 0i32;
     let _: () = msg![env; friends_table setTutorialMode:false];
-    if game_state != nil {
-        let game_data: id = msg![env; game_state zfGameData];
-        if game_data != nil {
-            // SocialMenu's real tutorial state machine consumes bits 0..=8
-            // of gflags2, ending with 0x100 in tutorialOkButtonPressed.
-            let flags: i32 = msg![env; game_data gflags2];
-            let _: () = msg![env; game_data setGflags2:(flags | 0x1ff)];
-            let social_menu: id = if from_social_menu {
-                receiver
-            } else {
-                msg_class![env; SocialMenu socialMenu]
-            };
-            if social_menu != nil {
-                let _: () = msg![env; social_menu tutorialNextStep];
-            }
-            log!("ZombieFarm public friend list marked the social tutorial complete");
+    if zombie_farm_complete_social_tutorial(env, "friend list refresh") {
+        let social_menu: id = if from_social_menu {
+            receiver
+        } else {
+            msg_class![env; SocialMenu socialMenu]
+        };
+        if social_menu != nil {
+            let _: () = msg![env; social_menu tutorialNextStep];
         }
     }
     if table_view != nil {
@@ -6201,6 +6234,9 @@ pub(super) fn zombie_farm_pre_dispatch_workarounds(
         | "startInvasionWithDictionary:checkHunger:"
         | "invadeButtonTapped:"
         | "switchToFightScene" => {
+            if selector_name == "saveGame" {
+                zombie_farm_complete_social_tutorial(env, "saveGame");
+            }
             zombie_farm_prepare_local_hunger_update(env, selector_name);
         }
         _ => {}
@@ -6287,6 +6323,7 @@ pub(super) fn zombie_farm_post_dispatch_workarounds(
             zombie_farm_apply_local_hunger_update(env, receiver, selector_name);
         }
         "statusCheckDone" | "startUpChecksComplete" => {
+            zombie_farm_complete_social_tutorial(env, selector_name);
             zombie_farm_apply_local_hunger_update(env, receiver, selector_name);
             zombie_farm_check_local_daily_event(env, receiver, selector_name);
             zombie_farm_restore_local_quest_progress(env, receiver, selector_name);
