@@ -10,7 +10,3 @@
 #define STBI_ONLY_GIF
 #define STBI_NO_STDIO
 #include "../../../vendor/stb/stb_image.h"
-
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#define STBI_WRITE_NO_STDIO
-#include "../../../vendor/stb/stb_image_write.h"

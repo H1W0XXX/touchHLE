@@ -17,7 +17,7 @@
 //! References:
 //! - "Supported Image Formats" in [Loading Images](https://developer.apple.com/library/archive/documentation/2DDrawing/Conceptual/DrawingPrintingiOS/LoadingImages/LoadingImages.html)
 
-use std::ffi::{c_int, c_uchar, c_void, CStr};
+use std::ffi::{c_int, c_uchar, CStr};
 use std::io::Cursor;
 
 use tiff::decoder::{Decoder as TiffDecoder, DecodingResult};
@@ -164,91 +164,6 @@ impl Image {
 
     pub fn dimensions(&self) -> (u32, u32) {
         self.dimensions
-    }
-
-    /// Resize premultiplied RGBA pixels with bilinear filtering.
-    pub fn resized(&self, dimensions: (u32, u32)) -> Image {
-        let (source_width, source_height) = self.dimensions;
-        let (target_width, target_height) = dimensions;
-        assert!(source_width != 0 && source_height != 0);
-        assert!(target_width != 0 && target_height != 0);
-
-        let mut pixels = vec![0; target_width as usize * target_height as usize * 4];
-        let source = self.pixels();
-        for target_y in 0..target_height {
-            let source_y = ((target_y as f32 + 0.5) * source_height as f32 / target_height as f32
-                - 0.5)
-                .clamp(0.0, source_height.saturating_sub(1) as f32);
-            let y0 = source_y.floor() as u32;
-            let y1 = (y0 + 1).min(source_height - 1);
-            let y_weight = source_y - y0 as f32;
-
-            for target_x in 0..target_width {
-                let source_x =
-                    ((target_x as f32 + 0.5) * source_width as f32 / target_width as f32 - 0.5)
-                        .clamp(0.0, source_width.saturating_sub(1) as f32);
-                let x0 = source_x.floor() as u32;
-                let x1 = (x0 + 1).min(source_width - 1);
-                let x_weight = source_x - x0 as f32;
-
-                let target_offset =
-                    (target_y as usize * target_width as usize + target_x as usize) * 4;
-                for channel in 0..4 {
-                    let sample = |x: u32, y: u32| {
-                        source[(y as usize * source_width as usize + x as usize) * 4 + channel]
-                            as f32
-                    };
-                    let top = sample(x0, y0) * (1.0 - x_weight) + sample(x1, y0) * x_weight;
-                    let bottom = sample(x0, y1) * (1.0 - x_weight) + sample(x1, y1) * x_weight;
-                    pixels[target_offset + channel] =
-                        (top * (1.0 - y_weight) + bottom * y_weight).round() as u8;
-                }
-            }
-        }
-
-        Image::from_pixel_vec(pixels, dimensions)
-    }
-
-    /// Encode the internal premultiplied RGBA pixels as a regular PNG.
-    pub fn to_png_bytes(&self) -> Result<Vec<u8>, String> {
-        let mut rgba = self.pixels().to_vec();
-        for pixel in rgba.chunks_exact_mut(4) {
-            let alpha = pixel[3] as u16;
-            if alpha != 0 {
-                for channel in &mut pixel[..3] {
-                    *channel = ((*channel as u16 * 255 + alpha / 2) / alpha).min(255) as u8;
-                }
-            }
-        }
-
-        unsafe extern "C" fn append_png_bytes(
-            context: *mut c_void,
-            data: *mut c_void,
-            size: c_int,
-        ) {
-            let output = unsafe { &mut *context.cast::<Vec<u8>>() };
-            let bytes = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), size as usize) };
-            output.extend_from_slice(bytes);
-        }
-
-        let mut output = Vec::new();
-        let (width, height) = self.dimensions;
-        let result = unsafe {
-            stbi_write_png_to_func(
-                append_png_bytes,
-                (&mut output as *mut Vec<u8>).cast(),
-                width.try_into().unwrap(),
-                height.try_into().unwrap(),
-                4,
-                rgba.as_ptr().cast(),
-                (width * 4).try_into().unwrap(),
-            )
-        };
-        if result == 0 {
-            Err("stb_image_write failed to encode PNG".to_string())
-        } else {
-            Ok(output)
-        }
     }
 
     /// Get image data as bytes (8 bits per channel sRGB RGBA with premultiplied
@@ -475,18 +390,6 @@ mod tests {
         let image = Image::from_bytes(&bytes).unwrap();
         assert_eq!(image.dimensions(), (1, 1));
         assert_eq!(image.pixels(), &[50, 25, 12, 128]);
-    }
-
-    #[test]
-    fn resizes_and_encodes_png() {
-        let image = Image::from_pixel_vec(vec![255, 0, 0, 255, 0, 255, 0, 255], (2, 1));
-        let resized = image.resized((4, 2));
-        assert_eq!(resized.dimensions(), (4, 2));
-
-        let png = resized.to_png_bytes().unwrap();
-        let decoded = Image::from_bytes(&png).unwrap();
-        assert_eq!(decoded.dimensions(), (4, 2));
-        assert_eq!(decoded.pixels(), resized.pixels());
     }
 }
 
