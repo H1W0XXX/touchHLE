@@ -7,6 +7,7 @@
 
 use super::ns_property_list_serialization;
 use super::ns_string::{from_rust_string, to_rust_string};
+use super::ns_url_connection::zombie_farm_http_request;
 use super::{NSRange, NSUInteger};
 use crate::frameworks::foundation::ns_keyed_unarchiver::decode_current_data;
 use crate::frameworks::foundation::ns_object::zombie_farm_preserve_object_on_release;
@@ -21,6 +22,32 @@ fn is_zombie_farm_save_path(path: &str) -> bool {
     path.ends_with("/Documents/saveGame.bin2")
         || path.ends_with("/Documents/saveGame.preview")
         || path.ends_with("/Documents/playerProfileManager.txt")
+}
+
+const ZOMBIE_FARM_IPAD_ASSET_URL_PREFIX: &str =
+    "https://s3.amazonaws.com/zombiefarm-website/website/images/ipadassets/";
+
+fn zombie_farm_local_asset_name(url: &str) -> Option<&str> {
+    let name = url.strip_prefix(ZOMBIE_FARM_IPAD_ASSET_URL_PREFIX)?;
+    if name.is_empty() || name.contains('/') || name.contains('\\') {
+        return None;
+    }
+    Some(name)
+}
+
+fn init_with_host_bytes(env: &mut Environment, this: id, bytes: &[u8]) -> id {
+    let size = bytes.len().try_into().unwrap();
+    let alloc = env.mem.alloc(size);
+    if size != 0 {
+        env.mem
+            .bytes_at_mut(alloc.cast(), size)
+            .copy_from_slice(bytes);
+    }
+
+    let host_object = env.objc.borrow_mut::<NSDataHostObject>(this);
+    host_object.bytes = alloc;
+    host_object.length = size;
+    this
 }
 
 pub(super) struct NSDataHostObject {
@@ -150,11 +177,48 @@ pub const CLASSES: ClassExports = objc_classes! {
         return nil;
     }
 
-    log!("TODO: ignoring [(NSData*){:?} initWithContentsOfURL:{:?}]", this, path);
-    // TODO: actually load data once we have proper network support
     if env.bundle.bundle_identifier().starts_with("com.playforge.Z") {
+        // The original Zombie Farm iPad asset bucket no longer contains these
+        // files. ZFR ships lower-resolution resources with the same names, so
+        // prefer those instead of taking the game's failed-download path.
+        if let Some(name) = zombie_farm_local_asset_name(&path) {
+            let local_path = env.bundle.bundle_path().join(name);
+            if let Ok(bytes) = env.fs.read(&local_path) {
+                log!(
+                    "ZombieFarm NSData: using bundled {:?} for unavailable iPad asset {:?}",
+                    local_path,
+                    path
+                );
+                return init_with_host_bytes(env, this, &bytes);
+            }
+        }
+
+        match zombie_farm_http_request("GET", &path, &[], Vec::new()) {
+            Ok(response) if (200..300).contains(&response.status) => {
+                log!(
+                    "ZombieFarm NSData: downloaded {} byte(s) from {:?}",
+                    response.body.len(),
+                    path
+                );
+                return init_with_host_bytes(env, this, &response.body);
+            }
+            Ok(response) => {
+                log!(
+                    "ZombieFarm NSData: GET {:?} returned HTTP {}",
+                    path,
+                    response.status
+                );
+            }
+            Err(error) => {
+                log!("ZombieFarm NSData: GET {:?} failed: {}", path, error);
+            }
+        }
+
         zombie_farm_preserve_object_on_release(this);
+        return nil;
     }
+
+    log!("TODO: ignoring [(NSData*){:?} initWithContentsOfURL:{:?}]", this, path);
     nil
 }
 
