@@ -12,10 +12,12 @@ use super::{NSRange, NSUInteger};
 use crate::frameworks::foundation::ns_keyed_unarchiver::decode_current_data;
 use crate::frameworks::foundation::ns_object::zombie_farm_preserve_object_on_release;
 use crate::fs::GuestPath;
+use crate::image::Image;
 use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::{
     autorelease, id, msg, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
 };
+use crate::window::DeviceFamily;
 use crate::{msg_class, Environment};
 
 fn is_zombie_farm_save_path(path: &str) -> bool {
@@ -33,6 +35,21 @@ fn zombie_farm_local_asset_name(url: &str) -> Option<&str> {
         return None;
     }
     Some(name)
+}
+
+fn zombie_farm_ipad_asset_dimensions(source: (u32, u32)) -> (u32, u32) {
+    const IPHONE_LANDSCAPE: (u64, u64) = (480, 320);
+    const IPAD_LANDSCAPE: (u64, u64) = (1024, 768);
+    let width = (source.0 as u64 * IPAD_LANDSCAPE.0 + IPHONE_LANDSCAPE.0 / 2) / IPHONE_LANDSCAPE.0;
+    let height = (source.1 as u64 * IPAD_LANDSCAPE.1 + IPHONE_LANDSCAPE.1 / 2) / IPHONE_LANDSCAPE.1;
+    (width.try_into().unwrap(), height.try_into().unwrap())
+}
+
+fn scale_zombie_farm_ipad_asset(bytes: &[u8]) -> Result<(Vec<u8>, (u32, u32)), String> {
+    let image = Image::from_bytes(bytes)?;
+    let dimensions = zombie_farm_ipad_asset_dimensions(image.dimensions());
+    let png = image.resized(dimensions).to_png_bytes()?;
+    Ok((png, dimensions))
 }
 
 fn init_with_host_bytes(env: &mut Environment, this: id, bytes: &[u8]) -> id {
@@ -184,6 +201,27 @@ pub const CLASSES: ClassExports = objc_classes! {
         if let Some(name) = zombie_farm_local_asset_name(&path) {
             let local_path = env.bundle.bundle_path().join(name);
             if let Ok(bytes) = env.fs.read(&local_path) {
+                if env.window().device_family() == DeviceFamily::iPad {
+                    match scale_zombie_farm_ipad_asset(&bytes) {
+                        Ok((scaled, dimensions)) => {
+                            log!(
+                                "ZombieFarm NSData: scaled bundled {:?} to {}x{} for iPad asset {:?}",
+                                local_path,
+                                dimensions.0,
+                                dimensions.1,
+                                path
+                            );
+                            return init_with_host_bytes(env, this, &scaled);
+                        }
+                        Err(error) => {
+                            log!(
+                                "ZombieFarm NSData: could not scale bundled {:?} for iPad: {}",
+                                local_path,
+                                error
+                            );
+                        }
+                    }
+                }
                 log!(
                     "ZombieFarm NSData: using bundled {:?} for unavailable iPad asset {:?}",
                     local_path,
@@ -512,4 +550,15 @@ pub fn to_rust_slice(env: &mut Environment, data: id) -> &[u8] {
     assert!(!borrowed_data.bytes.is_null() && borrowed_data.length != 0);
     env.mem
         .bytes_at(borrowed_data.bytes.cast(), borrowed_data.length)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::zombie_farm_ipad_asset_dimensions;
+
+    #[test]
+    fn scales_iphone_assets_to_ipad_landscape_coordinates() {
+        assert_eq!(zombie_farm_ipad_asset_dimensions((480, 320)), (1024, 768));
+        assert_eq!(zombie_farm_ipad_asset_dimensions((216, 320)), (461, 768));
+    }
 }

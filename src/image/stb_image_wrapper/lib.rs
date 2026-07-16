@@ -12,6 +12,8 @@
 
 use std::ffi::{c_char, c_int, c_uchar, c_void};
 
+pub type StbiWriteFunc = unsafe extern "C" fn(*mut c_void, *mut c_void, c_int);
+
 // See build.rs, lib.c and ../../../vendor/stb/stb_image.h
 extern "C" {
     pub fn stbi_convert_iphone_png_to_rgb(flag_true_if_should_convert: c_int);
@@ -26,4 +28,13 @@ extern "C" {
     ) -> *mut c_uchar;
     pub fn stbi_image_free(retval_from_stbi_load: *mut c_void);
     pub fn stbi_failure_reason() -> *const c_char;
+    pub fn stbi_write_png_to_func(
+        func: StbiWriteFunc,
+        context: *mut c_void,
+        width: c_int,
+        height: c_int,
+        components: c_int,
+        data: *const c_void,
+        stride_in_bytes: c_int,
+    ) -> c_int;
 }
