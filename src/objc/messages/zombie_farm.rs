@@ -25,6 +25,24 @@ use std::sync::{
     Mutex, OnceLock,
 };
 
+pub(super) fn trace_zombie_farm_daily_message(selector_name: &str) -> bool {
+    matches!(
+        selector_name,
+        "checkDailyEvent"
+            | "displayAlertDailyBonus"
+            | "displayAlertBrainSpinner"
+            | "showDailyEvents"
+            | "showDailyBonusRewardInterface"
+            | "showChanceSpinInterface"
+            | "inputDailyBonusReward:alert:"
+            | "incrementDailyBonusRewardDay"
+            | "applyReward"
+            | "spin"
+            | "displayResult"
+            | "didWin"
+    )
+}
+
 pub(super) fn trace_zombie_farm_status_message(class_name: &str, selector_name: &str) -> bool {
     let lower_class = class_name.to_ascii_lowercase();
     let interesting_class = matches!(
@@ -41,29 +59,7 @@ pub(super) fn trace_zombie_farm_status_message(class_name: &str, selector_name: 
     let statusish_class = lower_class.contains("status")
         || lower_class.contains("profile")
         || lower_class.contains("notification");
-    let daily_selector = matches!(
-        selector_name,
-        "checkDailyEvent"
-            | "checkDailySalesmanRewards"
-            | "displayAlertDailyBonus"
-            | "dailyRewardWindow"
-            | "showDailyEvents"
-            | "showDailyBonusRewardInterface"
-            | "canShowDailySalesmanOffer"
-            | "showDailySalesmanOffer"
-            | "inputDailyBonusReward:alert:"
-            | "incrementDailyBonusRewardDay"
-            | "applyReward"
-            | "createLabelWithDay:"
-            | "goldAmountForDayCount:"
-            | "brainChanceForDayCount:"
-            | "dailyBonusRewardDisplayDate"
-            | "setDailyBonusRewardDisplayDate:"
-            | "dailyBonusRewardRedeemedDate"
-            | "setDailyBonusRewardRedeemedDate:"
-            | "dailyBonusRewardDayCount"
-            | "setDailyBonusRewardDayCount:"
-    );
+    let daily_selector = trace_zombie_farm_daily_message(selector_name);
     let interesting_selector = daily_selector
         || matches!(
             selector_name,
@@ -212,6 +208,11 @@ pub(super) fn zombie_farm_quest_trace_enabled() -> bool {
 pub(super) fn zombie_farm_status_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("TOUCHHLE_ZF_STATUS_TRACE").ok().as_deref() == Some("1"))
+}
+
+pub(super) fn zombie_farm_daily_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("TOUCHHLE_ZF_DAILY_TRACE").ok().as_deref() == Some("1"))
 }
 
 fn zombie_farm_touch_trace_enabled() -> bool {
@@ -4486,7 +4487,6 @@ fn zombie_farm_complete_server_time_locally(
 ) -> bool {
     if selector_name != "getServerTime"
         || zombie_farm_object_class_name(env, receiver) != Some("ZFGuiLayer")
-        || ns_url_connection::zombie_farm_http_base_url(env).is_none()
     {
         return false;
     }
@@ -4497,12 +4497,14 @@ fn zombie_farm_complete_server_time_locally(
     let handled =
         zombie_farm_send_id_arg_if_responds(env, receiver, "handleTimeResponse:", response);
     release(env, response);
-    env.cpu.regs_mut().copy_from_slice(&regs);
-    env.cpu.regs_mut()[0] = 0;
 
     if handled {
-        log!("ZombieFarm public online: completed getServerTime locally without /shared/time.php");
+        zombie_farm_show_due_daily_reward_locally(env, receiver, "getServerTime");
+        ZOMBIE_FARM_CHECKED_LOCAL_DAILY_EVENT.store(true, Ordering::Relaxed);
+        log!("ZombieFarm status: completed getServerTime locally for daily rewards");
     }
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    env.cpu.regs_mut()[0] = 0;
     handled
 }
 
@@ -4621,6 +4623,34 @@ fn zombie_farm_complete_social_tutorial(env: &mut Environment, reason: &str) -> 
     true
 }
 
+fn zombie_farm_acknowledge_daily_reward_confirmation(env: &mut Environment, receiver: id) {
+    // The first argument is the Cocos daily-window choice: true for Claim,
+    // false for Wait. Only Claim enters the otherwise invisible UIKit
+    // confirmation path.
+    if env.cpu.regs()[2] == 0 || zombie_farm_object_class_name(env, receiver) != Some("ZFGuiLayer")
+    {
+        return;
+    }
+
+    let regs = *env.cpu.regs();
+    let game_state: id = msg_class![env; GameState gameState];
+    let game_data: id = if game_state == nil {
+        nil
+    } else {
+        msg![env; game_state zfGameData]
+    };
+    if game_data != nil {
+        const DAILY_REWARD_CONFIRMATION_ACKNOWLEDGED: i32 = 0x2000_0000;
+        let flags: i32 = msg![env; game_data gflags];
+        if flags & DAILY_REWARD_CONFIRMATION_ACKNOWLEDGED == 0 {
+            let updated_flags = flags | DAILY_REWARD_CONFIRMATION_ACKNOWLEDGED;
+            let _: () = msg![env; game_data setGflags:updated_flags];
+            log!("ZombieFarm daily reward: acknowledged invisible confirmation before first Claim");
+        }
+    }
+    env.cpu.regs_mut().copy_from_slice(&regs);
+}
+
 fn zombie_farm_check_local_daily_event(env: &mut Environment, receiver: id, selector_name: &str) {
     if !zombie_farm_uses_playforge_bundle(env)
         || !matches!(selector_name, "statusCheckDone" | "startUpChecksComplete")
@@ -4645,6 +4675,7 @@ fn zombie_farm_check_local_daily_event(env: &mut Environment, receiver: id, sele
     let time_response = zombie_farm_local_time_response(env);
     ZOMBIE_FARM_CHECKED_LOCAL_DAILY_EVENT.store(true, Ordering::Relaxed);
     if zombie_farm_send_id_arg_if_responds(env, gui_layer, "handleTimeResponse:", time_response) {
+        zombie_farm_show_due_daily_reward_locally(env, gui_layer, selector_name);
         log!(
             "ZombieFarm status: completed local daily event time response after {}",
             selector_name
@@ -4652,6 +4683,105 @@ fn zombie_farm_check_local_daily_event(env: &mut Environment, receiver: id, sele
     } else {
         ZOMBIE_FARM_CHECKED_LOCAL_DAILY_EVENT.store(false, Ordering::Relaxed);
     }
+    env.cpu.regs_mut().copy_from_slice(&regs);
+}
+
+fn zombie_farm_show_due_daily_reward_locally(
+    env: &mut Environment,
+    gui_layer: id,
+    reason: &str,
+) -> bool {
+    if zombie_farm_object_class_name(env, gui_layer) != Some("ZFGuiLayer") {
+        return false;
+    }
+
+    let regs = *env.cpu.regs();
+    let game_state: id = msg_class![env; GameState gameState];
+    let game_data: id = if game_state == nil {
+        nil
+    } else {
+        msg![env; game_state zfGameData]
+    };
+    if game_data == nil {
+        env.cpu.regs_mut().copy_from_slice(&regs);
+        return false;
+    }
+
+    let display_date: id = msg![env; game_data dailyBonusRewardDisplayDate];
+    let now: id = msg_class![env; NSDate date];
+    let elapsed_seconds = ns_date::debug_time_interval(env, now)
+        .zip(ns_date::debug_time_interval(env, display_date))
+        .map(|(now, last)| now - last);
+    let reward_is_due = display_date == nil
+        || elapsed_seconds
+            .map(|elapsed| elapsed >= 86_399.9999)
+            .unwrap_or(false);
+
+    let shown =
+        reward_is_due && zombie_farm_send_noarg_if_responds(env, gui_layer, "showDailyEvents");
+    if shown {
+        log!(
+            "ZombieFarm daily reward: invoked showDailyEvents after {} (elapsed {:?} seconds)",
+            reason,
+            elapsed_seconds,
+        );
+    } else if zombie_farm_daily_trace_enabled() {
+        log!(
+            "ZombieFarm daily trace: reward not shown after {} (displayDate={:?}, elapsedSeconds={:?}, due={})",
+            reason,
+            display_date,
+            elapsed_seconds,
+            reward_is_due,
+        );
+    }
+
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    shown
+}
+
+fn zombie_farm_trace_daily_reward_gate(env: &mut Environment, gui_layer: id) {
+    if !zombie_farm_daily_trace_enabled()
+        || zombie_farm_object_class_name(env, gui_layer) != Some("ZFGuiLayer")
+    {
+        return;
+    }
+
+    let regs = *env.cpu.regs();
+    let game_state: id = msg_class![env; GameState gameState];
+    let game_data: id = if game_state == nil {
+        nil
+    } else {
+        msg![env; game_state zfGameData]
+    };
+    let display_date: id = if game_data == nil {
+        nil
+    } else {
+        msg![env; game_data dailyBonusRewardDisplayDate]
+    };
+    let day_count: i32 = if game_data == nil {
+        0
+    } else {
+        msg![env; game_data dailyBonusRewardDayCount]
+    };
+    let server_date = zombie_farm_read_object_ivar(env, gui_layer, "serverDate").unwrap_or(nil);
+    let daily_reward_window =
+        zombie_farm_read_object_ivar(env, gui_layer, "dailyRewardWindow").unwrap_or(nil);
+    let server_seconds = ns_date::debug_time_interval(env, server_date);
+    let display_seconds = ns_date::debug_time_interval(env, display_date);
+    let elapsed_seconds = server_seconds
+        .zip(display_seconds)
+        .map(|(now, last)| now - last);
+
+    log!(
+        "ZombieFarm daily trace: gate serverDate={:?} ({:?}), displayDate={:?} ({:?}), rawElapsedSeconds={:?}, dayCount={}, dailyRewardWindow={:?}",
+        server_date,
+        server_seconds,
+        display_date,
+        display_seconds,
+        elapsed_seconds,
+        day_count,
+        daily_reward_window,
+    );
     env.cpu.regs_mut().copy_from_slice(&regs);
 }
 
@@ -6222,6 +6352,9 @@ pub(super) fn zombie_farm_pre_dispatch_workarounds(
         "handleResponse:forAction:" => {
             zombie_farm_prepare_local_server_date(env, receiver, selector_name);
         }
+        "inputDailyBonusReward:alert:" => {
+            zombie_farm_acknowledge_daily_reward_confirmation(env, receiver);
+        }
         "openMenu"
         | "openMenuThroughMausoleum"
         | "displayCurrentZombie"
@@ -6278,6 +6411,7 @@ pub(super) fn zombie_farm_needs_pre_dispatch_workarounds(
             | "setSaveDate:"
             | "getServerTime"
             | "handleResponse:forAction:"
+            | "inputDailyBonusReward:alert:"
             | "openMenu"
             | "openMenuThroughMausoleum"
             | "displayCurrentZombie"
@@ -6321,6 +6455,7 @@ pub(super) fn zombie_farm_post_dispatch_workarounds(
     match selector_name {
         "handleTimeResponse:" => {
             zombie_farm_apply_local_hunger_update(env, receiver, selector_name);
+            zombie_farm_trace_daily_reward_gate(env, receiver);
         }
         "statusCheckDone" | "startUpChecksComplete" => {
             zombie_farm_complete_social_tutorial(env, selector_name);

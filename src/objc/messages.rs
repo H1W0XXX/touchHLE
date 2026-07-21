@@ -163,11 +163,12 @@ mod zombie_farm;
 
 pub use zombie_farm::zombie_farm_complete_all_quests_cheat;
 use zombie_farm::{
-    trace_zombie_farm_layout_message, trace_zombie_farm_layout_normal_return,
-    trace_zombie_farm_layout_stret_return, trace_zombie_farm_layout_to_console,
-    trace_zombie_farm_quest_message, trace_zombie_farm_quest_normal_return,
-    trace_zombie_farm_status_message, trace_zombie_farm_status_normal_return,
-    zombie_farm_begin_zombie_cell_assignment, zombie_farm_cell_content_size_override,
+    trace_zombie_farm_daily_message, trace_zombie_farm_layout_message,
+    trace_zombie_farm_layout_normal_return, trace_zombie_farm_layout_stret_return,
+    trace_zombie_farm_layout_to_console, trace_zombie_farm_quest_message,
+    trace_zombie_farm_quest_normal_return, trace_zombie_farm_status_message,
+    trace_zombie_farm_status_normal_return, zombie_farm_begin_zombie_cell_assignment,
+    zombie_farm_cell_content_size_override, zombie_farm_daily_trace_enabled,
     zombie_farm_finish_zombie_cell_assignment, zombie_farm_ignore_spurious_operation_done,
     zombie_farm_layout_arg_details, zombie_farm_log_quest_object_state,
     zombie_farm_log_status_object_state, zombie_farm_needs_post_dispatch_workarounds,
@@ -396,6 +397,8 @@ fn objc_msgSend_inner(
                     zombie_farm_bundle && crate::zombie_farm_debug::scroll_profile_enabled();
                 let zombie_farm_status_trace_active = zombie_farm_bundle
                     && (zombie_farm_debug_enabled || zombie_farm_status_trace_enabled());
+                let zombie_farm_daily_trace_active =
+                    zombie_farm_bundle && zombie_farm_daily_trace_enabled();
                 let zombie_farm_quest_trace_active =
                     zombie_farm_bundle && zombie_farm_quest_trace_enabled();
                 let zombie_farm_cocos_label_text_selector = zombie_farm_bundle
@@ -411,6 +414,7 @@ fn objc_msgSend_inner(
                 let receiver_class_name = if zombie_farm_debug_enabled
                     || zombie_farm_scroll_profile_enabled
                     || zombie_farm_status_trace_active
+                    || zombie_farm_daily_trace_active
                     || zombie_farm_quest_trace_active
                     || zombie_farm_cocos_label_text_selector
                     || zombie_farm_reverse_workaround_candidate
@@ -441,9 +445,11 @@ fn objc_msgSend_inner(
                 let trace_zombie_farm_layout = zombie_farm_debug_enabled
                     && (trace_zombie_farm_layout_message(receiver_class_name, selector_name)
                         || trace_zombie_farm_layout_message(name, selector_name));
-                let trace_zombie_farm_status = zombie_farm_status_trace_active
+                let trace_zombie_farm_status = (zombie_farm_status_trace_active
                     && (trace_zombie_farm_status_message(receiver_class_name, selector_name)
-                        || trace_zombie_farm_status_message(name, selector_name));
+                        || trace_zombie_farm_status_message(name, selector_name)))
+                    || (zombie_farm_daily_trace_active
+                        && trace_zombie_farm_daily_message(selector_name));
                 let trace_zombie_farm_quest = zombie_farm_quest_trace_active
                     && (trace_zombie_farm_quest_message(receiver_class_name, selector_name)
                         || trace_zombie_farm_quest_message(name, selector_name));
