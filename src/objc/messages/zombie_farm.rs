@@ -616,7 +616,7 @@ pub(super) fn zombie_farm_return_nil_for_stale_object_message(
     if !zombie_farm_uses_playforge_bundle(env)
         || !matches!(
             selector_name,
-            "currentTile" | "objectForKey:" | "objectForKeyedSubscript:"
+            "currentTile" | "isKindOfClass:" | "objectForKey:" | "objectForKeyedSubscript:"
         )
     {
         return false;
