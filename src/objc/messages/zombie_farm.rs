@@ -613,16 +613,11 @@ pub(super) fn zombie_farm_return_nil_for_stale_object_message(
     selector_name: &str,
     stale_kind: &str,
 ) -> bool {
-    if !zombie_farm_uses_playforge_bundle(env)
-        || !matches!(
-            selector_name,
-            "currentTile" | "isKindOfClass:" | "objectForKey:" | "objectForKeyedSubscript:"
-        )
-    {
+    if !zombie_farm_uses_playforge_bundle(env) {
         return false;
     }
 
-    log!(
+    log_dbg!(
         "ZombieFarm workaround: returning nil for [{} {:?} {}]",
         stale_kind,
         receiver,

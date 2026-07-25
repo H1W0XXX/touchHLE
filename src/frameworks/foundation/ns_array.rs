@@ -13,7 +13,7 @@ use super::{
     _nib_archive_decoder, ns_keyed_unarchiver, ns_sort_descriptor, ns_string, ns_url,
     NSComparisonResult, NSNotFound, NSOrderedAscending, NSOrderedDescending, NSRange, NSUInteger,
 };
-use crate::abi::{CallFromHost, GuestFunction};
+use crate::abi::{CallFromHost, DotDotDot, GuestFunction};
 use crate::frameworks::foundation::ns_keyed_archiver::{
     encode_object, get_value_to_encode_for_current_key,
 };
@@ -53,6 +53,28 @@ fn alloc_array_storage(env: &mut Environment, class: id) -> id {
 fn is_zombie_farm(env: &Environment) -> bool {
     let bundle_id = env.bundle.bundle_identifier();
     bundle_id.starts_with("com.playforge.ZombieFarm") || bundle_id.starts_with("com.playforge.ZFR")
+}
+
+fn retained_variadic_objects(env: &mut Environment, first_object: id, args: DotDotDot) -> Vec<id> {
+    let mut objects = Vec::new();
+    let mut next_object = first_object;
+    let mut varargs = args.start();
+
+    while next_object != nil {
+        if is_zombie_farm(env) && env.objc.get_host_object(next_object).is_none() {
+            log!(
+                "ZombieFarm workaround: stopped NSArray variadic initializer at invalid object {:?} after {} valid object(s)",
+                next_object,
+                objects.len()
+            );
+            break;
+        }
+        retain(env, next_object);
+        objects.push(next_object);
+        next_object = varargs.next(env);
+    }
+
+    objects
 }
 
 fn object_at_index(env: &mut Environment, this: id, index: NSUInteger) -> id {
@@ -130,17 +152,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     autorelease(env, array)
 }
 + (id)arrayWithObjects:(id)firstObj, ...args {
-    retain(env, firstObj);
-    let mut objects = vec![firstObj];
-    let mut varargs = args.start();
-    loop {
-        let next_arg: id = varargs.next(env);
-        if next_arg.is_null() {
-            break;
-        }
-        retain(env, next_arg);
-        objects.push(next_arg);
-    }
+    let objects = retained_variadic_objects(env, firstObj, args);
     let array = from_vec(env, objects);
     autorelease(env, array)
 }
@@ -153,20 +165,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 // This designated initializer belongs to NSArray itself so concrete mutable
 // and immutable class-cluster implementations can both inherit it.
 - (id)initWithObjects:(id)firstObj, ...args {
-    let mut objects = Vec::new();
-    if firstObj != nil {
-        retain(env, firstObj);
-        objects.push(firstObj);
-        let mut varargs = args.start();
-        loop {
-            let next_arg: id = varargs.next(env);
-            if next_arg == nil {
-                break;
-            }
-            retain(env, next_arg);
-            objects.push(next_arg);
-        }
-    }
+    let objects = retained_variadic_objects(env, firstObj, args);
     replace_array_contents(env, this, objects);
     this
 }
@@ -389,17 +388,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (id)arrayWithObjects:(id)firstObj, ...args {
-    retain(env, firstObj);
-    let mut objects = vec![firstObj];
-    let mut varargs = args.start();
-    loop {
-        let next_arg: id = varargs.next(env);
-        if next_arg.is_null() {
-            break;
-        }
-        retain(env, next_arg);
-        objects.push(next_arg);
-    }
+    let objects = retained_variadic_objects(env, firstObj, args);
     let array = mutable_from_vec(env, objects);
     autorelease(env, array)
 }
@@ -489,17 +478,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)initWithObjects:(id)firstObj, ...args {
-    retain(env, firstObj);
-    let mut objects = vec![firstObj];
-    let mut varargs = args.start();
-    loop {
-        let next_arg: id = varargs.next(env);
-        if next_arg.is_null() {
-            break;
-        }
-        retain(env, next_arg);
-        objects.push(next_arg);
-    }
+    let objects = retained_variadic_objects(env, firstObj, args);
     env.objc.borrow_mut::<ArrayHostObject>(this).array = objects;
     this
 }

@@ -229,6 +229,21 @@ fn objc_msgSend_inner(
         return;
     }
 
+    if zombie_farm_uses_playforge_bundle(env)
+        && matches!(selector_name, "release" | "retain" | "autorelease")
+        && env.objc.get_host_object(receiver).is_none()
+    {
+        log_dbg!(
+            "ZombieFarm workaround: ignoring {} sent to stale unregistered object {:?}",
+            selector_name,
+            receiver
+        );
+        if selector_name != "release" {
+            env.cpu.regs_mut()[0] = receiver.to_bits();
+        }
+        return;
+    }
+
     let orig_class = super2.unwrap_or_else(|| ObjC::read_isa(receiver, &env.mem));
     if crate::objc::last_message_debug_enabled() {
         let debug = crate::objc::ObjCMessageDebug {
