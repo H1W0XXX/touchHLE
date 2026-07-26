@@ -607,6 +607,122 @@ fn zombie_farm_object_pointer_looks_valid(env: &Environment, object: id) -> bool
     object != nil && object.to_bits() >= env.mem.null_segment_size() && object.to_bits() % 4 == 0
 }
 
+fn zombie_farm_sanitize_ccarray_before_cleanup(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if !matches!(selector_name, "removeAllObjects" | "dealloc")
+        || zombie_farm_object_class_name(env, receiver) != Some("CCArray")
+    {
+        return false;
+    }
+
+    // Zombie Farm's bundled cocos2d uses:
+    // struct ccArray { unsigned int num, max; id *arr; };
+    let Some(data) = zombie_farm_read_object_ivar(env, receiver, "data") else {
+        return false;
+    };
+    if data == nil {
+        return false;
+    }
+
+    let data_bits = data.to_bits();
+    let data_ptr: ConstPtr<u8> = ConstPtr::from_bits(data_bits);
+    if env.mem.try_malloc_size(data_ptr.cast()).unwrap_or(0) < 12 {
+        log!(
+            "ZombieFarm workaround: skipped [{} {}] with untracked ccArray data 0x{:08x}",
+            zombie_farm_object_class_name(env, receiver).unwrap_or("unknown"),
+            selector_name,
+            data_bits
+        );
+        return true;
+    }
+
+    let num_ptr: MutPtr<u32> = MutPtr::from_bits(data_bits);
+    let arr_ptr_ptr: MutPtr<u32> = MutPtr::from_bits(data_bits + 8);
+    let num = env.mem.read(num_ptr);
+    let max: u32 = env.mem.read(MutPtr::from_bits(data_bits + 4));
+    let arr_bits = env.mem.read(arr_ptr_ptr);
+    if num == 0 {
+        return false;
+    }
+
+    let arr_allocation_size = if arr_bits < env.mem.null_segment_size() {
+        None
+    } else {
+        let arr_ptr: ConstPtr<u8> = ConstPtr::from_bits(arr_bits);
+        env.mem.try_malloc_size(arr_ptr.cast())
+    };
+
+    const MAX_REASONABLE_CCARRAY_COUNT: u32 = 1 << 20;
+    if num > max || num > MAX_REASONABLE_CCARRAY_COUNT {
+        env.mem.write(num_ptr, 0);
+        if arr_allocation_size.is_none() {
+            env.mem.write(MutPtr::<u32>::from_bits(data_bits + 4), 0);
+            env.mem.write(arr_ptr_ptr, 0);
+        }
+        log!(
+            "ZombieFarm workaround: cleared corrupt CCArray {:?} before {} (num={}, max={}, arr=0x{:08x})",
+            receiver,
+            selector_name,
+            num,
+            max,
+            arr_bits
+        );
+        return false;
+    }
+
+    let array_size = num.checked_mul(guest_size_of::<id>()).unwrap();
+    if !arr_allocation_size.is_some_and(|size| size >= array_size) {
+        // Keep the ccArray header itself so its normal dealloc can release it,
+        // but prevent it from walking or freeing an untracked object buffer.
+        env.mem.write(num_ptr, 0);
+        env.mem.write(MutPtr::<u32>::from_bits(data_bits + 4), 0);
+        env.mem.write(arr_ptr_ptr, 0);
+        log!(
+            "ZombieFarm workaround: cleared CCArray {:?} with untracked object buffer before {} (num={}, max={}, arr=0x{:08x})",
+            receiver,
+            selector_name,
+            num,
+            max,
+            arr_bits
+        );
+        return false;
+    }
+
+    let mut invalid_count = 0_u32;
+    let mut first_invalid = None;
+    for index in 0..num {
+        let element_ptr: MutPtr<u32> = MutPtr::from_bits(arr_bits + index * guest_size_of::<id>());
+        let element_bits = env.mem.read(element_ptr);
+        if element_bits == 0 {
+            continue;
+        }
+        let element: id = MutPtr::from_bits(element_bits);
+        if env.objc.get_host_object(element).is_none() {
+            env.mem.write(element_ptr, 0);
+            invalid_count += 1;
+            first_invalid.get_or_insert((index, element_bits));
+        }
+    }
+
+    if let Some((first_index, first_value)) = first_invalid {
+        log!(
+            "ZombieFarm workaround: removed {} invalid object pointer(s) from CCArray {:?} before {} (num={}, max={}, first index={} value=0x{:08x})",
+            invalid_count,
+            receiver,
+            selector_name,
+            num,
+            max,
+            first_index,
+            first_value
+        );
+    }
+
+    false
+}
+
 pub(super) fn zombie_farm_return_nil_for_stale_object_message(
     env: &mut Environment,
     receiver: id,
@@ -6154,6 +6270,10 @@ pub(super) fn zombie_farm_pre_dispatch_workarounds(
         return true;
     }
 
+    if zombie_farm_sanitize_ccarray_before_cleanup(env, receiver, selector_name) {
+        return true;
+    }
+
     if env.bundle.bundle_identifier() == "com.playforge.ZombieFarm2" {
         zombie_farm_trace_game_interaction_message(env, receiver, selector_name);
         zombie_farm_force_status_bar_timeout(env, receiver, selector_name);
@@ -6401,6 +6521,7 @@ pub(super) fn zombie_farm_needs_pre_dispatch_workarounds(
             | "md5sum:"
             | "setZombie:"
             | "dealloc"
+            | "removeAllObjects"
             | "_moveCellOutOfSight:"
             | "dequeueCell"
             | "setSaveDate:"

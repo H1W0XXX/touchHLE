@@ -67,12 +67,28 @@ fn reallocf(env: &mut Environment, ptr: MutVoidPtr, size: GuestUSize) -> MutVoid
 
 fn free(env: &mut Environment, ptr: MutVoidPtr) {
     // We need to catch situations of freeing NSObjects early!
-    if env.objc.get_host_object(ptr.cast()).is_some() {
+    let object = ptr.cast();
+    if env.objc.get_host_object(object).is_some() {
+        if env
+            .bundle
+            .bundle_identifier()
+            .starts_with("com.playforge.Z")
+        {
+            if let Some(refcount) = env.objc.try_get_refcount(object) {
+                log!(
+                    "ZombieFarm workaround: ignored premature free({:?}) on an object with retain count {} (guest LR=0x{:08x})",
+                    ptr,
+                    refcount,
+                    env.cpu.regs()[14]
+                );
+                return;
+            }
+        }
         log!(
             "App attempted to call free({:?}) on an object, calling dealloc_object() instead!",
             ptr
         );
-        env.objc.dealloc_object(ptr.cast(), &mut env.mem);
+        env.objc.dealloc_object(object, &mut env.mem);
         return;
     }
 

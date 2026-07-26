@@ -587,6 +587,10 @@ impl Mem {
         self.heap_allocator().find_allocated_size(ptr.to_bits())
     }
 
+    pub fn try_malloc_size(&mut self, ptr: ConstVoidPtr) -> Option<GuestUSize> {
+        self.heap_allocator().try_find_allocated_size(ptr.to_bits())
+    }
+
     pub fn realloc(&mut self, old_ptr: MutVoidPtr, size: GuestUSize) -> MutVoidPtr {
         if old_ptr.is_null() {
             return self.alloc(size);

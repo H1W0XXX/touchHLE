@@ -436,13 +436,19 @@ impl HeapAllocator {
 
     /// This is used for realloc
     pub fn find_allocated_size(&mut self, base: VAddr) -> GuestUSize {
-        if let Some(size) = self.external_chunks.get_size_with_base(base) {
-            return size.get();
-        }
-        let Some(size) = self.used_chunks.get_size_with_base(base) else {
+        let Some(size) = self.try_find_allocated_size(base) else {
             panic!("Can't find {base:#x}, unknown allocation!");
         };
-        size.get()
+        size
+    }
+
+    pub fn try_find_allocated_size(&mut self, base: VAddr) -> Option<GuestUSize> {
+        if let Some(size) = self.external_chunks.get_size_with_base(base) {
+            return Some(size.get());
+        }
+        self.used_chunks
+            .get_size_with_base(base)
+            .map(|size| size.get())
     }
 
     /// Add a chunk that was allocated by an external allocator
