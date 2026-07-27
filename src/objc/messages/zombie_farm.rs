@@ -4591,6 +4591,91 @@ fn zombie_farm_prepare_local_server_date(env: &mut Environment, receiver: id, se
     env.cpu.regs_mut().copy_from_slice(&regs);
 }
 
+fn zombie_farm_complete_offline_tag_response(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZFR.LZ54D2GT3D"
+        || env.bundle.bundle_version() != "1.0"
+        || selector_name != "handleResponse:forAction:"
+        || zombie_farm_object_class_name(env, receiver) != Some("SocialMenu")
+        || ns_url_connection::zombie_farm_http_base_url(env).is_some()
+    {
+        return false;
+    }
+
+    let action = id::from_bits(env.cpu.regs()[3]);
+    if action == nil {
+        return false;
+    }
+    let action_class = ObjC::read_isa(action, &env.mem);
+    if action_class == nil {
+        return false;
+    }
+    let string_class = env.objc.get_known_class("NSString", &mut env.mem);
+    if !env.objc.class_is_subclass_of(action_class, string_class)
+        || ns_string::to_rust_string(env, action).as_ref() != "sendTagResult"
+    {
+        return false;
+    }
+
+    // ZFR's retired tag endpoint can still complete after the UI that issued
+    // it is gone. The guest handler installs an SJLJ exception frame and
+    // decodes the legacy binary response; later failures have been observed
+    // unwinding through that expired frame during unrelated fight cleanup.
+    // With no replacement server configured there is no valid tag result to
+    // apply, so complete this obsolete callback before entering guest code.
+    env.cpu.regs_mut()[0] = 0;
+    log!("ZombieFarm workaround: skipped offline SocialMenu sendTagResult callback");
+    true
+}
+
+fn zombie_farm_complete_stale_tag_summary_dismiss(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZFR.LZ54D2GT3D"
+        || env.bundle.bundle_version() != "1.0"
+        || selector_name != "dismissMenu:"
+        || zombie_farm_object_class_name(env, receiver) != Some("ZFTagSummary")
+        || ns_url_connection::zombie_farm_http_base_url(env).is_some()
+    {
+        return false;
+    }
+
+    // The retired tag UI can finish dismissing after the fight scene has
+    // already replaced it. Its animation path asks CCDirector for a struct
+    // return, then has been observed entering free() with corrupted guest
+    // return addresses. Abandoning that entire guest call also abandons the
+    // surrounding Cocos scheduler pass, which prevents later zombies from
+    // being deployed. Complete the UI's tiny final callback normally instead:
+    // it only posts kZombieTagSummaryDoneNotification.
+    let regs = *env.cpu.regs();
+    let completed = env
+        .objc
+        .lookup_selector("dismissTimerCallback")
+        .filter(|&selector| env.objc.object_has_method(&env.mem, receiver, selector))
+        .map(|selector| {
+            let _: () = msg_send_no_type_checking(env, (receiver, selector));
+        })
+        .is_some();
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    env.cpu.regs_mut()[0] = 0;
+
+    if completed {
+        log!(
+            "ZombieFarm workaround: completed stale ZFTagSummary dismissMenu: without its broken animation"
+        );
+    } else {
+        log!(
+            "ZombieFarm workaround: skipped stale ZFTagSummary dismissMenu: because its completion callback is unavailable"
+        );
+    }
+    true
+}
+
 fn zombie_farm_complete_server_time_locally(
     env: &mut Environment,
     receiver: id,
@@ -6465,7 +6550,15 @@ pub(super) fn zombie_farm_pre_dispatch_workarounds(
             zombie_farm_prepare_local_server_date(env, receiver, selector_name);
         }
         "handleResponse:forAction:" => {
+            if zombie_farm_complete_offline_tag_response(env, receiver, selector_name) {
+                return true;
+            }
             zombie_farm_prepare_local_server_date(env, receiver, selector_name);
+        }
+        "dismissMenu:" => {
+            if zombie_farm_complete_stale_tag_summary_dismiss(env, receiver, selector_name) {
+                return true;
+            }
         }
         "inputDailyBonusReward:alert:" => {
             zombie_farm_acknowledge_daily_reward_confirmation(env, receiver);
@@ -6527,6 +6620,7 @@ pub(super) fn zombie_farm_needs_pre_dispatch_workarounds(
             | "setSaveDate:"
             | "getServerTime"
             | "handleResponse:forAction:"
+            | "dismissMenu:"
             | "inputDailyBonusReward:alert:"
             | "openMenu"
             | "openMenuThroughMausoleum"

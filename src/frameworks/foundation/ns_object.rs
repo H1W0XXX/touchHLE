@@ -116,6 +116,108 @@ fn zombie_farm_failed_remote_object_to_preserve(
     }
 }
 
+fn zombie_farm_owned_save_tile_to_preserve(
+    env: &mut crate::Environment,
+    object: id,
+) -> Option<NSUInteger> {
+    if !env
+        .bundle
+        .bundle_identifier()
+        .starts_with("com.playforge.ZFR")
+        || env.objc.try_get_refcount(object)?.get() != 1
+    {
+        return None;
+    }
+
+    let class = ObjC::read_isa(object, &env.mem);
+    if class == nil || env.objc.try_get_class_name(class) != Some("SaveTile") {
+        return None;
+    }
+
+    let regs = *env.cpu.regs();
+    let result = (|| {
+        let game_state_class = env.objc.get_known_class("GameState", &mut env.mem);
+        let game_state_selector = env.objc.lookup_selector("gameState")?;
+        if !env
+            .objc
+            .object_has_method(&env.mem, game_state_class, game_state_selector)
+        {
+            return None;
+        }
+        let game_state: id =
+            msg_send_no_type_checking(env, (game_state_class, game_state_selector));
+        if game_state == nil {
+            return None;
+        }
+
+        let game_data_selector = env.objc.lookup_selector("zfGameData")?;
+        if !env
+            .objc
+            .object_has_method(&env.mem, game_state, game_data_selector)
+        {
+            return None;
+        }
+        let game_data: id = msg_send_no_type_checking(env, (game_state, game_data_selector));
+        if game_data == nil {
+            return None;
+        }
+
+        let save_tiles_selector = env.objc.lookup_selector("saveTiles")?;
+        if !env
+            .objc
+            .object_has_method(&env.mem, game_data, save_tiles_selector)
+        {
+            return None;
+        }
+        let save_tiles: id = msg_send_no_type_checking(env, (game_data, save_tiles_selector));
+        if save_tiles == nil {
+            return None;
+        }
+
+        let count_selector = env.objc.lookup_selector("count")?;
+        let object_at_index_selector = env.objc.lookup_selector("objectAtIndex:")?;
+        if !env
+            .objc
+            .object_has_method(&env.mem, save_tiles, count_selector)
+            || !env
+                .objc
+                .object_has_method(&env.mem, save_tiles, object_at_index_selector)
+        {
+            return None;
+        }
+
+        let count: NSUInteger = msg_send_no_type_checking(env, (save_tiles, count_selector));
+        const MAX_REASONABLE_SAVE_TILE_COUNT: NSUInteger = 1 << 20;
+        if count > MAX_REASONABLE_SAVE_TILE_COUNT {
+            return None;
+        }
+        (0..count).find(|&index| {
+            let candidate: id =
+                msg_send_no_type_checking(env, (save_tiles, object_at_index_selector, index));
+            candidate == object
+        })
+    })();
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    result
+}
+
+static ZOMBIE_FARM_PRESERVED_SAVE_TILES: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+
+fn zombie_farm_log_preserved_save_tile(object: id, index: NSUInteger) {
+    let first_preservation = ZOMBIE_FARM_PRESERVED_SAVE_TILES
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap()
+        .insert(object.to_bits());
+    if first_preservation {
+        log!(
+            "ZombieFarm workaround: preserved SaveTile {:?} at saveTiles[{}] from a premature final release",
+            object,
+            index
+        );
+    }
+}
+
 pub const CLASSES: ClassExports = objc_classes! {
 
 (env, this, _cmd);
@@ -255,6 +357,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 - (())release {
     log_dbg!("[{:?} release]", this);
+    if let Some(index) = zombie_farm_owned_save_tile_to_preserve(env, this) {
+        zombie_farm_log_preserved_save_tile(this, index);
+        return;
+    }
     if let Some(class_name) = zombie_farm_failed_remote_object_to_preserve(env, this) {
         log_dbg!(
             "ZombieFarm workaround: preserving {:?} ({}) after failed remote load because the game can keep using it",

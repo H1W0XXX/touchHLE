@@ -1456,10 +1456,9 @@ impl Environment {
         }
 
         if self.gdb_server.is_none() {
-            if self
-                .bundle
-                .bundle_identifier()
-                .starts_with("com.playforge.ZombieFarm")
+            let bundle_identifier = self.bundle.bundle_identifier();
+            if bundle_identifier.starts_with("com.playforge.ZombieFarm")
+                || bundle_identifier.starts_with("com.playforge.ZFR")
             {
                 if let Ok(mut file) = std::fs::File::create("zombie_farm_crash_snapshot.txt") {
                     let _ = crate::zombie_farm_debug::write_snapshot(&mut file);
