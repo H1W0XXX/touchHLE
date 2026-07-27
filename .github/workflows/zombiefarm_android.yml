@@ -132,6 +132,16 @@ jobs:
           ANDROID_NDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.ANDROID_NDK_VERSION }}
           ANDROID_NDK: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.ANDROID_NDK_VERSION }}
           ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.ANDROID_NDK_VERSION }}
+          # Build one APK for modern heterogeneous Arm phones. Cortex-A75 and
+          # Cortex-A55 expose the same LLVM target features, so the resulting
+          # code can run on both the performance and efficiency cores of that
+          # generation while dropping compatibility with much older Armv8 CPUs.
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS: -C target-cpu=cortex-a75
+          CARGO_PROFILE_RELEASE_OPT_LEVEL: "3"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+          CARGO_PROFILE_RELEASE_LTO: fat
+          CFLAGS_aarch64_linux_android: -mcpu=cortex-a75
+          CXXFLAGS_aarch64_linux_android: -mcpu=cortex-a75
           ANDROID_KEYSTORE_PATH: ${{ github.workspace }}/android/app/zombiefarm-release.jks
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
