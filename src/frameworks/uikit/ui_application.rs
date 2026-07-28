@@ -22,6 +22,9 @@ pub struct State {
     /// [UIApplication sharedApplication]
     shared_application: Option<id>,
     pub(super) status_bar_hidden: bool,
+    /// Monotonic id handed to the host for each scheduled local notification,
+    /// so repeat schedules don't collide and can be individually managed.
+    next_local_notification_id: i32,
 }
 
 struct UIApplicationHostObject {
@@ -239,10 +242,48 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())cancelAllLocalNotifications {
-    log!("TODO: [(UIApplication*){:?} cancelAllLocalNotifications", this);
+    super::ui_local_notification::platform_cancel_all();
 }
 - (())scheduleLocalNotification:(id)local_notif { // UILocalNotification *
-    log!("TODO: [(UIApplication*){:?} scheduleLocalNotification:{:?}", this, local_notif);
+    if local_notif == nil {
+        return;
+    }
+
+    // fireDate is an absolute NSDate; -[NSDate timeIntervalSince1970] gives us
+    // seconds since the Unix epoch, which the host side wants in milliseconds.
+    let fire_date: id = msg![env; local_notif fireDate];
+    let fire_unix_ms = if fire_date == nil {
+        // No fire date means "fire now" on iOS.
+        crate::frameworks::foundation::ns_date::now_unix_time_millis()
+    } else {
+        let secs: crate::frameworks::foundation::NSTimeInterval =
+            msg![env; fire_date timeIntervalSince1970];
+        super::ui_local_notification::unix_seconds_to_millis(secs)
+    };
+
+    let body: id = msg![env; local_notif alertBody];
+    let body = if body == nil {
+        String::new()
+    } else {
+        ns_string::to_rust_string(env, body).into_owned()
+    };
+
+    // Assign a stable, monotonically increasing id so repeat schedules don't
+    // collide. cancelAllLocalNotifications clears the whole set on the host.
+    let notification_id = env.framework_state.uikit.ui_application.next_local_notification_id;
+    env.framework_state.uikit.ui_application.next_local_notification_id =
+        notification_id.wrapping_add(1);
+
+    log_dbg!(
+        "[(UIApplication*){:?} scheduleLocalNotification:{:?}] fire={}ms body={:?} id={}",
+        this,
+        local_notif,
+        fire_unix_ms,
+        body,
+        notification_id
+    );
+
+    super::ui_local_notification::platform_schedule(fire_unix_ms, &body, notification_id);
 }
 
 @end

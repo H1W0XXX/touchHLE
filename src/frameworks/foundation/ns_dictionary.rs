@@ -383,8 +383,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 + (id)allocWithZone:(NSZonePtr)zone {
     // NSDictionary might be subclassed by something which needs allocWithZone:
-    // to have the normal behaviour. Unimplemented: call superclass alloc then.
-    assert!(this == env.objc.get_known_class("NSDictionary", &mut env.mem));
+    // to have the normal behaviour (e.g. a game's own custom dictionary
+    // subclass). We don't support giving such subclasses their own storage/
+    // methods, so just always hand back a real _touchHLE_NSDictionary
+    // instance, regardless of which (sub)class this was actually called on.
     msg_class![env; _touchHLE_NSDictionary allocWithZone:zone]
 }
 
@@ -550,8 +552,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 + (id)allocWithZone:(NSZonePtr)zone {
     // NSDictionary might be subclassed by something which needs allocWithZone:
-    // to have the normal behaviour. Unimplemented: call superclass alloc then.
-    assert!(this == env.objc.get_known_class("NSMutableDictionary", &mut env.mem));
+    // to have the normal behaviour (e.g. a game's own custom dictionary
+    // subclass). We don't support giving such subclasses their own storage/
+    // methods, so just always hand back a real _touchHLE_NSMutableDictionary
+    // instance, regardless of which (sub)class this was actually called on.
     msg_class![env; _touchHLE_NSMutableDictionary allocWithZone:zone]
 }
 

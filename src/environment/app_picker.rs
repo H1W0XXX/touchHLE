@@ -75,6 +75,21 @@ pub fn app_picker(options: Options) -> Result<(PathBuf, Vec<String>), String> {
             })
     };
 
+    // If there's exactly one app available, skip the picker GUI entirely and
+    // launch it directly. This is the common case for a device that's set up
+    // to run a single game, and it avoids having to tap the icon on every
+    // launch. If there's more than one app, fall back to the normal picker
+    // so there's still a way to choose.
+    if let Ok(ref apps) = apps {
+        if apps.len() == 1 {
+            log!(
+                "Only one app found ({}), launching it directly instead of showing the app picker.",
+                apps[0].path.display()
+            );
+            return Ok((apps[0].path.clone(), Vec::new()));
+        }
+    }
+
     show_app_picker_gui(options, apps)
 }
 

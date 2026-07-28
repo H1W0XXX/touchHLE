@@ -21,6 +21,7 @@ pub mod ns_autorelease_pool;
 pub mod ns_bundle;
 pub mod ns_character_set;
 pub mod ns_coder;
+pub mod ns_condition_lock;
 pub mod ns_data;
 pub mod ns_date;
 pub mod ns_date_formatter;
@@ -69,6 +70,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ns_bundle::CLASSES,
         ns_character_set::CLASSES,
         ns_coder::CLASSES,
+        ns_condition_lock::CLASSES,
         ns_data::CLASSES,
         ns_date::CLASSES,
         ns_date_formatter::CLASSES,

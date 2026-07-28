@@ -31,6 +31,15 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- Post local notifications scheduled by emulated apps (crops/zombies
+         ready, etc.). Required to be requested at runtime on Android 13+;
+         auto-granted on older versions. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Lets AlarmManager wake the device to fire a due notification. We do NOT
+         request SCHEDULE_EXACT_ALARM: the code falls back to inexact
+         Doze-friendly alarms when exact alarms aren't permitted. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
     <!-- External mouse input events -->
     <uses-feature
         android:name="android.hardware.type.pc"
@@ -91,6 +100,12 @@
             </intent-filter>
             -->
         </activity>
+
+        <!-- Delivers scheduled local notifications from AlarmManager. Not
+             exported: only our own alarms (explicit intents) trigger it. -->
+        <receiver
+            android:name="org.touchhle.android.NotificationReceiver"
+            android:exported="false" />
 
         <provider
             android:name="org.touchhle.android.DocumentsProvider"

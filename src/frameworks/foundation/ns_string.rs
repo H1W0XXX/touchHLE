@@ -304,8 +304,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 + (id)allocWithZone:(NSZonePtr)zone {
     // NSString might be subclassed by something which needs allocWithZone:
-    // to have the normal behaviour. Unimplemented: call superclass alloc then.
-    assert!(this == env.objc.get_known_class("NSString", &mut env.mem));
+    // to have the normal behaviour (e.g. a game's own custom string
+    // subclass). We don't support giving such subclasses their own storage/
+    // methods, so just always hand back a real _touchHLE_NSString instance,
+    // regardless of which (sub)class this was actually called on.
     msg_class![env; _touchHLE_NSString allocWithZone:zone]
 }
 
@@ -1211,9 +1213,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 + (id)allocWithZone:(NSZonePtr)zone {
     // NSMutableString might be subclassed by something
-    // which needs allocWithZone: to have the normal behaviour.
-    // Unimplemented: call superclass alloc then.
-    assert!(this == env.objc.get_known_class("NSMutableString", &mut env.mem));
+    // which needs allocWithZone: to have the normal behaviour (e.g. a
+    // game's own custom string subclass). We don't support giving such
+    // subclasses their own storage/methods, so just always hand back a real
+    // _touchHLE_NSMutableString instance, regardless of which (sub)class
+    // this was actually called on.
     msg_class![env; _touchHLE_NSMutableString allocWithZone:zone]
 }
 

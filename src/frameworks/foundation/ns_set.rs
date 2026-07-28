@@ -37,8 +37,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 + (id)allocWithZone:(NSZonePtr)zone {
     // NSSet might be subclassed by something which needs allocWithZone:
-    // to have the normal behaviour. Unimplemented: call superclass alloc then.
-    assert!(this == env.objc.get_known_class("NSSet", &mut env.mem));
+    // to have the normal behaviour (e.g. a game's own custom set
+    // subclass). We don't support giving such subclasses their own storage/
+    // methods, so just always hand back a real _touchHLE_NSSet instance,
+    // regardless of which (sub)class this was actually called on.
     msg_class![env; _touchHLE_NSSet allocWithZone:zone]
 }
 
@@ -91,8 +93,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 + (id)allocWithZone:(NSZonePtr)zone {
     // NSSet might be subclassed by something which needs allocWithZone:
-    // to have the normal behaviour. Unimplemented: call superclass alloc then.
-    assert!(this == env.objc.get_known_class("NSMutableSet", &mut env.mem));
+    // to have the normal behaviour (e.g. a game's own custom set
+    // subclass). We don't support giving such subclasses their own storage/
+    // methods, so just always hand back a real _touchHLE_NSMutableSet
+    // instance, regardless of which (sub)class this was actually called on.
     msg_class![env; _touchHLE_NSMutableSet allocWithZone:zone]
 }
 

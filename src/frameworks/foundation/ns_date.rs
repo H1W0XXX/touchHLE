@@ -223,3 +223,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
+
+/// Current wall-clock time as milliseconds since the Unix epoch.
+///
+/// Used by `-[UIApplication scheduleLocalNotification:]` when a notification
+/// has no explicit `fireDate` (iOS treats that as "fire immediately").
+pub fn now_unix_time_millis() -> i64 {
+    match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as i64,
+        Err(_) => 0,
+    }
+}
