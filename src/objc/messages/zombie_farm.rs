@@ -4631,6 +4631,33 @@ fn zombie_farm_complete_offline_tag_response(
     true
 }
 
+fn zombie_farm_skip_offline_potential_friends_response(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZFR.LZ54D2GT3D"
+        || env.bundle.bundle_version() != "1.0"
+        || selector_name != "handlePotentialFriendsResponse:"
+        || zombie_farm_object_class_name(env, receiver) != Some("SocialTableViewFacebook")
+        || ns_url_connection::zombie_farm_http_base_url(env).is_some()
+    {
+        return false;
+    }
+
+    // This callback parses BrainClient's retired binary potential-friends
+    // response. With no replacement server configured, ZFR can deliver a
+    // malformed/stale completion long after the social controller has left the
+    // screen. It has been observed continuing during a robot fight and reading
+    // through a null BinaryDataHelper buffer. There is no valid offline friend
+    // data to apply, so finish the obsolete callback before entering guest code.
+    env.cpu.regs_mut()[0] = 0;
+    log!(
+        "ZombieFarm workaround: skipped offline SocialTableViewFacebook handlePotentialFriendsResponse:"
+    );
+    true
+}
+
 fn zombie_farm_complete_stale_tag_summary_dismiss(
     env: &mut Environment,
     receiver: id,
@@ -6555,6 +6582,11 @@ pub(super) fn zombie_farm_pre_dispatch_workarounds(
             }
             zombie_farm_prepare_local_server_date(env, receiver, selector_name);
         }
+        "handlePotentialFriendsResponse:" => {
+            if zombie_farm_skip_offline_potential_friends_response(env, receiver, selector_name) {
+                return true;
+            }
+        }
         "dismissMenu:" => {
             if zombie_farm_complete_stale_tag_summary_dismiss(env, receiver, selector_name) {
                 return true;
@@ -6620,6 +6652,7 @@ pub(super) fn zombie_farm_needs_pre_dispatch_workarounds(
             | "setSaveDate:"
             | "getServerTime"
             | "handleResponse:forAction:"
+            | "handlePotentialFriendsResponse:"
             | "dismissMenu:"
             | "inputDailyBonusReward:alert:"
             | "openMenu"

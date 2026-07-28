@@ -13,6 +13,7 @@
 
 use super::{id, nil, Class, ObjC, IMP, SEL};
 use crate::abi::{CallFromHost, GuestRet};
+use crate::cpu::Cpu;
 use crate::environment::ThreadId;
 use crate::libc::pthread::cond::{
     pthread_cond_broadcast, pthread_cond_destroy, pthread_cond_init, pthread_cond_t,
@@ -218,6 +219,14 @@ fn objc_msgSend_inner(
                 "Ignoring compare: sent to invalid low ObjC pointer {:?}",
                 receiver
             );
+        } else if zombie_farm_uses_playforge_bundle(env) {
+            log!(
+                "Warning: ignoring {} sent to invalid low ObjC pointer {:?} (guest LR=0x{:08x}, PC=0x{:08x})",
+                selector_name,
+                receiver,
+                env.cpu.regs()[Cpu::LR],
+                env.cpu.regs()[Cpu::PC],
+            );
         } else {
             log!(
                 "Warning: ignoring {} sent to invalid low ObjC pointer {:?}",
@@ -245,7 +254,7 @@ fn objc_msgSend_inner(
     }
 
     let orig_class = super2.unwrap_or_else(|| ObjC::read_isa(receiver, &env.mem));
-    if crate::objc::last_message_debug_enabled() {
+    if zombie_farm_uses_playforge_bundle(env) || crate::objc::last_message_debug_enabled() {
         let debug = crate::objc::ObjCMessageDebug {
             receiver,
             selector,
@@ -353,12 +362,23 @@ fn objc_msgSend_inner(
             }
             let selector_name = selector.as_str(&env.mem).to_string();
             if matches!(selector_name.as_str(), "release" | "retain" | "autorelease") {
-                log!(
-                    "Warning: ignoring {} sent to object {:?} with unregistered class {:?}",
-                    selector_name,
-                    receiver,
-                    class
-                );
+                if zombie_farm_uses_playforge_bundle(env) {
+                    log!(
+                        "Warning: ignoring {} sent to object {:?} with unregistered class {:?} (guest LR=0x{:08x}, PC=0x{:08x})",
+                        selector_name,
+                        receiver,
+                        class,
+                        env.cpu.regs()[Cpu::LR],
+                        env.cpu.regs()[Cpu::PC],
+                    );
+                } else {
+                    log!(
+                        "Warning: ignoring {} sent to object {:?} with unregistered class {:?}",
+                        selector_name,
+                        receiver,
+                        class
+                    );
+                }
                 if selector_name == "retain" || selector_name == "autorelease" {
                     env.cpu.regs_mut()[0] = receiver.to_bits();
                 }

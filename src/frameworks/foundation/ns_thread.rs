@@ -100,7 +100,15 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 + (id)callStackReturnAddresses {
     log!("WARNING: [NSThread callStackReturnAddresses] is called, returning an empty array!");
-    msg_class![env; NSArray new]
+    msg_class![env; NSArray array]
+}
+
++ (id)callStackSymbols {
+    // touchHLE cannot currently symbolize the guest call stack here. Returning
+    // an empty NSArray still matches the API's object contract and lets guest
+    // exception-reporting code continue instead of failing message dispatch.
+    log!("WARNING: [NSThread callStackSymbols] is called, returning an empty array!");
+    msg_class![env; NSArray array]
 }
 
 + (())sleepForTimeInterval:(NSTimeInterval)ti {

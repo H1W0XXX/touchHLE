@@ -141,7 +141,8 @@ fn zombie_farm_online_table_rendering_enabled(env: &crate::Environment) -> bool 
 fn request_table_reload(env: &mut crate::Environment, table_view: id) {
     let render_now = {
         let host = env.objc.borrow_mut::<UITableViewHostObject>(table_view);
-        if host.update_depth == 0 {
+        if host.update_depth == 0 && env.current_thread == 0 {
+            host.pending_reload = false;
             true
         } else {
             host.pending_reload = true;
@@ -154,11 +155,35 @@ fn request_table_reload(env: &mut crate::Environment, table_view: id) {
     () = msg![env; table_view setNeedsLayout];
 }
 
+fn render_pending_table_reload(env: &mut crate::Environment, table_view: id) {
+    if env.current_thread != 0 {
+        return;
+    }
+    let render_now = {
+        let host = env.objc.borrow_mut::<UITableViewHostObject>(table_view);
+        if host.update_depth == 0 && host.pending_reload {
+            host.pending_reload = false;
+            true
+        } else {
+            false
+        }
+    };
+    if render_now && zombie_farm_online_table_rendering_enabled(env) {
+        render_data_source_views(env, table_view);
+    }
+}
+
 /// Materialize the rows requested by a UITableView data source. touchHLE's
 /// historical UITableView stub only invalidated layout from reloadData, so the
 /// app could report rows without ever being asked to create a cell. Keep this
 /// initial renderer behind Zombie Farm's opt-in online mode while it matures.
+///
+/// Data source and delegate callbacks are UIKit work and must stay on the main
+/// thread. Zombie Farm performs network completion work on guest pthreads; if
+/// those threads synchronously materialize cells, a main-thread table update can
+/// interleave with the same controller and corrupt its guest execution state.
 fn render_data_source_views(env: &mut crate::Environment, table_view: id) {
+    assert_eq!(env.current_thread, 0);
     clear_rendered_views(env, table_view);
 
     let data_source: id = msg![env; table_view dataSource];
@@ -486,7 +511,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         if host.update_depth > 0 {
             host.update_depth -= 1;
         }
-        if host.update_depth == 0 && host.pending_reload {
+        if host.update_depth == 0 && host.pending_reload && env.current_thread == 0 {
             host.pending_reload = false;
             true
         } else {
@@ -512,6 +537,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())layoutSubviews {
+    render_pending_table_reload(env, this);
     msg_super![env; this layoutSubviews]
 }
 
