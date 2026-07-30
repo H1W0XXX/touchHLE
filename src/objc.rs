@@ -22,7 +22,7 @@ use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant,
 use crate::frameworks::foundation::ns_string;
 use crate::objc::messages::ThreadInitializer;
 use crate::MutexId;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 mod classes;
 mod messages;
@@ -58,7 +58,7 @@ use properties::{ivar_list_t, objc_copyStruct, objc_getProperty, objc_setPropert
 use selectors::sel_registerName;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex as StdMutex, OnceLock};
 use synchronization::{objc_sync_enter, objc_sync_exit};
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -148,6 +148,80 @@ impl ObjC {
 static LAST_MESSAGE_RECEIVER: AtomicU32 = AtomicU32::new(0);
 static LAST_MESSAGE_SELECTOR: AtomicU32 = AtomicU32::new(0);
 static LAST_MESSAGE_CLASS: AtomicU32 = AtomicU32::new(0);
+static ZOMBIE_FARM_MESSAGE_SEQUENCE: AtomicU32 = AtomicU32::new(0);
+
+#[derive(Clone, Copy)]
+struct ZombieFarmMessageTrace {
+    sequence: u32,
+    receiver: u32,
+    selector: u32,
+    selector_name: &'static str,
+    receiver_class: u32,
+    pc: u32,
+    lr: u32,
+    sp: u32,
+    fp: u32,
+    cpsr: u32,
+}
+
+static ZOMBIE_FARM_RECENT_MESSAGES: OnceLock<StdMutex<VecDeque<ZombieFarmMessageTrace>>> =
+    OnceLock::new();
+
+pub(crate) fn record_zombie_farm_message_trace(
+    debug: ObjCMessageDebug,
+    selector_name: &'static str,
+    regs: &[u32; 16],
+    cpsr: u32,
+) {
+    const TRACE_CAPACITY: usize = 32;
+    let trace = ZombieFarmMessageTrace {
+        sequence: ZOMBIE_FARM_MESSAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        receiver: debug.receiver.to_bits(),
+        selector: debug.selector.to_bits(),
+        selector_name,
+        receiver_class: debug.receiver_class.map_or(0, |class| class.to_bits()),
+        pc: regs[crate::cpu::Cpu::PC],
+        lr: regs[crate::cpu::Cpu::LR],
+        sp: regs[crate::cpu::Cpu::SP],
+        fp: regs[crate::abi::FRAME_POINTER],
+        cpsr,
+    };
+    let recent = ZOMBIE_FARM_RECENT_MESSAGES.get_or_init(|| StdMutex::new(VecDeque::new()));
+    let mut recent = recent.lock().unwrap();
+    if recent.len() == TRACE_CAPACITY {
+        recent.pop_front();
+    }
+    recent.push_back(trace);
+}
+
+pub(crate) fn dump_zombie_farm_message_trace() {
+    let Some(recent) = ZOMBIE_FARM_RECENT_MESSAGES.get() else {
+        return;
+    };
+    let Ok(recent) = recent.lock() else {
+        return;
+    };
+    echo_no_panic!("Recent ZombieFarm ObjC messages before CPU error:");
+    for trace in recent.iter() {
+        echo_no_panic!(
+            "  #{:08x} receiver=0x{:08x} selector=0x{:08x} ({}) class=0x{:08x} pc=0x{:08x} lr=0x{:08x} sp=0x{:08x} fp=0x{:08x} mode={}",
+            trace.sequence,
+            trace.receiver,
+            trace.selector,
+            trace.selector_name,
+            trace.receiver_class,
+            trace.pc,
+            trace.lr,
+            trace.sp,
+            trace.fp,
+            if trace.cpsr & crate::cpu::Cpu::CPSR_THUMB != 0 {
+                "Thumb"
+            } else {
+                "ARM"
+            },
+        );
+    }
+}
 
 pub(crate) fn last_message_debug_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();

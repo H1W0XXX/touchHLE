@@ -7,6 +7,7 @@
 
 use super::{autorelease, id, msg_send_no_type_checking, nil, release, retain, ObjC, SEL};
 use crate::cpu::Cpu;
+use crate::frameworks::core_foundation::time::SECS_FROM_UNIX_TO_APPLE_EPOCHS;
 use crate::frameworks::core_graphics::{CGPoint, CGSize};
 use crate::frameworks::foundation::{
     ns_date, ns_dictionary, ns_property_list_serialization, ns_string, ns_url_connection,
@@ -16,6 +17,7 @@ use crate::fs::GuestPath;
 use crate::mem::{guest_size_of, ConstPtr, MutPtr, MutVoidPtr};
 use crate::Environment;
 use crate::{msg, msg_class};
+use chrono::{DateTime, Local, LocalResult, NaiveDate, TimeZone, Utc};
 use plist::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -218,6 +220,52 @@ pub(super) fn zombie_farm_daily_trace_enabled() -> bool {
 fn zombie_farm_touch_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("TOUCHHLE_ZF2_TOUCH_TRACE").ok().as_deref() == Some("1"))
+}
+
+const ZOMBIE_FARM_NO_INVASION_COOLDOWN_ENV: &str = "TOUCHHLE_ZOMBIE_FARM_NO_INVASION_COOLDOWN";
+const ZOMBIE_FARM_INVASION_READY_INTERVAL_SECONDS: f64 = 7_201.0;
+static ZOMBIE_FARM_LAST_INVASION_DATE: AtomicUsize = AtomicUsize::new(0);
+
+fn zombie_farm_env_flag_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        let value = value.trim();
+        value == "1"
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("yes")
+            || value.eq_ignore_ascii_case("on")
+    })
+}
+
+fn zombie_farm_no_invasion_cooldown_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        zombie_farm_env_flag_enabled(
+            std::env::var(ZOMBIE_FARM_NO_INVASION_COOLDOWN_ENV)
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+fn zombie_farm_invasion_interval_override(
+    enabled: bool,
+    selector_name: &str,
+    receiver_is_last_invasion_date: bool,
+    argument_is_last_invasion_date: bool,
+) -> Option<f64> {
+    if !enabled {
+        return None;
+    }
+
+    match selector_name {
+        "timeIntervalSinceNow" if receiver_is_last_invasion_date => {
+            Some(-ZOMBIE_FARM_INVASION_READY_INTERVAL_SECONDS)
+        }
+        "timeIntervalSinceDate:" if argument_is_last_invasion_date => {
+            Some(ZOMBIE_FARM_INVASION_READY_INTERVAL_SECONDS)
+        }
+        _ => None,
+    }
 }
 
 fn trace_zombie_farm_sprite_message(env: &Environment, receiver: id, selector_name: &str) {
@@ -607,6 +655,70 @@ fn zombie_farm_object_pointer_looks_valid(env: &Environment, object: id) -> bool
     object != nil && object.to_bits() >= env.mem.null_segment_size() && object.to_bits() % 4 == 0
 }
 
+fn zombie_farm_is_exact_legacy_app(env: &Environment) -> bool {
+    env.bundle.bundle_identifier() == "com.playforge.ZFR.LZ54D2GT3D"
+        && env.bundle.bundle_version() == "1.0"
+}
+
+fn zombie_farm_record_last_invasion_date(env: &Environment, receiver: id, selector_name: &str) {
+    if !zombie_farm_no_invasion_cooldown_enabled()
+        || !zombie_farm_is_exact_legacy_app(env)
+        || selector_name != "lastInvasionDate"
+        || zombie_farm_object_class_name(env, receiver) != Some("GameData")
+    {
+        return;
+    }
+
+    let date = id::from_bits(env.cpu.regs()[0]);
+    let date_bits = if zombie_farm_date_interval(env, date).is_some() {
+        date.to_bits() as usize
+    } else {
+        0
+    };
+    ZOMBIE_FARM_LAST_INVASION_DATE.store(date_bits, Ordering::Relaxed);
+}
+
+fn zombie_farm_override_invasion_cooldown_interval(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if !zombie_farm_is_exact_legacy_app(env) {
+        return false;
+    }
+
+    let enabled = zombie_farm_no_invasion_cooldown_enabled();
+    let last_invasion_date_bits = ZOMBIE_FARM_LAST_INVASION_DATE.load(Ordering::Relaxed);
+    if !enabled || last_invasion_date_bits == 0 {
+        return false;
+    }
+
+    let receiver_is_last_invasion_date = receiver.to_bits() as usize == last_invasion_date_bits;
+    let argument_is_last_invasion_date = selector_name == "timeIntervalSinceDate:"
+        && env.cpu.regs()[2] as usize == last_invasion_date_bits;
+    let Some(interval) = zombie_farm_invasion_interval_override(
+        enabled,
+        selector_name,
+        receiver_is_last_invasion_date,
+        argument_is_last_invasion_date,
+    ) else {
+        return false;
+    };
+
+    let bits = interval.to_bits().to_le_bytes();
+    env.cpu.regs_mut()[0] = u32::from_le_bytes(bits[0..4].try_into().unwrap());
+    env.cpu.regs_mut()[1] = u32::from_le_bytes(bits[4..8].try_into().unwrap());
+
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        log!(
+            "ZombieFarm workaround: {} enabled; invasion cooldown is always ready",
+            ZOMBIE_FARM_NO_INVASION_COOLDOWN_ENV
+        );
+    }
+    true
+}
+
 fn zombie_farm_sanitize_ccarray_before_cleanup(
     env: &mut Environment,
     receiver: id,
@@ -721,6 +833,87 @@ fn zombie_farm_sanitize_ccarray_before_cleanup(
     }
 
     false
+}
+
+fn zombie_farm_ccarray_storage_is_safe_for_visit(env: &mut Environment, array: id) -> bool {
+    if zombie_farm_object_class_name(env, array) != Some("CCArray")
+        || env.objc.get_host_object(array).is_none()
+    {
+        return false;
+    }
+
+    let Some(data) = zombie_farm_read_object_ivar(env, array, "data") else {
+        return false;
+    };
+    if data == nil
+        || env
+            .mem
+            .try_malloc_size(data.cast_const().cast())
+            .unwrap_or(0)
+            < 12
+    {
+        return false;
+    }
+
+    // Zombie Farm's bundled cocos2d uses:
+    // struct ccArray { unsigned int num, max; id *arr; };
+    let data_bits = data.to_bits();
+    let num: u32 = env.mem.read(ConstPtr::from_bits(data_bits));
+    let max: u32 = env.mem.read(ConstPtr::from_bits(data_bits + 4));
+    let arr_bits: u32 = env.mem.read(ConstPtr::from_bits(data_bits + 8));
+    if num == 0 {
+        return true;
+    }
+    if num > max || num > (1 << 20) || arr_bits < env.mem.null_segment_size() {
+        return false;
+    }
+
+    let required_size = num.checked_mul(guest_size_of::<id>()).unwrap();
+    env.mem
+        .try_malloc_size(ConstPtr::<u8>::from_bits(arr_bits).cast())
+        .is_some_and(|size| size >= required_size)
+}
+
+fn zombie_farm_repair_ccnode_children_before_visit(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) {
+    if !zombie_farm_is_exact_legacy_app(env) || selector_name != "visit" {
+        return;
+    }
+
+    let Some(children_ivar) =
+        env.objc
+            .object_lookup_ivar(&env.mem, receiver, &"children_".to_string())
+    else {
+        return;
+    };
+    let children: id = env.mem.read(children_ivar.cast());
+    if children == nil || zombie_farm_ccarray_storage_is_safe_for_visit(env, children) {
+        return;
+    }
+
+    // CCNode's visit implementation dereferences children_->data directly.
+    // If the old CCArray has already been deallocated, replace the stale
+    // container with a valid empty one and let the node continue its own draw.
+    let regs = *env.cpu.regs();
+    let replacement: id = msg_class![env; CCArray alloc];
+    let capacity: NSUInteger = 1;
+    let replacement: id = msg![env; replacement initWithCapacity:capacity];
+    if replacement == nil {
+        env.cpu.regs_mut().copy_from_slice(&regs);
+        return;
+    }
+
+    env.mem.write(children_ivar.cast(), replacement);
+    env.cpu.regs_mut().copy_from_slice(&regs);
+    log!(
+        "ZombieFarm workaround: replaced stale CCNode children {:?} on {:?} ({}) before visit",
+        children,
+        receiver,
+        zombie_farm_object_class_name(env, receiver).unwrap_or("unknown")
+    );
 }
 
 pub(super) fn zombie_farm_return_nil_for_stale_object_message(
@@ -4591,32 +4784,29 @@ fn zombie_farm_prepare_local_server_date(env: &mut Environment, receiver: id, se
     env.cpu.regs_mut().copy_from_slice(&regs);
 }
 
-fn zombie_farm_complete_offline_tag_response(
+fn zombie_farm_is_legacy_social_response(
+    bundle_identifier: &str,
+    bundle_version: &str,
+    class_name: Option<&str>,
+    selector_name: &str,
+) -> bool {
+    bundle_identifier == "com.playforge.ZFR.LZ54D2GT3D"
+        && bundle_version == "1.0"
+        && class_name == Some("SocialMenu")
+        && selector_name == "handleResponse:forAction:"
+}
+
+fn zombie_farm_complete_legacy_social_response(
     env: &mut Environment,
     receiver: id,
     selector_name: &str,
 ) -> bool {
-    if env.bundle.bundle_identifier() != "com.playforge.ZFR.LZ54D2GT3D"
-        || env.bundle.bundle_version() != "1.0"
-        || selector_name != "handleResponse:forAction:"
-        || zombie_farm_object_class_name(env, receiver) != Some("SocialMenu")
-        || ns_url_connection::zombie_farm_http_base_url(env).is_some()
-    {
-        return false;
-    }
-
-    let action = id::from_bits(env.cpu.regs()[3]);
-    if action == nil {
-        return false;
-    }
-    let action_class = ObjC::read_isa(action, &env.mem);
-    if action_class == nil {
-        return false;
-    }
-    let string_class = env.objc.get_known_class("NSString", &mut env.mem);
-    if !env.objc.class_is_subclass_of(action_class, string_class)
-        || ns_string::to_rust_string(env, action).as_ref() != "sendTagResult"
-    {
+    if !zombie_farm_is_legacy_social_response(
+        env.bundle.bundle_identifier(),
+        env.bundle.bundle_version(),
+        zombie_farm_object_class_name(env, receiver),
+        selector_name,
+    ) {
         return false;
     }
 
@@ -4624,36 +4814,123 @@ fn zombie_farm_complete_offline_tag_response(
     // it is gone. The guest handler installs an SJLJ exception frame and
     // decodes the legacy binary response; later failures have been observed
     // unwinding through that expired frame during unrelated fight cleanup.
-    // With no replacement server configured there is no valid tag result to
-    // apply, so complete this obsolete callback before entering guest code.
+    // The only implemented action in this exact guest method is
+    // "sendTagResult"; every other action exits without changing state but
+    // still installs the same unsafe exception frame. Complete the entire
+    // obsolete callback at the host boundary.
+    // The public farm server is implemented by separate host-managed /v1
+    // endpoints and does not use this legacy tag response, so this obsolete
+    // callback is unsafe in both offline and public-online modes.
     env.cpu.regs_mut()[0] = 0;
-    log!("ZombieFarm workaround: skipped offline SocialMenu sendTagResult callback");
+    log!("ZombieFarm workaround: skipped legacy SocialMenu handleResponse:forAction: callback");
     true
 }
 
-fn zombie_farm_skip_offline_potential_friends_response(
+fn zombie_farm_is_unsafe_legacy_gift_action(
+    bundle_identifier: &str,
+    bundle_version: &str,
+    class_name: Option<&str>,
+    selector_name: &str,
+    table_exists: bool,
+    table_is_attached_to_window: bool,
+    public_friend_mode: bool,
+) -> bool {
+    bundle_identifier == "com.playforge.ZFR.LZ54D2GT3D"
+        && bundle_version == "1.0"
+        && class_name == Some("SocialTableViewGifts")
+        && selector_name == "acceptGift"
+        && (public_friend_mode || !table_exists || !table_is_attached_to_window)
+}
+
+fn zombie_farm_skip_unsafe_gift_action(
     env: &mut Environment,
     receiver: id,
     selector_name: &str,
 ) -> bool {
     if env.bundle.bundle_identifier() != "com.playforge.ZFR.LZ54D2GT3D"
         || env.bundle.bundle_version() != "1.0"
-        || selector_name != "handlePotentialFriendsResponse:"
-        || zombie_farm_object_class_name(env, receiver) != Some("SocialTableViewFacebook")
-        || ns_url_connection::zombie_farm_http_base_url(env).is_some()
+        || zombie_farm_object_class_name(env, receiver) != Some("SocialTableViewGifts")
+        || selector_name != "acceptGift"
     {
         return false;
     }
 
-    // This callback parses BrainClient's retired binary potential-friends
-    // response. With no replacement server configured, ZFR can deliver a
-    // malformed/stale completion long after the social controller has left the
-    // screen. It has been observed continuing during a robot fight and reading
-    // through a null BinaryDataHelper buffer. There is no valid offline friend
-    // data to apply, so finish the obsolete callback before entering guest code.
+    let table_view = zombie_farm_read_object_ivar(env, receiver, "tableView").unwrap_or(nil);
+    let table_is_attached_to_window = if table_view == nil {
+        false
+    } else {
+        let regs = *env.cpu.regs();
+        let window = zombie_farm_get_id_if_responds(env, table_view, "window").unwrap_or(nil);
+        env.cpu.regs_mut().copy_from_slice(&regs);
+        window != nil
+    };
+
+    let public_friend_mode = ns_url_connection::zombie_farm_http_base_url(env).is_some();
+    if !zombie_farm_is_unsafe_legacy_gift_action(
+        env.bundle.bundle_identifier(),
+        env.bundle.bundle_version(),
+        zombie_farm_object_class_name(env, receiver),
+        selector_name,
+        table_view != nil,
+        table_is_attached_to_window,
+        public_friend_mode,
+    ) {
+        return false;
+    }
+
+    // The legacy gifts controller can survive after its UIKit hierarchy has
+    // been removed. A delayed alert/control action may then enter acceptGift
+    // while the robot fight is being created. That method mutates two table
+    // rows and has repeatedly been observed returning through stale SJLJ/ARM
+    // continuations into SocialMenu::handleResponse. A visible gifts table is
+    // still allowed to accept gifts in the original offline path. The public
+    // friend API does not implement incoming gifts, so acceptGift is obsolete
+    // there even if the old table still reports a non-nil window.
     env.cpu.regs_mut()[0] = 0;
     log!(
-        "ZombieFarm workaround: skipped offline SocialTableViewFacebook handlePotentialFriendsResponse:"
+        "ZombieFarm workaround: skipped unsafe [SocialTableViewGifts acceptGift] (table {:?}, public friend mode={})",
+        table_view,
+        public_friend_mode
+    );
+    true
+}
+
+fn zombie_farm_is_obsolete_potential_friends_response(
+    bundle_identifier: &str,
+    bundle_version: &str,
+    class_name: Option<&str>,
+    selector_name: &str,
+) -> bool {
+    bundle_identifier == "com.playforge.ZFR.LZ54D2GT3D"
+        && bundle_version == "1.0"
+        && class_name == Some("SocialTableViewFacebook")
+        && selector_name == "handlePotentialFriendsResponse:"
+}
+
+fn zombie_farm_skip_obsolete_potential_friends_response(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if !zombie_farm_is_obsolete_potential_friends_response(
+        env.bundle.bundle_identifier(),
+        env.bundle.bundle_version(),
+        zombie_farm_object_class_name(env, receiver),
+        selector_name,
+    ) {
+        return false;
+    }
+
+    // This callback parses BrainClient's retired binary potential-friends
+    // response. ZFR can deliver a malformed/stale completion long after the
+    // social controller has left the screen. It has been observed continuing
+    // during a robot fight, nested inside SocialTableViewGifts::acceptGift, and
+    // corrupting the ARM return chain to PC 0x4. The host-managed public friend
+    // list is installed directly by getFriendsList/findFriends and does not use
+    // this legacy Facebook response, so this callback is obsolete in both modes.
+    env.cpu.regs_mut()[0] = 0;
+    log!(
+        "ZombieFarm workaround: skipped obsolete SocialTableViewFacebook handlePotentialFriendsResponse:"
     );
     true
 }
@@ -4667,18 +4944,18 @@ fn zombie_farm_complete_stale_tag_summary_dismiss(
         || env.bundle.bundle_version() != "1.0"
         || selector_name != "dismissMenu:"
         || zombie_farm_object_class_name(env, receiver) != Some("ZFTagSummary")
-        || ns_url_connection::zombie_farm_http_base_url(env).is_some()
     {
         return false;
     }
 
-    // The retired tag UI can finish dismissing after the fight scene has
-    // already replaced it. Its animation path asks CCDirector for a struct
-    // return, then has been observed entering free() with corrupted guest
-    // return addresses. Abandoning that entire guest call also abandons the
-    // surrounding Cocos scheduler pass, which prevents later zombies from
-    // being deployed. Complete the UI's tiny final callback normally instead:
-    // it only posts kZombieTagSummaryDoneNotification.
+    // The legacy tag UI can finish dismissing after the fight scene has
+    // already replaced it, including while the public farm server is enabled.
+    // Its animation path asks CCDirector for a struct return, then has been
+    // observed entering free() with corrupted guest return addresses.
+    // Abandoning that entire guest call also abandons the surrounding Cocos
+    // scheduler pass, which prevents later zombies from being deployed.
+    // Complete the UI's tiny final callback normally instead: it only posts
+    // kZombieTagSummaryDoneNotification.
     let regs = *env.cpu.regs();
     let completed = env
         .objc
@@ -4932,34 +5209,167 @@ fn zombie_farm_show_due_daily_reward_locally(
 
     let display_date: id = msg![env; game_data dailyBonusRewardDisplayDate];
     let now: id = msg_class![env; NSDate date];
-    let elapsed_seconds = ns_date::debug_time_interval(env, now)
-        .zip(ns_date::debug_time_interval(env, display_date))
-        .map(|(now, last)| now - last);
+    let now_seconds = zombie_farm_date_unix_seconds(env, now);
+    let display_seconds = zombie_farm_date_unix_seconds(env, display_date);
+    let now_day =
+        now_seconds.and_then(|seconds| zombie_farm_calendar_day_in_timezone(seconds, &Local));
+    let display_day = display_seconds
+        .and_then(|seconds| zombie_farm_legacy_compatible_day_in_timezone(seconds, &Local));
     let reward_is_due = display_date == nil
-        || elapsed_seconds
-            .map(|elapsed| elapsed >= 86_399.9999)
+        || now_day
+            .zip(display_day)
+            .map(|(now, last)| now > last)
             .unwrap_or(false);
 
     let shown =
         reward_is_due && zombie_farm_send_noarg_if_responds(env, gui_layer, "showDailyEvents");
     if shown {
         log!(
-            "ZombieFarm daily reward: invoked showDailyEvents after {} (elapsed {:?} seconds)",
+            "ZombieFarm daily reward: invoked showDailyEvents after {} (local day {:?}, previous local day {:?})",
             reason,
-            elapsed_seconds,
+            now_day,
+            display_day,
         );
     } else if zombie_farm_daily_trace_enabled() {
         log!(
-            "ZombieFarm daily trace: reward not shown after {} (displayDate={:?}, elapsedSeconds={:?}, due={})",
+            "ZombieFarm daily trace: reward not shown after {} (displayDate={:?}, localDay={:?}, previousLocalDay={:?}, due={})",
             reason,
             display_date,
-            elapsed_seconds,
+            now_day,
+            display_day,
             reward_is_due,
         );
     }
 
     env.cpu.regs_mut().copy_from_slice(&regs);
     shown
+}
+
+const ZOMBIE_FARM_SECONDS_PER_DAY: f64 = 86_400.0;
+const ZOMBIE_FARM_UTC_MIDNIGHT_TOLERANCE_SECONDS: f64 = 0.001;
+
+fn zombie_farm_date_unix_seconds(env: &Environment, date: id) -> Option<f64> {
+    ns_date::debug_time_interval(env, date)
+        .map(|seconds| seconds + SECS_FROM_UNIX_TO_APPLE_EPOCHS as f64)
+}
+
+fn zombie_farm_utc_datetime(unix_seconds: f64) -> Option<DateTime<Utc>> {
+    if !unix_seconds.is_finite() {
+        return None;
+    }
+
+    let whole_seconds = unix_seconds.floor();
+    if whole_seconds < i64::MIN as f64 || whole_seconds > i64::MAX as f64 {
+        return None;
+    }
+
+    DateTime::<Utc>::from_timestamp(whole_seconds as i64, 0)
+}
+
+fn zombie_farm_calendar_day_in_timezone<Tz: TimeZone>(
+    unix_seconds: f64,
+    time_zone: &Tz,
+) -> Option<NaiveDate> {
+    Some(
+        zombie_farm_utc_datetime(unix_seconds)?
+            .with_timezone(time_zone)
+            .date_naive(),
+    )
+}
+
+fn zombie_farm_was_legacy_utc_midnight(unix_seconds: f64) -> bool {
+    let seconds_since_midnight = unix_seconds.rem_euclid(ZOMBIE_FARM_SECONDS_PER_DAY);
+    seconds_since_midnight <= ZOMBIE_FARM_UTC_MIDNIGHT_TOLERANCE_SECONDS
+        || ZOMBIE_FARM_SECONDS_PER_DAY - seconds_since_midnight
+            <= ZOMBIE_FARM_UTC_MIDNIGHT_TOLERANCE_SECONDS
+}
+
+fn zombie_farm_legacy_compatible_day_in_timezone<Tz: TimeZone>(
+    unix_seconds: f64,
+    time_zone: &Tz,
+) -> Option<NaiveDate> {
+    let utc_date = zombie_farm_utc_datetime(unix_seconds)?;
+    if zombie_farm_was_legacy_utc_midnight(unix_seconds) {
+        // Old ZFR saves stored the intended calendar date as midnight UTC.
+        // Preserve that date label when migrating to a host-local midnight.
+        Some(utc_date.date_naive())
+    } else {
+        Some(utc_date.with_timezone(time_zone).date_naive())
+    }
+}
+
+fn zombie_farm_first_valid_instant_for_day<Tz: TimeZone>(
+    day: NaiveDate,
+    time_zone: &Tz,
+) -> Option<f64> {
+    for minute_of_day in 0..(24 * 60) {
+        let hour = minute_of_day / 60;
+        let minute = minute_of_day % 60;
+        let Some(local_time) = day.and_hms_opt(hour, minute, 0) else {
+            continue;
+        };
+        let date_time = match time_zone.from_local_datetime(&local_time) {
+            LocalResult::Single(value) => value,
+            LocalResult::Ambiguous(first, second) => {
+                if first.timestamp() <= second.timestamp() {
+                    first
+                } else {
+                    second
+                }
+            }
+            LocalResult::None => continue,
+        };
+        return Some(date_time.timestamp() as f64);
+    }
+
+    None
+}
+
+fn zombie_farm_start_of_local_day_in_timezone<Tz: TimeZone>(
+    unix_seconds: f64,
+    time_zone: &Tz,
+) -> Option<(NaiveDate, f64, bool)> {
+    let migrated_legacy_utc_midnight = zombie_farm_was_legacy_utc_midnight(unix_seconds);
+    let day = zombie_farm_legacy_compatible_day_in_timezone(unix_seconds, time_zone)?;
+    let start_seconds = zombie_farm_first_valid_instant_for_day(day, time_zone)?;
+    Some((day, start_seconds, migrated_legacy_utc_midnight))
+}
+
+fn zombie_farm_return_local_beginning_of_day(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if env.bundle.bundle_identifier() != "com.playforge.ZFR.LZ54D2GT3D"
+        || env.bundle.bundle_version() != "1.0"
+        || selector_name != "getBeginningOfTheDayFromDate:"
+        || zombie_farm_object_class_name(env, receiver) != Some("GameState")
+    {
+        return false;
+    }
+
+    let date = id::from_bits(env.cpu.regs()[2]);
+    let Some(unix_seconds) = zombie_farm_date_unix_seconds(env, date) else {
+        return false;
+    };
+    let Some((day, start_seconds, migrated_legacy_utc_midnight)) =
+        zombie_farm_start_of_local_day_in_timezone(unix_seconds, &Local)
+    else {
+        return false;
+    };
+
+    let result: id = msg_class![env; NSDate dateWithTimeIntervalSince1970:start_seconds];
+    env.cpu.regs_mut()[0] = result.to_bits();
+
+    if zombie_farm_daily_trace_enabled() {
+        log!(
+            "ZombieFarm daily trace: returned host-local beginning of day {} ({:.0} Unix seconds, migrated legacy UTC midnight={})",
+            day,
+            start_seconds,
+            migrated_legacy_utc_midnight,
+        );
+    }
+    true
 }
 
 fn zombie_farm_trace_daily_reward_gate(env: &mut Environment, gui_layer: id) {
@@ -5410,6 +5820,88 @@ pub(super) fn zombie_farm_cell_content_size_override(
         "ZombieFarm workaround: [{} contentSize] -> class cellSize {}",
         class_name,
         cell_size
+    );
+    true
+}
+
+const ZOMBIE_FARM_TAG_SUMMARY_WIN_SIZE_RETURN: u32 = 0x0023_2090;
+
+fn zombie_farm_is_tag_summary_win_size_call(
+    bundle_identifier: &str,
+    bundle_version: &str,
+    receiver_class_name: Option<&str>,
+    selector_name: &str,
+    guest_lr: u32,
+) -> bool {
+    bundle_identifier == "com.playforge.ZFR.LZ54D2GT3D"
+        && bundle_version == "1.0"
+        && matches!(
+            receiver_class_name,
+            Some("CCDirector" | "CCFastDirector" | "CCThreadedFastDirector")
+        )
+        && selector_name == "winSize"
+        && guest_lr == ZOMBIE_FARM_TAG_SUMMARY_WIN_SIZE_RETURN
+}
+
+fn zombie_farm_cocos_win_size(device_orientation: u32, surface_size: CGSize) -> CGSize {
+    if matches!(device_orientation, 3 | 4) {
+        CGSize {
+            width: surface_size.height,
+            height: surface_size.width,
+        }
+    } else {
+        surface_size
+    }
+}
+
+pub(super) fn zombie_farm_tag_summary_win_size_override(
+    env: &mut Environment,
+    receiver: id,
+    selector: SEL,
+    stret: MutVoidPtr,
+) -> bool {
+    if receiver == nil || stret.is_null() {
+        return false;
+    }
+
+    let selector_name = selector.as_str(&env.mem);
+    let receiver_class_name = zombie_farm_object_class_name(env, receiver);
+    if !zombie_farm_is_tag_summary_win_size_call(
+        env.bundle.bundle_identifier(),
+        env.bundle.bundle_version(),
+        receiver_class_name,
+        selector_name,
+        env.cpu.regs()[Cpu::LR],
+    ) {
+        return false;
+    }
+
+    // ZFR's -[ZFTagSummary dismissMenu:] calls [CCDirector winSize] through
+    // objc_msgSend_stret at 0x0023208c. On this one legacy path the return from
+    // the host dispatch stub has intermittently resumed the ARM caller in
+    // Thumb mode, eventually wandering into free() and stale social callbacks.
+    // The guest winSize implementation only reads these two CCDirector ivars,
+    // swapping the surface dimensions for landscape orientations. Reproduce
+    // that result directly so no guest call/return boundary is involved.
+    let Some(device_orientation_ivar) =
+        env.objc
+            .object_lookup_ivar(&env.mem, receiver, &"deviceOrientation_".to_string())
+    else {
+        return false;
+    };
+    let Some(surface_size_ivar) =
+        env.objc
+            .object_lookup_ivar(&env.mem, receiver, &"surfaceSize_".to_string())
+    else {
+        return false;
+    };
+    let device_orientation: u32 = env.mem.read(device_orientation_ivar.cast());
+    let surface_size: CGSize = env.mem.read(surface_size_ivar.cast());
+    let win_size = zombie_farm_cocos_win_size(device_orientation, surface_size);
+    env.mem.write(stret.cast(), win_size);
+    log!(
+        "ZombieFarm workaround: returned CCDirector winSize {} directly for ZFTagSummary dismissMenu:",
+        win_size
     );
     true
 }
@@ -6382,9 +6874,15 @@ pub(super) fn zombie_farm_pre_dispatch_workarounds(
         return true;
     }
 
+    if zombie_farm_override_invasion_cooldown_interval(env, receiver, selector_name) {
+        return true;
+    }
+
     if zombie_farm_sanitize_ccarray_before_cleanup(env, receiver, selector_name) {
         return true;
     }
+
+    zombie_farm_repair_ccnode_children_before_visit(env, receiver, selector_name);
 
     if env.bundle.bundle_identifier() == "com.playforge.ZombieFarm2" {
         zombie_farm_trace_game_interaction_message(env, receiver, selector_name);
@@ -6570,6 +7068,11 @@ pub(super) fn zombie_farm_pre_dispatch_workarounds(
         "setSaveDate:" => {
             zombie_farm_prepare_game_state_save_date(env, receiver, selector_name);
         }
+        "getBeginningOfTheDayFromDate:" => {
+            if zombie_farm_return_local_beginning_of_day(env, receiver, selector_name) {
+                return true;
+            }
+        }
         "getServerTime" => {
             if zombie_farm_complete_server_time_locally(env, receiver, selector_name) {
                 return true;
@@ -6577,13 +7080,18 @@ pub(super) fn zombie_farm_pre_dispatch_workarounds(
             zombie_farm_prepare_local_server_date(env, receiver, selector_name);
         }
         "handleResponse:forAction:" => {
-            if zombie_farm_complete_offline_tag_response(env, receiver, selector_name) {
+            if zombie_farm_complete_legacy_social_response(env, receiver, selector_name) {
                 return true;
             }
             zombie_farm_prepare_local_server_date(env, receiver, selector_name);
         }
         "handlePotentialFriendsResponse:" => {
-            if zombie_farm_skip_offline_potential_friends_response(env, receiver, selector_name) {
+            if zombie_farm_skip_obsolete_potential_friends_response(env, receiver, selector_name) {
+                return true;
+            }
+        }
+        "acceptGift" => {
+            if zombie_farm_skip_unsafe_gift_action(env, receiver, selector_name) {
                 return true;
             }
         }
@@ -6632,6 +7140,16 @@ pub(super) fn zombie_farm_needs_pre_dispatch_workarounds(
         return true;
     }
 
+    if zombie_farm_is_exact_legacy_app(env)
+        && zombie_farm_no_invasion_cooldown_enabled()
+        && matches!(
+            selector_name,
+            "timeIntervalSinceNow" | "timeIntervalSinceDate:"
+        )
+    {
+        return true;
+    }
+
     matches!(
         selector_name,
         "operationDone"
@@ -6645,14 +7163,17 @@ pub(super) fn zombie_farm_needs_pre_dispatch_workarounds(
             | "setHunger:"
             | "md5sum:"
             | "setZombie:"
+            | "visit"
             | "dealloc"
             | "removeAllObjects"
             | "_moveCellOutOfSight:"
             | "dequeueCell"
             | "setSaveDate:"
+            | "getBeginningOfTheDayFromDate:"
             | "getServerTime"
             | "handleResponse:forAction:"
             | "handlePotentialFriendsResponse:"
+            | "acceptGift"
             | "dismissMenu:"
             | "inputDailyBonusReward:alert:"
             | "openMenu"
@@ -6681,6 +7202,281 @@ pub(super) fn zombie_farm_needs_pre_dispatch_workarounds(
     )
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{
+        zombie_farm_calendar_day_in_timezone, zombie_farm_cocos_win_size,
+        zombie_farm_env_flag_enabled, zombie_farm_invasion_interval_override,
+        zombie_farm_is_legacy_social_response, zombie_farm_is_obsolete_potential_friends_response,
+        zombie_farm_is_tag_summary_win_size_call, zombie_farm_is_unsafe_legacy_gift_action,
+        zombie_farm_legacy_compatible_day_in_timezone, zombie_farm_start_of_local_day_in_timezone,
+        ZOMBIE_FARM_INVASION_READY_INTERVAL_SECONDS, ZOMBIE_FARM_TAG_SUMMARY_WIN_SIZE_RETURN,
+    };
+    use crate::frameworks::core_graphics::CGSize;
+    use chrono::{FixedOffset, NaiveDate, TimeZone, Utc};
+
+    fn unix_seconds(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> f64 {
+        Utc.with_ymd_and_hms(year, month, day, hour, minute, second)
+            .single()
+            .unwrap()
+            .timestamp() as f64
+    }
+
+    #[test]
+    fn zombie_farm_migrates_legacy_utc_midnight_to_utc_plus_eight() {
+        let time_zone = FixedOffset::east_opt(8 * 60 * 60).unwrap();
+        let legacy_midnight = unix_seconds(2026, 7, 30, 0, 0, 0);
+        let (day, start, migrated) =
+            zombie_farm_start_of_local_day_in_timezone(legacy_midnight, &time_zone).unwrap();
+
+        assert_eq!(day, NaiveDate::from_ymd_opt(2026, 7, 30).unwrap());
+        assert_eq!(start, unix_seconds(2026, 7, 29, 16, 0, 0));
+        assert!(migrated);
+    }
+
+    #[test]
+    fn zombie_farm_migrates_legacy_utc_midnight_to_utc_minus_eight() {
+        let time_zone = FixedOffset::west_opt(8 * 60 * 60).unwrap();
+        let legacy_midnight = unix_seconds(2026, 7, 30, 0, 0, 0);
+        let (day, start, migrated) =
+            zombie_farm_start_of_local_day_in_timezone(legacy_midnight, &time_zone).unwrap();
+
+        assert_eq!(day, NaiveDate::from_ymd_opt(2026, 7, 30).unwrap());
+        assert_eq!(start, unix_seconds(2026, 7, 30, 8, 0, 0));
+        assert!(migrated);
+    }
+
+    #[test]
+    fn zombie_farm_uses_local_calendar_day_for_ordinary_instants() {
+        let time_zone = FixedOffset::west_opt(8 * 60 * 60).unwrap();
+        let instant = unix_seconds(2026, 7, 30, 1, 0, 0);
+        let (day, start, migrated) =
+            zombie_farm_start_of_local_day_in_timezone(instant, &time_zone).unwrap();
+
+        assert_eq!(day, NaiveDate::from_ymd_opt(2026, 7, 29).unwrap());
+        assert_eq!(start, unix_seconds(2026, 7, 29, 8, 0, 0));
+        assert!(!migrated);
+    }
+
+    #[test]
+    fn zombie_farm_daily_reward_changes_at_utc_plus_eight_midnight() {
+        let time_zone = FixedOffset::east_opt(8 * 60 * 60).unwrap();
+        let display = unix_seconds(2026, 7, 30, 0, 0, 0);
+        let previous_day =
+            zombie_farm_legacy_compatible_day_in_timezone(display, &time_zone).unwrap();
+        let before_midnight =
+            zombie_farm_calendar_day_in_timezone(unix_seconds(2026, 7, 30, 15, 59, 59), &time_zone)
+                .unwrap();
+        let at_midnight =
+            zombie_farm_calendar_day_in_timezone(unix_seconds(2026, 7, 30, 16, 0, 0), &time_zone)
+                .unwrap();
+
+        assert_eq!(before_midnight, previous_day);
+        assert!(at_midnight > previous_day);
+    }
+
+    #[test]
+    fn zombie_farm_daily_reward_changes_at_utc_minus_eight_midnight() {
+        let time_zone = FixedOffset::west_opt(8 * 60 * 60).unwrap();
+        let display = unix_seconds(2026, 7, 30, 0, 0, 0);
+        let previous_day =
+            zombie_farm_legacy_compatible_day_in_timezone(display, &time_zone).unwrap();
+        let before_midnight =
+            zombie_farm_calendar_day_in_timezone(unix_seconds(2026, 7, 31, 7, 59, 59), &time_zone)
+                .unwrap();
+        let at_midnight =
+            zombie_farm_calendar_day_in_timezone(unix_seconds(2026, 7, 31, 8, 0, 0), &time_zone)
+                .unwrap();
+
+        assert_eq!(before_midnight, previous_day);
+        assert!(at_midnight > previous_day);
+    }
+
+    #[test]
+    fn zombie_farm_only_skips_the_exact_legacy_social_response_method() {
+        assert!(zombie_farm_is_legacy_social_response(
+            "com.playforge.ZFR.LZ54D2GT3D",
+            "1.0",
+            Some("SocialMenu"),
+            "handleResponse:forAction:",
+        ));
+        assert!(!zombie_farm_is_legacy_social_response(
+            "com.playforge.ZFR.LZ54D2GT3D",
+            "1.0",
+            Some("ZFGuiLayer"),
+            "handleResponse:forAction:",
+        ));
+        assert!(!zombie_farm_is_legacy_social_response(
+            "com.playforge.ZombieFarm2",
+            "1.0",
+            Some("SocialMenu"),
+            "handleResponse:forAction:",
+        ));
+    }
+
+    #[test]
+    fn zombie_farm_skips_accept_gift_for_detached_or_public_legacy_gifts_table() {
+        assert!(zombie_farm_is_unsafe_legacy_gift_action(
+            "com.playforge.ZFR.LZ54D2GT3D",
+            "1.0",
+            Some("SocialTableViewGifts"),
+            "acceptGift",
+            true,
+            false,
+            false,
+        ));
+        assert!(zombie_farm_is_unsafe_legacy_gift_action(
+            "com.playforge.ZFR.LZ54D2GT3D",
+            "1.0",
+            Some("SocialTableViewGifts"),
+            "acceptGift",
+            false,
+            false,
+            false,
+        ));
+        assert!(zombie_farm_is_unsafe_legacy_gift_action(
+            "com.playforge.ZFR.LZ54D2GT3D",
+            "1.0",
+            Some("SocialTableViewGifts"),
+            "acceptGift",
+            true,
+            true,
+            true,
+        ));
+        assert!(!zombie_farm_is_unsafe_legacy_gift_action(
+            "com.playforge.ZFR.LZ54D2GT3D",
+            "1.0",
+            Some("SocialTableViewGifts"),
+            "acceptGift",
+            true,
+            true,
+            false,
+        ));
+        assert!(!zombie_farm_is_unsafe_legacy_gift_action(
+            "com.playforge.ZFR.LZ54D2GT3D",
+            "1.0",
+            Some("SocialMenu"),
+            "acceptGift",
+            true,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn zombie_farm_skips_obsolete_potential_friends_response_in_both_network_modes() {
+        assert!(zombie_farm_is_obsolete_potential_friends_response(
+            "com.playforge.ZFR.LZ54D2GT3D",
+            "1.0",
+            Some("SocialTableViewFacebook"),
+            "handlePotentialFriendsResponse:",
+        ));
+        assert!(!zombie_farm_is_obsolete_potential_friends_response(
+            "com.playforge.ZFR.LZ54D2GT3D",
+            "1.0",
+            Some("SocialTableViewNeighbors"),
+            "handlePotentialFriendsResponse:",
+        ));
+        assert!(!zombie_farm_is_obsolete_potential_friends_response(
+            "com.playforge.ZombieFarm2",
+            "1.0",
+            Some("SocialTableViewFacebook"),
+            "handlePotentialFriendsResponse:",
+        ));
+    }
+
+    #[test]
+    fn zombie_farm_only_overrides_tag_summary_win_size_at_the_exact_return_site() {
+        assert!(zombie_farm_is_tag_summary_win_size_call(
+            "com.playforge.ZFR.LZ54D2GT3D",
+            "1.0",
+            Some("CCFastDirector"),
+            "winSize",
+            ZOMBIE_FARM_TAG_SUMMARY_WIN_SIZE_RETURN,
+        ));
+        assert!(!zombie_farm_is_tag_summary_win_size_call(
+            "com.playforge.ZFR.LZ54D2GT3D",
+            "1.0",
+            Some("CCFastDirector"),
+            "winSize",
+            ZOMBIE_FARM_TAG_SUMMARY_WIN_SIZE_RETURN + 4,
+        ));
+        assert!(!zombie_farm_is_tag_summary_win_size_call(
+            "com.playforge.ZFR.LZ54D2GT3D",
+            "1.0",
+            Some("ZFTagSummary"),
+            "winSize",
+            ZOMBIE_FARM_TAG_SUMMARY_WIN_SIZE_RETURN,
+        ));
+        assert!(!zombie_farm_is_tag_summary_win_size_call(
+            "com.playforge.ZombieFarm2",
+            "1.0",
+            Some("CCFastDirector"),
+            "winSize",
+            ZOMBIE_FARM_TAG_SUMMARY_WIN_SIZE_RETURN,
+        ));
+    }
+
+    #[test]
+    fn zombie_farm_win_size_matches_cocos_landscape_orientation_rules() {
+        let surface_size = CGSize {
+            width: 768.0,
+            height: 1024.0,
+        };
+
+        assert_eq!(zombie_farm_cocos_win_size(1, surface_size), surface_size);
+        assert_eq!(
+            zombie_farm_cocos_win_size(3, surface_size),
+            CGSize {
+                width: 1024.0,
+                height: 768.0,
+            }
+        );
+        assert_eq!(
+            zombie_farm_cocos_win_size(4, surface_size),
+            CGSize {
+                width: 1024.0,
+                height: 768.0,
+            }
+        );
+    }
+
+    #[test]
+    fn zombie_farm_parses_no_invasion_cooldown_environment_flag() {
+        for enabled in ["1", "true", "TRUE", " yes ", "On"] {
+            assert!(zombie_farm_env_flag_enabled(Some(enabled)));
+        }
+        for disabled in ["", "0", "false", "no", "off", "2"] {
+            assert!(!zombie_farm_env_flag_enabled(Some(disabled)));
+        }
+        assert!(!zombie_farm_env_flag_enabled(None));
+    }
+
+    #[test]
+    fn zombie_farm_only_overrides_intervals_for_last_invasion_date() {
+        assert_eq!(
+            zombie_farm_invasion_interval_override(true, "timeIntervalSinceNow", true, false,),
+            Some(-ZOMBIE_FARM_INVASION_READY_INTERVAL_SECONDS)
+        );
+        assert_eq!(
+            zombie_farm_invasion_interval_override(true, "timeIntervalSinceDate:", false, true,),
+            Some(ZOMBIE_FARM_INVASION_READY_INTERVAL_SECONDS)
+        );
+        assert_eq!(
+            zombie_farm_invasion_interval_override(true, "timeIntervalSinceNow", false, false,),
+            None
+        );
+        assert_eq!(
+            zombie_farm_invasion_interval_override(true, "timeIntervalSinceDate:", true, false,),
+            None
+        );
+        assert_eq!(
+            zombie_farm_invasion_interval_override(false, "timeIntervalSinceNow", true, false,),
+            None
+        );
+    }
+}
+
 pub(super) fn zombie_farm_post_dispatch_workarounds(
     env: &mut Environment,
     receiver: id,
@@ -6694,6 +7490,8 @@ pub(super) fn zombie_farm_post_dispatch_workarounds(
     if zombie_farm_touch_trace_enabled() {
         zombie_farm_trace_game_interaction_return(env, receiver, selector_name);
     }
+
+    zombie_farm_record_last_invasion_date(env, receiver, selector_name);
 
     match selector_name {
         "handleTimeResponse:" => {
@@ -6718,6 +7516,9 @@ pub(super) fn zombie_farm_needs_post_dispatch_workarounds(
 ) -> bool {
     zombie_farm_uses_playforge_bundle(env)
         && (zombie_farm_touch_trace_enabled()
+            || (zombie_farm_is_exact_legacy_app(env)
+                && zombie_farm_no_invasion_cooldown_enabled()
+                && selector_name == "lastInvasionDate")
             || matches!(
                 selector_name,
                 "handleTimeResponse:" | "statusCheckDone" | "startUpChecksComplete" | "saveGame"

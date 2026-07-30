@@ -149,6 +149,23 @@ $env:TOUCHHLE_TIME_OFFSET_SECONDS="900"
 Remove-Item Env:\TOUCHHLE_TIME_OFFSET_SECONDS
 ```
 
+## Zombie Farm 入侵冷却
+
+如果希望 Zombie Farm 1.0 的机器人入侵冷却始终就绪，可以在启动前设置：
+
+```powershell
+$env:TOUCHHLE_ZOMBIE_FARM_NO_INVASION_COOLDOWN="1"
+.\touchHLE.exe ".\zombie_farm\ZFR.ipa" --device-family="ipad"
+```
+
+该开关只覆盖界面和入侵资格检查所读取的 `lastInvasionDate` 时间差，不会修改存档中的日期，也不会绕过僵尸数量等其他入侵条件。它只对包标识为 `com.playforge.ZFR.LZ54D2GT3D`、版本为 `1.0` 的 Zombie Farm 生效。环境变量也接受 `true`、`yes` 或 `on`，不区分大小写。
+
+关闭该功能：
+
+```powershell
+Remove-Item Env:\TOUCHHLE_ZOMBIE_FARM_NO_INVASION_COOLDOWN
+```
+
 ## Windows 快捷键
 
 这些快捷键主要用于 Zombie Farm 调试和排查：

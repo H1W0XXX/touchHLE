@@ -1463,6 +1463,7 @@ impl Environment {
                 if let Ok(mut file) = std::fs::File::create("zombie_farm_crash_snapshot.txt") {
                     let _ = crate::zombie_farm_debug::write_snapshot(&mut file);
                 }
+                crate::objc::dump_zombie_farm_message_trace();
             }
             self.dump_all_regs();
             self.stack_trace_current();

@@ -138,21 +138,32 @@ fn zombie_farm_online_table_rendering_enabled(env: &crate::Environment) -> bool 
         && std::env::var_os("TOUCHHLE_ZOMBIE_FARM_HTTP_BASE_URL").is_some()
 }
 
-fn request_table_reload(env: &mut crate::Environment, table_view: id) {
-    let render_now = {
-        let host = env.objc.borrow_mut::<UITableViewHostObject>(table_view);
-        if host.update_depth == 0 && env.current_thread == 0 {
-            host.pending_reload = false;
-            true
-        } else {
-            host.pending_reload = true;
-            false
-        }
-    };
-    if render_now && zombie_farm_online_table_rendering_enabled(env) {
-        render_data_source_views(env, table_view);
+fn schedule_table_layout(env: &mut crate::Environment, table_view: id) {
+    if zombie_farm_online_table_rendering_enabled(env) {
+        // UIView::setNeedsLayout currently calls layoutSubviews immediately.
+        // That is unsafe for Zombie Farm's social tables: acceptGift mutates
+        // its model between beginUpdates/endUpdates, and a synchronous layout
+        // re-enters the data source before acceptGift has returned. Queue the
+        // layout on the main run loop to match UIKit's deferred semantics.
+        let layout_selector = env.objc.lookup_selector("layoutSubviews").unwrap();
+        () = msg![env; table_view performSelectorOnMainThread:layout_selector
+                       withObject:nil
+                       waitUntilDone:false];
+    } else {
+        () = msg![env; table_view setNeedsLayout];
     }
-    () = msg![env; table_view setNeedsLayout];
+}
+
+fn request_table_reload(env: &mut crate::Environment, table_view: id) {
+    // UIKit applies reloads during a later layout pass. In particular, do not
+    // call a Zombie Farm data source synchronously from reloadData or a row
+    // update: the game's social controllers can still be unwinding those
+    // methods while the fight scene is being created, and re-entering guest
+    // code here can corrupt the saved ARM continuation.
+    env.objc
+        .borrow_mut::<UITableViewHostObject>(table_view)
+        .pending_reload = true;
+    schedule_table_layout(env, table_view);
 }
 
 fn render_pending_table_reload(env: &mut crate::Environment, table_view: id) {
@@ -506,22 +517,13 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())endUpdates {
-    let render_now = {
+    {
         let host = env.objc.borrow_mut::<UITableViewHostObject>(this);
         if host.update_depth > 0 {
             host.update_depth -= 1;
         }
-        if host.update_depth == 0 && host.pending_reload && env.current_thread == 0 {
-            host.pending_reload = false;
-            true
-        } else {
-            false
-        }
-    };
-    if render_now && zombie_farm_online_table_rendering_enabled(env) {
-        render_data_source_views(env, this);
     }
-    () = msg![env; this setNeedsLayout];
+    schedule_table_layout(env, this);
 }
 
 - (())insertRowsAtIndexPaths:(id)_index_paths withRowAnimation:(NSInteger)_animation {

@@ -149,6 +149,23 @@ To clear the time offset:
 Remove-Item Env:\TOUCHHLE_TIME_OFFSET_SECONDS
 ```
 
+## Zombie Farm Invasion Cooldown
+
+To keep Zombie Farm 1.0's robot-invasion cooldown ready, set this before launching:
+
+```powershell
+$env:TOUCHHLE_ZOMBIE_FARM_NO_INVASION_COOLDOWN="1"
+.\touchHLE.exe ".\zombie_farm\ZFR.ipa" --device-family="ipad"
+```
+
+This only overrides the `lastInvasionDate` interval read by the UI and invasion eligibility check. It does not change the stored date or bypass other invasion requirements such as the zombie-count requirement. It is gated to Zombie Farm bundle `com.playforge.ZFR.LZ54D2GT3D`, version `1.0`. The environment variable also accepts `true`, `yes`, or `on`, case-insensitively.
+
+To disable this feature:
+
+```powershell
+Remove-Item Env:\TOUCHHLE_ZOMBIE_FARM_NO_INVASION_COOLDOWN
+```
+
 ## Windows Shortcuts
 
 These shortcuts are mainly for Zombie Farm debugging and troubleshooting:

@@ -178,8 +178,8 @@ use zombie_farm::{
     zombie_farm_quest_arg_details, zombie_farm_quest_trace_enabled,
     zombie_farm_return_nil_for_stale_object_message,
     zombie_farm_should_return_self_for_unimplemented_cocos_reverse, zombie_farm_status_arg_details,
-    zombie_farm_status_trace_enabled, zombie_farm_uses_playforge_bundle,
-    ZOMBIE_FARM_APPLY_TRACE_DEPTH,
+    zombie_farm_status_trace_enabled, zombie_farm_tag_summary_win_size_override,
+    zombie_farm_uses_playforge_bundle, ZOMBIE_FARM_APPLY_TRACE_DEPTH,
 };
 
 /// The core implementation of `objc_msgSend`, the main function of Objective-C.
@@ -262,6 +262,14 @@ fn objc_msgSend_inner(
         };
         env.objc.last_message_debug = Some(debug);
         crate::objc::set_global_last_message_debug(debug);
+        if zombie_farm_uses_playforge_bundle(env) {
+            crate::objc::record_zombie_farm_message_trace(
+                debug,
+                selector_name,
+                env.cpu.regs(),
+                env.cpu.cpsr(),
+            );
+        }
     }
     if orig_class == nil {
         if matches!(selector_name, "release" | "retain" | "autorelease") {
@@ -883,6 +891,9 @@ pub(super) fn objc_msgSend_stret(
     receiver: id,
     selector: SEL,
 ) {
+    if zombie_farm_tag_summary_win_size_override(env, receiver, selector, stret) {
+        return;
+    }
     if zombie_farm_cell_content_size_override(env, receiver, selector, stret) {
         return;
     }
@@ -899,6 +910,9 @@ pub(crate) fn _touchHLE_objc_msgSend_stret_tolerant(
     receiver: id,
     selector: SEL,
 ) {
+    if zombie_farm_tag_summary_win_size_override(env, receiver, selector, stret) {
+        return;
+    }
     if zombie_farm_cell_content_size_override(env, receiver, selector, stret) {
         return;
     }
