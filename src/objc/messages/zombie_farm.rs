@@ -835,6 +835,158 @@ fn zombie_farm_sanitize_ccarray_before_cleanup(
     false
 }
 
+const ZOMBIE_FARM_CCACTION_HASH_ELEMENT_SIZE: u32 = 52;
+const ZOMBIE_FARM_CCACTION_ACTIONS_OFFSET: u32 = 0;
+const ZOMBIE_FARM_CCACTION_TARGET_OFFSET: u32 = 4;
+const ZOMBIE_FARM_CCACTION_PAUSED_OFFSET: u32 = 17;
+const ZOMBIE_FARM_CCACTION_HASH_TABLE_OFFSET: u32 = 20;
+const ZOMBIE_FARM_CCACTION_NEXT_OFFSET: u32 = 28;
+const ZOMBIE_FARM_CCACTION_MAX_TARGETS: usize = 4096;
+
+fn zombie_farm_is_ccaction_manager_workaround_call(
+    exact_legacy_app: bool,
+    class_name: Option<&str>,
+    selector_name: &str,
+) -> bool {
+    exact_legacy_app
+        && class_name == Some("CCActionManager")
+        && matches!(selector_name, "update:" | "resumeTarget:")
+}
+
+fn zombie_farm_repair_ccaction_manager_targets(
+    env: &mut Environment,
+    receiver: id,
+    selector_name: &str,
+) -> bool {
+    if !zombie_farm_is_ccaction_manager_workaround_call(
+        zombie_farm_is_exact_legacy_app(env),
+        zombie_farm_object_class_name(env, receiver),
+        selector_name,
+    ) {
+        return false;
+    }
+
+    let Some(targets_ivar) =
+        env.objc
+            .object_lookup_ivar(&env.mem, receiver, &"targets".to_string())
+    else {
+        return false;
+    };
+    let targets_bits: u32 = env.mem.read(targets_ivar.cast());
+    if targets_bits == 0 {
+        return false;
+    }
+
+    // Zombie Farm's bundled cocos2d uses:
+    // struct hashElement {
+    //     ccArray *actions; id target; unsigned int actionIndex; id currentAction;
+    //     bool currentActionSalvaged; bool paused; UT_hash_handle hh;
+    // };
+    //
+    // Some invasion action callbacks leave an element linked after clearing
+    // actions, and can also leave hh.tbl null. CCActionManager::update then
+    // dereferences actions unconditionally, while resumeTarget hashes through
+    // hh.tbl unconditionally. Keep the linked targets and repair only those
+    // two invalid fields so the normal cocos2d cleanup/update flow can proceed.
+    let mut node_bits = targets_bits;
+    let mut visited = HashSet::new();
+    let mut repaired_actions = 0_u32;
+    let mut resumed_target = false;
+    let requested_target = (selector_name == "resumeTarget:").then(|| env.cpu.regs()[2]);
+    let mut head_hash_table_bits = None;
+
+    while node_bits != 0
+        && visited.len() < ZOMBIE_FARM_CCACTION_MAX_TARGETS
+        && visited.insert(node_bits)
+    {
+        if node_bits < env.mem.null_segment_size()
+            || env
+                .mem
+                .try_malloc_size(ConstPtr::<u8>::from_bits(node_bits).cast())
+                .unwrap_or(0)
+                < ZOMBIE_FARM_CCACTION_HASH_ELEMENT_SIZE
+        {
+            log!(
+                "ZombieFarm workaround: stopped CCActionManager target repair at invalid hash element 0x{:08x}",
+                node_bits
+            );
+            break;
+        }
+
+        let actions_ptr: MutPtr<u32> =
+            MutPtr::from_bits(node_bits + ZOMBIE_FARM_CCACTION_ACTIONS_OFFSET);
+        let actions_bits = env.mem.read(actions_ptr);
+        let actions_are_valid = actions_bits >= env.mem.null_segment_size()
+            && env
+                .mem
+                .try_malloc_size(ConstPtr::<u8>::from_bits(actions_bits).cast())
+                .unwrap_or(0)
+                >= 12;
+        if !actions_are_valid {
+            // ccArray is a plain C allocation: { num, max, arr }. calloc gives
+            // cocos2d a valid empty header which its own ccArrayFree can own.
+            let replacement = env.mem.calloc(12);
+            env.mem.write(actions_ptr, replacement.to_bits());
+            repaired_actions += 1;
+            log!(
+                "ZombieFarm workaround: replaced invalid CCActionManager actions 0x{:08x} with empty ccArray {:?} for hash element 0x{:08x}",
+                actions_bits,
+                replacement,
+                node_bits
+            );
+        }
+
+        if node_bits == targets_bits {
+            head_hash_table_bits = Some(env.mem.read(MutPtr::<u32>::from_bits(
+                node_bits + ZOMBIE_FARM_CCACTION_HASH_TABLE_OFFSET,
+            )));
+        }
+
+        if requested_target.is_some_and(|target| {
+            env.mem.read(MutPtr::<u32>::from_bits(
+                node_bits + ZOMBIE_FARM_CCACTION_TARGET_OFFSET,
+            )) == target
+        }) {
+            env.mem.write(
+                MutPtr::<u8>::from_bits(node_bits + ZOMBIE_FARM_CCACTION_PAUSED_OFFSET),
+                0,
+            );
+            resumed_target = true;
+        }
+
+        node_bits = env.mem.read(MutPtr::<u32>::from_bits(
+            node_bits + ZOMBIE_FARM_CCACTION_NEXT_OFFSET,
+        ));
+    }
+
+    if visited.len() == ZOMBIE_FARM_CCACTION_MAX_TARGETS && node_bits != 0 {
+        log!(
+            "ZombieFarm workaround: stopped CCActionManager target repair after {} elements",
+            ZOMBIE_FARM_CCACTION_MAX_TARGETS
+        );
+    }
+
+    if repaired_actions != 0 {
+        log!(
+            "ZombieFarm workaround: repaired {} invalid CCActionManager action array(s) before {}",
+            repaired_actions,
+            selector_name
+        );
+    }
+
+    if selector_name == "resumeTarget:" && head_hash_table_bits == Some(0) {
+        log!(
+            "ZombieFarm workaround: handled resumeTarget: through linked targets because uthash table is null (target=0x{:08x}, found={})",
+            requested_target.unwrap(),
+            resumed_target
+        );
+        env.cpu.regs_mut()[0..2].fill(0);
+        return true;
+    }
+
+    false
+}
+
 fn zombie_farm_ccarray_storage_is_safe_for_visit(env: &mut Environment, array: id) -> bool {
     if zombie_farm_object_class_name(env, array) != Some("CCArray")
         || env.objc.get_host_object(array).is_none()
@@ -6882,6 +7034,10 @@ pub(super) fn zombie_farm_pre_dispatch_workarounds(
         return true;
     }
 
+    if zombie_farm_repair_ccaction_manager_targets(env, receiver, selector_name) {
+        return true;
+    }
+
     zombie_farm_repair_ccnode_children_before_visit(env, receiver, selector_name);
 
     if env.bundle.bundle_identifier() == "com.playforge.ZombieFarm2" {
@@ -7166,6 +7322,8 @@ pub(super) fn zombie_farm_needs_pre_dispatch_workarounds(
             | "visit"
             | "dealloc"
             | "removeAllObjects"
+            | "update:"
+            | "resumeTarget:"
             | "_moveCellOutOfSight:"
             | "dequeueCell"
             | "setSaveDate:"
@@ -7207,7 +7365,8 @@ mod tests {
     use super::{
         zombie_farm_calendar_day_in_timezone, zombie_farm_cocos_win_size,
         zombie_farm_env_flag_enabled, zombie_farm_invasion_interval_override,
-        zombie_farm_is_legacy_social_response, zombie_farm_is_obsolete_potential_friends_response,
+        zombie_farm_is_ccaction_manager_workaround_call, zombie_farm_is_legacy_social_response,
+        zombie_farm_is_obsolete_potential_friends_response,
         zombie_farm_is_tag_summary_win_size_call, zombie_farm_is_unsafe_legacy_gift_action,
         zombie_farm_legacy_compatible_day_in_timezone, zombie_farm_start_of_local_day_in_timezone,
         ZOMBIE_FARM_INVASION_READY_INTERVAL_SECONDS, ZOMBIE_FARM_TAG_SUMMARY_WIN_SIZE_RETURN,
@@ -7474,6 +7633,30 @@ mod tests {
             zombie_farm_invasion_interval_override(false, "timeIntervalSinceNow", true, false,),
             None
         );
+    }
+
+    #[test]
+    fn zombie_farm_only_repairs_legacy_ccaction_manager_update_and_resume() {
+        assert!(zombie_farm_is_ccaction_manager_workaround_call(
+            true,
+            Some("CCActionManager"),
+            "update:",
+        ));
+        assert!(zombie_farm_is_ccaction_manager_workaround_call(
+            true,
+            Some("CCActionManager"),
+            "resumeTarget:",
+        ));
+        assert!(!zombie_farm_is_ccaction_manager_workaround_call(
+            true,
+            Some("CCRepeatForever"),
+            "update:",
+        ));
+        assert!(!zombie_farm_is_ccaction_manager_workaround_call(
+            false,
+            Some("CCActionManager"),
+            "update:",
+        ));
     }
 }
 
