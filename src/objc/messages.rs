@@ -272,6 +272,32 @@ fn objc_msgSend_inner(
         }
     }
     if orig_class == nil {
+        // A null isa can mean either a dead object or guest memory corruption.
+        // Capture that distinction before the legacy fallback hides the call.
+        // In particular, returning nil from methodForSelector: may be followed
+        // by a direct guest IMP call, with no further objc_msgSend trace.
+        if env.bundle.bundle_identifier() == "com.playforge.ZFR.LZ54D2GT3D"
+            && env.bundle.bundle_version() == "1.0"
+        {
+            static NIL_ISA_DIAGNOSTICS: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            if NIL_ISA_DIAGNOSTICS.fetch_add(1, Ordering::Relaxed) < 16 {
+                let registered = env.objc.get_host_object(receiver).is_some();
+                let refcount = env.objc.try_get_refcount(receiver);
+                let allocation_size = env.mem.try_malloc_size(receiver.cast().cast_const());
+                log!(
+                    "ZombieFarm nil-isa diagnostic: receiver={:?}, selector={}, registered={}, refcount={:?}, allocation_size={:?}, arg2=0x{:08x}, LR=0x{:08x}, PC=0x{:08x}",
+                    receiver,
+                    selector_name,
+                    registered,
+                    refcount,
+                    allocation_size,
+                    env.cpu.regs()[2],
+                    env.cpu.regs()[Cpu::LR],
+                    env.cpu.regs()[Cpu::PC],
+                );
+            }
+        }
         if matches!(selector_name, "release" | "retain" | "autorelease") {
             log!(
                 "Warning: ignoring {} sent to object {:?} with nil isa",
@@ -855,7 +881,9 @@ Type mismatch when sending message {} to {:?}!
             return;
         } else {
             panic!(
-                "Item {class:?} in superclass chain of object {receiver:?}'s class {orig_class:?} has an unexpected host object type."
+                "Item {class:?} in superclass chain of object {receiver:?}'s class {orig_class:?} has an unexpected host object type (selector {selector_name}, guest LR=0x{:08x}, PC=0x{:08x}).",
+                env.cpu.regs()[Cpu::LR],
+                env.cpu.regs()[Cpu::PC],
             );
         }
     }

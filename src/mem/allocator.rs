@@ -456,6 +456,13 @@ impl HeapAllocator {
         self.external_chunks.insert(chunk);
     }
 
+    /// Whether this allocation belongs to the VM allocator rather than the
+    /// heap. Query before freeing it; alignment can make a heap allocation's
+    /// recorded size exceed the original heap request limit.
+    pub fn is_external_allocation(&self, base: VAddr) -> bool {
+        self.external_chunks.get_size_with_base(base).is_some()
+    }
+
     /// Returns the size of the freed chunk so it can be zeroed if desired
     #[must_use]
     pub fn free(&mut self, base: VAddr) -> GuestUSize {

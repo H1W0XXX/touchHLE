@@ -610,9 +610,12 @@ impl Mem {
     /// Free allocations made with non vm prefixed `alloc` methods on
     /// this type.
     pub fn free(&mut self, ptr: MutVoidPtr) {
+        // Allocation provenance cannot be inferred from the returned size:
+        // heap alignment can round a request up past MAX_HEAP_ALLOCATION_SIZE.
+        let is_external = self.heap_allocator().is_external_allocation(ptr.to_bits());
         let size = self.heap_allocator().free(ptr.to_bits());
 
-        if size > Self::MAX_HEAP_ALLOCATION_SIZE {
+        if is_external {
             self.vm_free(ptr, size);
         }
 
@@ -683,5 +686,66 @@ impl Mem {
     /// memory allocator.
     pub fn reserve(&mut self, base: VAddr, size: GuestUSize) {
         self.vm_allocator.allocate(Some(base), size).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Mem, MutPtr, PAGE_SIZE};
+
+    #[test]
+    fn freeing_rounded_heap_blocks_preserves_live_neighbors() {
+        let mut mem = Mem::new();
+        mem.set_null_segment_size(PAGE_SIZE);
+        // The last 15 valid heap request sizes all round up across the limit.
+        for requested in (Mem::MAX_HEAP_ALLOCATION_SIZE - 14)..=Mem::MAX_HEAP_ALLOCATION_SIZE {
+            let before = mem.alloc(32);
+            let block = mem.alloc(requested);
+            let after = mem.alloc(32);
+            mem.bytes_at_mut(before.cast(), 32).fill(0xa5);
+            mem.bytes_at_mut(after.cast(), 32).fill(0x5a);
+            assert_eq!(mem.malloc_size(block.cast_const()), 15 * 1024);
+
+            mem.free(block);
+            // Previously, free punched a page-aligned hole in the live heap.
+            // The next VM allocation reused and zeroed both neighbor objects.
+            let large = mem.alloc(4 * PAGE_SIZE);
+            assert_eq!(
+                mem.bytes_at(before.cast::<u8>(), 32),
+                &[0xa5; 32],
+                "request {requested}: prefix overwritten"
+            );
+            assert_eq!(
+                mem.bytes_at(after.cast::<u8>(), 32),
+                &[0x5a; 32],
+                "request {requested}: suffix overwritten"
+            );
+            mem.free(large);
+            mem.free(before);
+            mem.free(after);
+        }
+    }
+
+    #[test]
+    fn freeing_external_blocks_returns_pages_to_vm_allocator() {
+        let mut mem = Mem::new();
+        mem.set_null_segment_size(PAGE_SIZE);
+        let live: MutPtr<u32> = mem.alloc(32).cast();
+        mem.write(live, 0x1234_5678);
+        // Include the very first request assigned to the external allocator.
+        for requested in [Mem::MAX_HEAP_ALLOCATION_SIZE + 1, 4 * PAGE_SIZE + 1] {
+            let block = mem.alloc(requested);
+            mem.bytes_at_mut(block.cast(), requested).fill(0x7f);
+            mem.free(block);
+            let replacement = mem.alloc(requested);
+            assert_eq!(replacement, block, "external pages were not returned");
+            assert!(mem
+                .bytes_at(replacement.cast::<u8>(), requested)
+                .iter()
+                .all(|&b| b == 0));
+            assert_eq!(mem.read(live), 0x1234_5678);
+            mem.free(replacement);
+        }
+        mem.free(live.cast());
     }
 }
